@@ -44,7 +44,11 @@ const mockSensorData = {
     temperature: 25.6,
     humidity: 58.3,
     aqi: 132,
-    timestamp: Date.now()
+    timestamp: Date.now(),
+    device_id: null,
+    esp_time_ms: null,
+    esp_uptime_ms: null,
+    upload_delay_ms: null
 };
 
 const mockASRData = {
@@ -97,6 +101,12 @@ let dashboardState = {
     alertLogs: mockAlertLogs,
     systemLogs: mockSystemLogs,
     commandLogs: [],
+    timeSync: {
+        ok: false,
+        server_time_ms: null,
+        server_time_iso: null,
+        latest_ping: null
+    },
     sources: {
         sensor: "mock",
         asr: "mock",
@@ -118,6 +128,22 @@ function formatTime(timestamp = Date.now()) {
     const date = parseTimestamp(timestamp) || new Date();
     return date.toLocaleTimeString("zh-CN", {
         hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+    });
+}
+
+function formatDateTime(value) {
+    const date = parseTimestamp(value);
+    if (!date) {
+        return "--";
+    }
+
+    return date.toLocaleString("zh-CN", {
+        hour12: false,
+        month: "2-digit",
+        day: "2-digit",
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit"
@@ -164,6 +190,49 @@ function formatNumber(value, digits = 1) {
         return "--";
     }
     return Number(numeric.toFixed(digits)).toString();
+}
+
+function formatMilliseconds(value) {
+    const numeric = toNumber(value);
+    if (numeric === null) {
+        return "--";
+    }
+
+    return `${Math.round(numeric)} ms`;
+}
+
+function formatTimestampMs(value) {
+    const numeric = toNumber(value);
+    if (numeric === null) {
+        return "--";
+    }
+
+    return `${Math.round(numeric)} (${formatDateTime(numeric)})`;
+}
+
+function formatUptime(value) {
+    const numeric = toNumber(value);
+    if (numeric === null) {
+        return "--";
+    }
+
+    const totalSeconds = Math.floor(numeric / 1000);
+    if (totalSeconds < 60) {
+        return `${Math.round(numeric)} ms`;
+    }
+
+    const days = Math.floor(totalSeconds / 86400);
+    const hours = Math.floor((totalSeconds % 86400) / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const parts = [];
+
+    if (days > 0) parts.push(`${days}天`);
+    if (hours > 0) parts.push(`${hours}小时`);
+    if (minutes > 0) parts.push(`${minutes}分`);
+    if (parts.length === 0) parts.push(`${seconds}秒`);
+
+    return parts.join(" ");
 }
 
 function cloneMockData(mockData) {
@@ -219,6 +288,28 @@ async function fetchLatestLLM() {
     }
 }
 
+async function fetchTimeSyncStatus() {
+    try {
+        const response = await fetch("/api/time/status", { cache: "no-store" });
+        if (!response.ok) {
+            throw new Error(`${response.url} ${response.status}`);
+        }
+
+        return { data: await response.json(), source: "real" };
+    } catch (error) {
+        console.warn("[Dashboard] TimeSync: status fallback", error.message);
+        return {
+            data: {
+                ok: false,
+                server_time_ms: null,
+                server_time_iso: null,
+                latest_ping: null
+            },
+            source: "mock"
+        };
+    }
+}
+
 async function fetchHistoryData() {
     // 当前后端没有历史数据接口，保留 mockHistoryData 作为曲线占位。
     return mockHistoryData;
@@ -241,6 +332,12 @@ function normalizeSensor(rawSensor, source) {
     const gas = toNumber(pickFirst(rawSensor, ["gas_resistance", "gas"]));
     const timestampValue = pickFirst(rawSensor, ["timestamp", "created_at", "time"]);
     const timestamp = parseTimestamp(timestampValue);
+    const deviceId = pickFirst(rawSensor, ["device_id", "deviceId"]);
+    const espTimeMs = toNumber(pickFirst(rawSensor, ["esp_time_ms", "espTimeMs"]));
+    const espUptimeMs = toNumber(pickFirst(rawSensor, ["esp_uptime_ms", "espUptimeMs"]));
+    const serverRecvMs = toNumber(pickFirst(rawSensor, ["server_recv_ms", "serverRecvMs"]));
+    const serverTimeIso = pickFirst(rawSensor, ["server_time_iso", "serverTimeIso"]);
+    const uploadDelayMs = toNumber(pickFirst(rawSensor, ["upload_delay_ms", "uploadDelayMs"]));
 
     let airValue = aqi;
     let airMode = "aqi";
@@ -270,6 +367,12 @@ function normalizeSensor(rawSensor, source) {
         airLabel,
         airUnit,
         timestamp,
+        deviceId,
+        espTimeMs,
+        espUptimeMs,
+        serverRecvMs,
+        serverTimeIso,
+        uploadDelayMs,
         hasTimestamp: Boolean(timestamp),
         usedMockFields: {
             temperature: temperature === null,
@@ -709,6 +812,27 @@ function renderStatusHeader() {
     }
 }
 
+function renderTimeSyncPanel() {
+    const sensor = dashboardState.sensor || {};
+    const timeSync = dashboardState.timeSync || {};
+    const latestPing = timeSync.latest_ping || sensor.raw?.time_sync?.latest_ping || null;
+    const serverTime = timeSync.server_time_iso || timeSync.server_time_ms || sensor.raw?.time_sync?.server_time_iso || sensor.serverTimeIso;
+    const deviceId = sensor.deviceId || latestPing?.device_id;
+    const status = document.querySelector('[data-time-sync="status"]');
+
+    if (status) {
+        status.textContent = timeSync.ok ? "实时" : "等待数据";
+        status.className = `sync-pill ${timeSync.ok ? "" : "offline"}`;
+    }
+
+    setText('[data-time-sync="serverTime"]', formatDateTime(serverTime));
+    setText('[data-time-sync="deviceId"]', deviceId || "--");
+    setText('[data-time-sync="espTime"]', formatTimestampMs(sensor.espTimeMs));
+    setText('[data-time-sync="espUptime"]', formatUptime(sensor.espUptimeMs));
+    setText('[data-time-sync="uploadDelay"]', formatMilliseconds(sensor.uploadDelayMs));
+    setText('[data-time-sync="pingDelay"]', formatMilliseconds(latestPing?.estimated_one_way_delay_ms));
+}
+
 function renderSourceDebug() {
     const sources = dashboardState.sources;
     setText('[data-source="sensor"]', sources.sensor);
@@ -723,10 +847,11 @@ function renderSourceDebug() {
 }
 
 async function updateDashboard() {
-    const [sensorResult, asrResult, llmResult, history, mockLogs] = await Promise.all([
+    const [sensorResult, asrResult, llmResult, timeSyncResult, history, mockLogs] = await Promise.all([
         fetchLatestSensor(),
         fetchLatestASR(),
         fetchLatestLLM(),
+        fetchTimeSyncStatus(),
         fetchHistoryData(),
         fetchAlertLogs()
     ]);
@@ -741,6 +866,7 @@ async function updateDashboard() {
         asr: asrResult.source,
         llm: llmResult.source
     };
+    dashboardState.timeSync = timeSyncResult.data;
     dashboardState.metrics = buildMetrics(sensor);
     dashboardState.history = history;
 
@@ -754,6 +880,7 @@ async function updateDashboard() {
     renderAlertLogs();
     renderSystemLogs();
     renderStatusHeader();
+    renderTimeSyncPanel();
     renderSourceDebug();
 }
 

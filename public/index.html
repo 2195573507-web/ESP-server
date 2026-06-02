@@ -192,18 +192,53 @@
                     </div>
                 </article>
 
-                <article class="panel alert-panel" id="alertPanel">
-                    <div class="panel-header">
-                        <h2>异常状态报警 <span class="count-pill" data-alert-count>0</span></h2>
-                        <div class="current-state">当前状态：<strong data-current-state>正常</strong></div>
-                    </div>
-                    <div class="alert-summary" data-alert-summary></div>
-                    <div class="latest-alert" data-latest-alert>
-                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 2 20h20L12 2Zm1 15h-2v-2h2v2Zm0-4h-2V8h2v5Z"/></svg>
-                        <span>最近报警：暂无异常</span>
-                        <svg class="arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6 1.4-1.4 7.4 7.4-7.4 7.4L9 18Z"/></svg>
-                    </div>
-                </article>
+                <div class="side-stack">
+                    <article class="panel alert-panel" id="alertPanel">
+                        <div class="panel-header">
+                            <h2>异常状态报警 <span class="count-pill" data-alert-count>0</span></h2>
+                            <div class="current-state">当前状态：<strong data-current-state>正常</strong></div>
+                        </div>
+                        <div class="alert-summary" data-alert-summary></div>
+                        <div class="latest-alert" data-latest-alert>
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 2 20h20L12 2Zm1 15h-2v-2h2v2Zm0-4h-2V8h2v5Z"/></svg>
+                            <span>最近报警：暂无异常</span>
+                            <svg class="arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6 1.4-1.4 7.4 7.4-7.4 7.4L9 18Z"/></svg>
+                        </div>
+                    </article>
+
+                    <article class="panel time-sync-panel" id="time-sync">
+                        <div class="panel-header">
+                            <h2>时间同步</h2>
+                            <span class="sync-pill" data-time-sync="status">等待数据</span>
+                        </div>
+                        <div class="time-sync-grid">
+                            <div class="time-sync-item">
+                                <span>服务器时间</span>
+                                <strong data-time-sync="serverTime">--</strong>
+                            </div>
+                            <div class="time-sync-item">
+                                <span>设备 ID</span>
+                                <strong data-time-sync="deviceId">--</strong>
+                            </div>
+                            <div class="time-sync-item">
+                                <span>ESP 时间戳</span>
+                                <strong data-time-sync="espTime">--</strong>
+                            </div>
+                            <div class="time-sync-item">
+                                <span>ESP uptime</span>
+                                <strong data-time-sync="espUptime">--</strong>
+                            </div>
+                            <div class="time-sync-item">
+                                <span>上传延迟</span>
+                                <strong data-time-sync="uploadDelay">--</strong>
+                            </div>
+                            <div class="time-sync-item">
+                                <span>Ping 单程估算</span>
+                                <strong data-time-sync="pingDelay">--</strong>
+                            </div>
+                        </div>
+                    </article>
+                </div>
             </section>
 
             <section class="bottom-grid">

@@ -464,6 +464,12 @@ svg {
     gap: 18px;
 }
 
+.side-stack {
+    display: grid;
+    gap: 18px;
+    align-content: start;
+}
+
 .bottom-grid {
     display: grid;
     grid-template-columns: minmax(430px, 1.18fr) minmax(330px, 0.75fr) minmax(310px, 0.75fr);
@@ -661,6 +667,61 @@ svg {
 
 .latest-alert .arrow {
     justify-self: end;
+}
+
+.time-sync-panel {
+    background:
+        linear-gradient(180deg, rgba(244, 249, 255, 0.92), rgba(255, 255, 255, 0.9)),
+        var(--panel);
+}
+
+.sync-pill {
+    display: inline-flex;
+    align-items: center;
+    min-height: 28px;
+    padding: 0 10px;
+    color: #155df8;
+    background: rgba(34, 102, 243, 0.1);
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 850;
+    white-space: nowrap;
+}
+
+.sync-pill.offline {
+    color: var(--orange);
+    background: rgba(249, 115, 22, 0.12);
+}
+
+.time-sync-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.time-sync-item {
+    min-width: 0;
+    min-height: 72px;
+    padding: 12px;
+    border: 1px solid #e2eaf5;
+    border-radius: var(--radius);
+    background: rgba(255, 255, 255, 0.7);
+}
+
+.time-sync-item span {
+    display: block;
+    margin-bottom: 8px;
+    color: #627a9d;
+    font-size: 12px;
+    font-weight: 800;
+}
+
+.time-sync-item strong {
+    display: block;
+    overflow-wrap: anywhere;
+    color: #142a4d;
+    font-size: 15px;
+    line-height: 1.35;
 }
 
 .table-wrap {
@@ -933,6 +994,10 @@ tbody tr:last-child td {
     .panel-header {
         align-items: flex-start;
         flex-direction: column;
+    }
+
+    .time-sync-grid {
+        grid-template-columns: 1fr;
     }
 
     .data-source-panel {

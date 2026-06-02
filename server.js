@@ -1,14 +1,78 @@
 const express = require("express");
 const path = require("path");
 const sqlite3 = require("sqlite3").verbose();
+const {
+    buildSensorTimingFields,
+    createTimeSyncRouter,
+    withTimeSyncStatus
+} = require("./server-time-sync/timeSync");
 
 const app = express();
 
 app.use(express.json());
+app.use((err, req, res, next) => {
+    if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+        return res.status(400).json({
+            ok: false,
+            error: "Invalid JSON body"
+        });
+    }
+
+    return next(err);
+});
 app.use(express.static(path.join(__dirname, "public")));
 
 // 数据库连接
 const db = new sqlite3.Database(path.join(__dirname, "db", "database.db"));
+
+const SENSOR_TIMING_COLUMNS = [
+    { name: "device_id", type: "TEXT" },
+    { name: "esp_time_ms", type: "INTEGER" },
+    { name: "esp_uptime_ms", type: "INTEGER" },
+    { name: "server_recv_ms", type: "INTEGER" },
+    { name: "server_time_iso", type: "TEXT" },
+    { name: "upload_delay_ms", type: "INTEGER" }
+];
+
+function dbRun(sql, params = []) {
+    return new Promise((resolve, reject) => {
+        db.run(sql, params, function (err) {
+            if (err) {
+                reject(err);
+                return;
+            }
+
+            resolve(this);
+        });
+    });
+}
+
+function dbAll(sql, params = []) {
+    return new Promise((resolve, reject) => {
+        db.all(sql, params, (err, rows) => {
+            if (err) {
+                reject(err);
+                return;
+            }
+
+            resolve(rows);
+        });
+    });
+}
+
+async function ensureSensorTimingColumns() {
+    const columns = await dbAll("PRAGMA table_info(sensor_records)");
+    const existingNames = new Set(columns.map(column => column.name));
+
+    for (const column of SENSOR_TIMING_COLUMNS) {
+        if (!existingNames.has(column.name)) {
+            await dbRun(`ALTER TABLE sensor_records ADD COLUMN ${column.name} ${column.type}`);
+            console.log(`[db] sensor_records added column ${column.name}`);
+        }
+    }
+}
+
+app.use("/api/time", createTimeSyncRouter());
 
 // 首页跳转到仪表盘
 app.get("/", (req, res) => {
@@ -103,7 +167,7 @@ app.get("/sensor/latest", (req, res) => {
                 });
             }
 
-            res.json(row || {});
+            res.json(row ? withTimeSyncStatus(row) : {});
         }
     );
 });
@@ -116,28 +180,44 @@ app.post("/sensor", (req, res) => {
         pressure,
         gas_resistance
     } = req.body;
+    const serverRecvMs = Date.now();
+    const timing = buildSensorTimingFields(req.body, serverRecvMs);
 
     db.run(
         `INSERT INTO sensor_records
-        (timestamp,temperature,humidity,pressure,gas_resistance)
-        VALUES(?,?,?,?,?)`,
+        (timestamp,temperature,humidity,pressure,gas_resistance,device_id,esp_time_ms,esp_uptime_ms,server_recv_ms,server_time_iso,upload_delay_ms)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
         [
-            Date.now(),
+            serverRecvMs,
             temperature,
             humidity,
             pressure,
-            gas_resistance
+            gas_resistance,
+            timing.device_id,
+            timing.esp_time_ms,
+            timing.esp_uptime_ms,
+            timing.server_recv_ms,
+            timing.server_time_iso,
+            timing.upload_delay_ms
         ],
         function (err) {
             if (err) {
                 return res.status(500).json({
+                    ok: false,
+                    success: false,
                     error: err.message
                 });
             }
 
+            console.log(
+                `[sensor] upload device_id=${timing.device_id || "-"} server_recv_ms=${timing.server_recv_ms} upload_delay_ms=${timing.upload_delay_ms ?? "null"}`
+            );
+
             res.json({
+                ok: true,
                 success: true,
-                id: this.lastID
+                id: this.lastID,
+                ...timing
             });
         }
     );
@@ -148,6 +228,15 @@ app.get("/dashboard", (req, res) => {
 });
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+async function startServer() {
+    await ensureSensorTimingColumns();
+
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
+}
+
+startServer().catch(error => {
+    console.error("[server] failed to start", error);
+    process.exit(1);
 });

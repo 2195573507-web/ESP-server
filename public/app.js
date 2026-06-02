@@ -1,3 +1,11 @@
+const API_CONFIG = {
+    sensorLatest: "/sensor/latest",
+    sensorHistory: "/sensor/history",
+    asrLatest: "/asr/latest",
+    llmLatest: "/llm/latest",
+    timeSyncStatus: "/api/time/status"
+};
+
 const LEVELS = {
     normal: { label: "正常", className: "normal" },
     warning: { label: "警告", className: "warning" },
@@ -61,7 +69,7 @@ const mockLLMData = {
     response: "暂无真实 LLM 数据，等待服务返回"
 };
 
-// mockHistoryData: 当前后端没有历史曲线接口，主图暂时使用前端 mock 数据。
+// mockHistoryData: 历史接口无数据或不可用时，主图继续使用前端 mock 数据。
 const mockHistoryData = [
     { time: "12:00", temperature: 26, humidity: 58, air: 10 },
     { time: "14:00", temperature: 28, humidity: 62, air: 14 },
@@ -263,7 +271,7 @@ function readEndpointFallback(error, mockData, label) {
 
 async function fetchLatestSensor() {
     try {
-        const response = await fetch("/sensor/latest", { cache: "no-store" });
+        const response = await fetch(API_CONFIG.sensorLatest, { cache: "no-store" });
         return readEndpointResponse(response, mockSensorData, "Sensor");
     } catch (error) {
         return readEndpointFallback(error, mockSensorData, "Sensor");
@@ -272,7 +280,7 @@ async function fetchLatestSensor() {
 
 async function fetchLatestASR() {
     try {
-        const response = await fetch("/asr/latest", { cache: "no-store" });
+        const response = await fetch(API_CONFIG.asrLatest, { cache: "no-store" });
         return readEndpointResponse(response, mockASRData, "ASR");
     } catch (error) {
         return readEndpointFallback(error, mockASRData, "ASR");
@@ -281,7 +289,7 @@ async function fetchLatestASR() {
 
 async function fetchLatestLLM() {
     try {
-        const response = await fetch("/llm/latest", { cache: "no-store" });
+        const response = await fetch(API_CONFIG.llmLatest, { cache: "no-store" });
         return readEndpointResponse(response, mockLLMData, "LLM");
     } catch (error) {
         return readEndpointFallback(error, mockLLMData, "LLM");
@@ -290,7 +298,7 @@ async function fetchLatestLLM() {
 
 async function fetchTimeSyncStatus() {
     try {
-        const response = await fetch("/api/time/status", { cache: "no-store" });
+        const response = await fetch(API_CONFIG.timeSyncStatus, { cache: "no-store" });
         if (!response.ok) {
             throw new Error(`${response.url} ${response.status}`);
         }
@@ -311,8 +319,34 @@ async function fetchTimeSyncStatus() {
 }
 
 async function fetchHistoryData() {
-    // 当前后端没有历史数据接口，保留 mockHistoryData 作为曲线占位。
-    return mockHistoryData;
+    try {
+        const response = await fetch(`${API_CONFIG.sensorHistory}?limit=50`, { cache: "no-store" });
+        if (!response.ok) {
+            throw new Error(`${response.url} ${response.status}`);
+        }
+
+        const rows = await response.json();
+        if (!Array.isArray(rows) || rows.length === 0) {
+            console.warn("[Dashboard] History: mock fallback because API returned empty data");
+            return mockHistoryData;
+        }
+
+        return rows.map(row => {
+            const timestamp = parseTimestamp(pickFirst(row, ["timestamp", "server_recv_ms", "created_at", "time"]));
+            const gasResistance = toNumber(pickFirst(row, ["gas_resistance", "gas"]));
+            const aqi = toNumber(pickFirst(row, ["aqi", "air_quality"]));
+
+            return {
+                time: timestamp ? formatTime(timestamp) : "--:--",
+                temperature: toNumber(row.temperature) ?? 0,
+                humidity: toNumber(row.humidity) ?? 0,
+                air: aqi ?? gasResistance ?? 0
+            };
+        });
+    } catch (error) {
+        console.warn("[Dashboard] History: mock fallback", error.message);
+        return mockHistoryData;
+    }
 }
 
 async function fetchAlertLogs() {

@@ -1,19 +1,18 @@
 const express = require("express");
+const path = require("path");
 const sqlite3 = require("sqlite3").verbose();
 
 const app = express();
 
 app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
 
 // 数据库连接
-const db = new sqlite3.Database("./db/database.db");
+const db = new sqlite3.Database(path.join(__dirname, "db", "database.db"));
 
-// 首页
+// 首页跳转到仪表盘
 app.get("/", (req, res) => {
-    res.json({
-        status: "ok",
-        message: "ESP Server Running"
-    });
+    res.redirect("/dashboard");
 });
 
 // 获取最新 ASR
@@ -145,58 +144,10 @@ app.post("/sensor", (req, res) => {
 });
 // Dashboard
 app.get("/dashboard", (req, res) => {
-
-    db.get(
-        "SELECT * FROM asr_records ORDER BY id DESC LIMIT 1",
-        [],
-        (err, asrRow) => {
-
-            db.get(
-                "SELECT * FROM llm_records ORDER BY id DESC LIMIT 1",
-                [],
-                (err, llmRow) => {
-
-                    db.get(
-                        "SELECT * FROM sensor_records ORDER BY id DESC LIMIT 1",
-                        [],
-                        (err, sensorRow) => {
-
-                            res.send(`
-                                <html>
-                                <head>
-                                    <title>ESP Dashboard</title>
-                                    <meta charset="utf-8">
-                                </head>
-                                <body style="font-family:Arial;padding:30px">
-
-                                    <h1>ESP Dashboard</h1>
-
-                                    <hr>
-
-                                    <h2>最新 ASR</h2>
-                                    <pre>${JSON.stringify(asrRow, null, 2)}</pre>
-
-                                    <h2>最新 LLM</h2>
-                                    <pre>${JSON.stringify(llmRow, null, 2)}</pre>
-
-                                    <h2>最新 Sensor</h2>
-                                    <pre>${JSON.stringify(sensorRow, null, 2)}</pre>
-
-                                </body>
-                                </html>
-                            `);
-
-                        }
-                    );
-
-                }
-            );
-
-        }
-    );
-
+    res.sendFile(path.join(__dirname, "public", "index.html"));
 });
-app.listen(3000, () => {
-    console.log("Server running on port 3000");
-});
+const PORT = process.env.PORT || 3000;
 
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});

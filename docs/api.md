@@ -4,6 +4,72 @@
 
 ## ESP 上传数据接口
 
+### `POST /api/llm/text`
+
+Mic-getaway 将 ASR final 文本发送到服务器，服务器只代理文本到火山引擎 LLM Chat Completions 网关，并把模型回复文本返回给 ESP。服务器不接收、不转发、不处理任何 ASR/TTS 音频。
+
+请求体：
+
+```json
+{
+  "text": "ASR最终文本",
+  "device_id": "mic-getaway-001",
+  "session_id": "可选"
+}
+```
+
+字段说明：
+
+- `text`: ASR final 文本，必填，去除首尾空白后不能为空，最大 `4000` 字符。
+- `device_id`: 设备 ID，可为空，仅用于服务器日志脱敏定位。
+- `session_id`: 会话 ID，可为空，仅用于服务器日志脱敏定位。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "text": "LLM回复文本",
+  "id": 123,
+  "model": "Doubao-Seed-1.6-flash",
+  "server_time_ms": 1780000000000
+}
+```
+
+失败响应：
+
+```json
+{
+  "ok": false,
+  "error": "LLM request failed"
+}
+```
+
+非法请求会返回 HTTP `400`：
+
+```json
+{
+  "ok": false,
+  "error": "text is required"
+}
+```
+
+服务器 `.env` 配置示例：
+
+```dotenv
+LLM_API_KEY=<火山网关API Key>
+LLM_BASE_URL=https://fai-gateway.vei.volces.com
+LLM_CHAT_PATH=/v1/chat/completions
+LLM_MODEL=Doubao-Seed-1.6-flash
+LLM_TIMEOUT_MS=30000
+```
+
+说明：
+
+- `Authorization` 只由服务器使用 `.env` 中的 `LLM_API_KEY` 生成，不会返回给 ESP。
+- 调用成功后会写入现有 `llm_records` 表：`prompt=text`，`response=模型回复`，因此 `GET /llm/latest` 仍可显示最新回复。
+- 该接口不新增 WebSocket，不处理 ASR 音频，不处理 TTS 音频，不代理 ASR/TTS。
+
 ### `POST /sensor`
 
 ESP 设备上传传感器数据。该接口是当前传感器数据的写入入口，不要为了前端展示随意改变字段名。

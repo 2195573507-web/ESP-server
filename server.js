@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 const express = require("express");
 const path = require("path");
 const sqlite3 = require("sqlite3").verbose();
@@ -8,6 +10,12 @@ const {
 } = require("./server-time-sync/timeSync");
 
 const app = express();
+
+const DEFAULT_LLM_BASE_URL = "https://fai-gateway.vei.volces.com";
+const DEFAULT_LLM_CHAT_PATH = "/v1/chat/completions";
+const DEFAULT_LLM_MODEL = "Doubao-Seed-1.6-flash";
+const DEFAULT_LLM_TIMEOUT_MS = 30000;
+const LLM_TEXT_MAX_CHARS = 4000;
 
 app.use(express.json());
 app.use((err, req, res, next) => {
@@ -80,6 +88,205 @@ function readHistoryLimit(value) {
     return Math.min(numeric, 500);
 }
 
+function readPositiveInteger(value, fallback) {
+    const numeric = Number.parseInt(value, 10);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+        return fallback;
+    }
+
+    return numeric;
+}
+
+function readLlmConfig() {
+    const baseUrl = (process.env.LLM_BASE_URL || DEFAULT_LLM_BASE_URL)
+        .trim()
+        .replace(/\/+$/, "");
+    const chatPath = (process.env.LLM_CHAT_PATH || DEFAULT_LLM_CHAT_PATH).trim();
+
+    return {
+        apiKey: (process.env.LLM_API_KEY || "").trim(),
+        baseUrl,
+        chatPath: chatPath.startsWith("/") ? chatPath : `/${chatPath}`,
+        model: (process.env.LLM_MODEL || DEFAULT_LLM_MODEL).trim() || DEFAULT_LLM_MODEL,
+        timeoutMs: readPositiveInteger(process.env.LLM_TIMEOUT_MS, DEFAULT_LLM_TIMEOUT_MS)
+    };
+}
+
+function readLlmTextRequest(body) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return {
+            error: "JSON object body is required"
+        };
+    }
+
+    if (typeof body.text !== "string") {
+        return {
+            error: "text is required"
+        };
+    }
+
+    const text = body.text.trim();
+    if (!text) {
+        return {
+            error: "text is required"
+        };
+    }
+
+    if (text.length > LLM_TEXT_MAX_CHARS) {
+        return {
+            error: `text exceeds ${LLM_TEXT_MAX_CHARS} characters`
+        };
+    }
+
+    return {
+        text,
+        deviceId: typeof body.device_id === "string" ? body.device_id.trim() : "",
+        sessionId: typeof body.session_id === "string" ? body.session_id.trim() : ""
+    };
+}
+
+function maskLogValue(value) {
+    if (!value) {
+        return "-";
+    }
+
+    if (value.length <= 6) {
+        return `${value.slice(0, 1)}***len${value.length}`;
+    }
+
+    return `${value.slice(0, 3)}***${value.slice(-2)}len${value.length}`;
+}
+
+function normalizeLlmContent(content) {
+    if (typeof content === "string") {
+        return content.trim();
+    }
+
+    if (Array.isArray(content)) {
+        return content
+            .map(part => {
+                if (typeof part === "string") {
+                    return part;
+                }
+
+                if (part && typeof part.text === "string") {
+                    return part.text;
+                }
+
+                return "";
+            })
+            .join("")
+            .trim();
+    }
+
+    return "";
+}
+
+function extractLlmReply(payload) {
+    const choice = payload && Array.isArray(payload.choices) ? payload.choices[0] : null;
+    const replyText = normalizeLlmContent(
+        choice?.message?.content ??
+        choice?.delta?.content ??
+        choice?.text
+    );
+
+    return {
+        text: replyText,
+        model: typeof payload?.model === "string" && payload.model.trim() ? payload.model.trim() : ""
+    };
+}
+
+function createLlmError(code) {
+    const error = new Error(code);
+    error.code = code;
+    return error;
+}
+
+function describeLlmError(error) {
+    const parts = [
+        `name=${error?.name || "Error"}`
+    ];
+
+    if (error?.code) {
+        parts.push(`code=${error.code}`);
+    }
+
+    if (typeof error?.status === "number") {
+        parts.push(`upstream_status=${error.status}`);
+    }
+
+    if (typeof error?.bodyLength === "number") {
+        parts.push(`body_len=${error.bodyLength}`);
+    }
+
+    return parts.join(" ");
+}
+
+async function requestLlmText(text, config) {
+    if (!config.apiKey) {
+        throw createLlmError("LLM_API_KEY_MISSING");
+    }
+
+    if (typeof fetch !== "function") {
+        throw createLlmError("FETCH_UNAVAILABLE");
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), config.timeoutMs);
+    const endpoint = `${config.baseUrl}${config.chatPath}`;
+
+    try {
+        const upstreamResponse = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${config.apiKey}`
+            },
+            body: JSON.stringify({
+                model: config.model,
+                messages: [
+                    {
+                        role: "user",
+                        content: text
+                    }
+                ],
+                stream: false
+            }),
+            signal: controller.signal
+        });
+        const responseBody = await upstreamResponse.text();
+
+        if (!upstreamResponse.ok) {
+            const error = createLlmError("LLM_UPSTREAM_STATUS");
+            error.status = upstreamResponse.status;
+            error.bodyLength = responseBody.length;
+            throw error;
+        }
+
+        let payload;
+        try {
+            payload = responseBody ? JSON.parse(responseBody) : null;
+        } catch (parseError) {
+            const error = createLlmError("LLM_JSON_PARSE_FAILED");
+            error.bodyLength = responseBody.length;
+            error.cause = parseError;
+            throw error;
+        }
+
+        const reply = extractLlmReply(payload);
+        if (!reply.text) {
+            throw createLlmError("LLM_REPLY_EMPTY");
+        }
+
+        return {
+            text: reply.text,
+            model: reply.model || config.model
+        };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 // Static frontend routes
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -89,6 +296,50 @@ app.get("/", (req, res) => {
 
 app.get("/dashboard", (req, res) => {
     res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+// ESP text-only LLM proxy API
+app.post("/api/llm/text", async (req, res) => {
+    const llmRequest = readLlmTextRequest(req.body);
+    if (llmRequest.error) {
+        return res.status(400).json({
+            ok: false,
+            error: llmRequest.error
+        });
+    }
+
+    const config = readLlmConfig();
+    console.log(
+        `[llm-text] request text_len=${llmRequest.text.length} device_id=${maskLogValue(llmRequest.deviceId)} session_id=${maskLogValue(llmRequest.sessionId)} api_key_len=${config.apiKey.length} model=${config.model}`
+    );
+
+    try {
+        const llmResult = await requestLlmText(llmRequest.text, config);
+        const serverTimeMs = Date.now();
+        const insertResult = await dbRun(
+            "INSERT INTO llm_records(timestamp,prompt,response) VALUES(?,?,?)",
+            [serverTimeMs, llmRequest.text, llmResult.text]
+        );
+
+        console.log(
+            `[llm-text] success id=${insertResult.lastID} reply_len=${llmResult.text.length} model=${llmResult.model}`
+        );
+
+        return res.json({
+            ok: true,
+            text: llmResult.text,
+            id: insertResult.lastID,
+            model: llmResult.model,
+            server_time_ms: serverTimeMs
+        });
+    } catch (error) {
+        console.error(`[llm-text] failed ${describeLlmError(error)}`);
+
+        return res.status(500).json({
+            ok: false,
+            error: "LLM request failed"
+        });
+    }
 });
 
 // ESP ingest API

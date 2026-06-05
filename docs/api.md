@@ -58,7 +58,7 @@ Mic-getaway 将 ASR final 文本发送到服务器，服务器只代理文本到
 
 ```dotenv
 LLM_API_KEY=<火山网关API Key>
-LLM_BASE_URL=https://fai-gateway.vei.volces.com
+LLM_BASE_URL=https://ai-gateway.vei.volces.com
 LLM_CHAT_PATH=/v1/chat/completions
 LLM_MODEL=Doubao-Seed-1.6-flash
 LLM_TIMEOUT_MS=30000
@@ -67,8 +67,60 @@ LLM_TIMEOUT_MS=30000
 说明：
 
 - `Authorization` 只由服务器使用 `.env` 中的 `LLM_API_KEY` 生成，不会返回给 ESP。
+- 默认请求地址为火山引擎边缘大模型网关旧版控制台地址：`https://ai-gateway.vei.volces.com/v1/chat/completions`。
+- `LLM_MODEL` 使用网关访问密钥绑定的平台预置模型名，例如 `Doubao-Seed-1.6-flash`。不要把新版方舟 Endpoint ID 或新版方舟地域网关地址填到这里。
+- 当前服务器只调用平台预置 Chat Completions 模型，不发送 `X-Api-Resource-Id`。该请求头仅适用于自有三方渠道等需要 Resource ID 的场景。
 - 调用成功后会写入现有 `llm_records` 表：`prompt=text`，`response=模型回复`，因此 `GET /llm/latest` 仍可显示最新回复。
 - 该接口不新增 WebSocket，不处理 ASR 音频，不处理 TTS 音频，不代理 ASR/TTS。
+
+### `POST /api/voice/turn`
+
+ESP 设备上传一轮 PCM 音频，服务器校验格式后转发到 `VOICE_TURN_UPSTREAM_URL` 指向的语音上游服务。该接口本身不直接调用火山引擎 Realtime API。
+
+请求头：
+
+```http
+Content-Type: audio/L16; rate=16000; channels=1
+X-Audio-Format: pcm_s16le_mono_16k
+X-Device-Id: esp32-c5-001
+```
+
+字段说明：
+
+- `Content-Type`: 必须声明 `audio/L16; rate=16000; channels=1`。
+- `X-Audio-Format`: 必须声明 `pcm_s16le_mono_16k`，用于和服务端 PCM 校验契约对齐。
+- `X-Device-Id`: 可选，用于并发控制和脱敏日志定位。
+
+服务器 `.env` 配置示例：
+
+```dotenv
+VOICE_TURN_UPSTREAM_URL=<语音上游HTTP地址>
+VOICE_TURN_TIMEOUT_MS=45000
+VOICE_TURN_MAX_CONCURRENT=1
+VOICE_TURN_MAX_BYTES=4194304
+VOICE_TURN_MOCK=0
+```
+
+失败响应会返回结构化错误码。缺少 `X-Audio-Format` 时返回 HTTP `415`：
+
+```json
+{
+  "ok": false,
+  "code": "VOICE_UNSUPPORTED_AUDIO_FORMAT",
+  "error": "X-Audio-Format must be pcm_s16le_mono_16k"
+}
+```
+
+如果语音上游返回错误，服务器会保留上游状态码信息：
+
+```json
+{
+  "ok": false,
+  "code": "VOICE_UPSTREAM_STATUS",
+  "error": "上游错误信息",
+  "upstream_status": 415
+}
+```
 
 ### `POST /sensor`
 

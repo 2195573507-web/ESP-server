@@ -11,7 +11,8 @@ const {
 
 const app = express();
 
-const DEFAULT_LLM_BASE_URL = "https://fai-gateway.vei.volces.com";
+const LEGACY_LLM_BASE_URL = "https://fai-gateway.vei.volces.com";
+const DEFAULT_LLM_BASE_URL = "https://ai-gateway.vei.volces.com";
 const DEFAULT_LLM_CHAT_PATH = "/v1/chat/completions";
 const DEFAULT_LLM_MODEL = "Doubao-Seed-1.6-flash";
 const DEFAULT_LLM_TIMEOUT_MS = 30000;
@@ -23,6 +24,7 @@ const DEFAULT_VOICE_TURN_MAX_CONCURRENT = 1;
 const DEFAULT_VOICE_TURN_MAX_BYTES = 4 * 1024 * 1024;
 const activeVoiceDevices = new Set();
 let activeVoiceTurns = 0;
+let legacyLlmBaseUrlWarned = false;
 
 const voiceTurnRawParser = express.raw({
     type: () => true,
@@ -258,6 +260,42 @@ function createVoiceError(code, message, status) {
     return error;
 }
 
+function normalizeLogPreview(value, maxLength = 500) {
+    const preview = String(value || "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    if (preview.length <= maxLength) {
+        return preview;
+    }
+
+    return `${preview.slice(0, maxLength)}...`;
+}
+
+function extractErrorMessageFromBody(body) {
+    const preview = normalizeLogPreview(body);
+    if (!preview) {
+        return "";
+    }
+
+    try {
+        const payload = JSON.parse(body);
+        const message = payload?.error?.message ||
+            payload?.error?.code ||
+            payload?.error ||
+            payload?.message ||
+            payload?.code;
+
+        if (typeof message === "string" && message.trim()) {
+            return message.trim();
+        }
+    } catch (_) {
+        // Non-JSON upstream errors are still useful as bounded log previews.
+    }
+
+    return preview;
+}
+
 function describeVoiceError(error) {
     const parts = [
         `name=${error?.name || "Error"}`
@@ -279,23 +317,41 @@ function describeVoiceError(error) {
         parts.push(`bytes=${error.bytes}`);
     }
 
+    if (typeof error?.bodyLength === "number") {
+        parts.push(`body_len=${error.bodyLength}`);
+    }
+
+    if (error?.bodyPreview) {
+        parts.push(`body=${JSON.stringify(error.bodyPreview)}`);
+    }
+
     return parts.join(" ");
 }
 
-function sendVoiceError(res, status, code, message) {
+function sendVoiceError(res, status, code, message, details = {}) {
     if (res.headersSent) {
         res.end();
         return;
     }
 
+    const headers = {
+        "X-Error-Code": code
+    };
+    const payload = {
+        ok: false,
+        code,
+        error: message
+    };
+
+    if (typeof details.upstreamStatus === "number") {
+        headers["X-Upstream-Status"] = String(details.upstreamStatus);
+        payload.upstream_status = details.upstreamStatus;
+    }
+
     res
         .status(status)
-        .set("X-Error-Code", code)
-        .json({
-            ok: false,
-            code,
-            error: message
-        });
+        .set(headers)
+        .json(payload);
 }
 
 function writeVoiceTurnHeaders(res) {
@@ -344,12 +400,19 @@ async function streamUpstreamVoiceTurn(audioBuffer, req, res, config, signal) {
     });
 
     if (!upstreamResponse.ok) {
+        const responseBody = await upstreamResponse.text();
+        const upstreamMessage = extractErrorMessageFromBody(responseBody);
+        const status = upstreamResponse.status >= 400 && upstreamResponse.status < 500
+            ? upstreamResponse.status
+            : 502;
         const error = createVoiceError(
             "VOICE_UPSTREAM_STATUS",
-            "Voice upstream request failed",
-            502
+            upstreamMessage || "Voice upstream request failed",
+            status
         );
         error.upstreamStatus = upstreamResponse.status;
+        error.bodyLength = responseBody.length;
+        error.bodyPreview = normalizeLogPreview(responseBody);
         throw error;
     }
 
@@ -442,7 +505,9 @@ async function handleVoiceTurn(req, res) {
             `[voice-turn] failed device_id=${maskLogValue(deviceId)} elapsed_ms=${elapsedMs} ${describeVoiceError(normalizedError)}`
         );
 
-        sendVoiceError(res, status, code, message);
+        sendVoiceError(res, status, code, message, {
+            upstreamStatus: normalizedError.upstreamStatus
+        });
     } finally {
         clearTimeout(timeout);
         req.off("aborted", abortOnClientClose);
@@ -459,7 +524,7 @@ function readLlmConfig() {
 
     return {
         apiKey: (process.env.LLM_API_KEY || "").trim(),
-        baseUrl,
+        baseUrl: normalizeLlmBaseUrl(baseUrl),
         chatPath: chatPath.startsWith("/") ? chatPath : `/${chatPath}`,
         model: (process.env.LLM_MODEL || DEFAULT_LLM_MODEL).trim() || DEFAULT_LLM_MODEL,
         timeoutMs: readPositiveInteger(process.env.LLM_TIMEOUT_MS, DEFAULT_LLM_TIMEOUT_MS)
@@ -573,7 +638,50 @@ function describeLlmError(error) {
         parts.push(`body_len=${error.bodyLength}`);
     }
 
+    if (error?.endpoint) {
+        parts.push(`endpoint=${error.endpoint}`);
+    }
+
+    if (error?.model) {
+        parts.push(`model=${error.model}`);
+    }
+
+    if (error?.bodyPreview) {
+        parts.push(`body=${JSON.stringify(error.bodyPreview)}`);
+    }
+
     return parts.join(" ");
+}
+
+function getLlmResponseStatus(error) {
+    if (error?.code === "LLM_API_KEY_MISSING") {
+        return 503;
+    }
+
+    if (error?.code === "LLM_TIMEOUT") {
+        return 504;
+    }
+
+    if (error?.code === "LLM_UPSTREAM_STATUS" ||
+        error?.code === "LLM_JSON_PARSE_FAILED" ||
+        error?.code === "LLM_REPLY_EMPTY") {
+        return 502;
+    }
+
+    return 500;
+}
+
+function normalizeLlmBaseUrl(baseUrl) {
+    if (baseUrl === LEGACY_LLM_BASE_URL) {
+        if (!legacyLlmBaseUrlWarned) {
+            console.warn(`[llm-text] LLM_BASE_URL uses legacy ${LEGACY_LLM_BASE_URL}; using ${DEFAULT_LLM_BASE_URL}`);
+            legacyLlmBaseUrlWarned = true;
+        }
+
+        return DEFAULT_LLM_BASE_URL;
+    }
+
+    return baseUrl;
 }
 
 async function requestLlmText(text, config) {
@@ -614,6 +722,10 @@ async function requestLlmText(text, config) {
             const error = createLlmError("LLM_UPSTREAM_STATUS");
             error.status = upstreamResponse.status;
             error.bodyLength = responseBody.length;
+            error.endpoint = endpoint;
+            error.model = config.model;
+            error.bodyPreview = normalizeLogPreview(responseBody);
+            error.message = extractErrorMessageFromBody(responseBody) || error.message;
             throw error;
         }
 
@@ -629,13 +741,26 @@ async function requestLlmText(text, config) {
 
         const reply = extractLlmReply(payload);
         if (!reply.text) {
-            throw createLlmError("LLM_REPLY_EMPTY");
+            const error = createLlmError("LLM_REPLY_EMPTY");
+            error.endpoint = endpoint;
+            error.model = config.model;
+            throw error;
         }
 
         return {
             text: reply.text,
             model: reply.model || config.model
         };
+    } catch (error) {
+        if (error?.name === "AbortError") {
+            const timeoutError = createLlmError("LLM_TIMEOUT");
+            timeoutError.endpoint = endpoint;
+            timeoutError.model = config.model;
+            timeoutError.cause = error;
+            throw timeoutError;
+        }
+
+        throw error;
     } finally {
         clearTimeout(timer);
     }
@@ -664,7 +789,7 @@ app.post("/api/llm/text", async (req, res) => {
 
     const config = readLlmConfig();
     console.log(
-        `[llm-text] request text_len=${llmRequest.text.length} device_id=${maskLogValue(llmRequest.deviceId)} session_id=${maskLogValue(llmRequest.sessionId)} api_key_len=${config.apiKey.length} model=${config.model}`
+        `[llm-text] request text_len=${llmRequest.text.length} device_id=${maskLogValue(llmRequest.deviceId)} session_id=${maskLogValue(llmRequest.sessionId)} api_key_len=${config.apiKey.length} endpoint=${config.baseUrl}${config.chatPath} model=${config.model}`
     );
 
     try {
@@ -689,10 +814,18 @@ app.post("/api/llm/text", async (req, res) => {
     } catch (error) {
         console.error(`[llm-text] failed ${describeLlmError(error)}`);
 
-        return res.status(500).json({
+        const status = getLlmResponseStatus(error);
+        const payload = {
             ok: false,
+            code: error?.code || "LLM_REQUEST_FAILED",
             error: "LLM request failed"
-        });
+        };
+
+        if (typeof error?.status === "number") {
+            payload.upstream_status = error.status;
+        }
+
+        return res.status(status).json(payload);
     }
 });
 

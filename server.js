@@ -16,9 +16,34 @@ const DEFAULT_LLM_CHAT_PATH = "/v1/chat/completions";
 const DEFAULT_LLM_MODEL = "Doubao-Seed-1.6-flash";
 const DEFAULT_LLM_TIMEOUT_MS = 30000;
 const LLM_TEXT_MAX_CHARS = 4000;
+const VOICE_TURN_CONTENT_TYPE = "audio/L16; rate=16000; channels=1";
+const VOICE_TURN_AUDIO_FORMAT = "pcm_s16le_mono_16k";
+const DEFAULT_VOICE_TURN_TIMEOUT_MS = 45000;
+const DEFAULT_VOICE_TURN_MAX_CONCURRENT = 1;
+const DEFAULT_VOICE_TURN_MAX_BYTES = 4 * 1024 * 1024;
+const activeVoiceDevices = new Set();
+let activeVoiceTurns = 0;
+
+const voiceTurnRawParser = express.raw({
+    type: () => true,
+    limit: readPositiveInteger(process.env.VOICE_TURN_MAX_BYTES, DEFAULT_VOICE_TURN_MAX_BYTES),
+    inflate: false
+});
+
+app.post("/api/voice/turn", voiceTurnRawParser, handleVoiceTurn);
 
 app.use(express.json());
 app.use((err, req, res, next) => {
+    if (req.path === "/api/voice/turn") {
+        const status = err?.type === "entity.too.large" ? 413 : 400;
+        const code = err?.type === "entity.too.large"
+            ? "VOICE_BODY_TOO_LARGE"
+            : "VOICE_BODY_PARSE_FAILED";
+
+        console.warn(`[voice-turn] body parser failed code=${code} status=${status} message=${err?.message || "-"}`);
+        return sendVoiceError(res, status, code, err?.message || "Invalid PCM request body");
+    }
+
     if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
         return res.status(400).json({
             ok: false,
@@ -95,6 +120,335 @@ function readPositiveInteger(value, fallback) {
     }
 
     return numeric;
+}
+
+function parseContentType(value) {
+    const parts = String(value || "")
+        .split(";")
+        .map(part => part.trim())
+        .filter(Boolean);
+    const mediaType = (parts.shift() || "").toLowerCase();
+    const params = {};
+
+    for (const part of parts) {
+        const separator = part.indexOf("=");
+        if (separator <= 0) {
+            continue;
+        }
+
+        const key = part.slice(0, separator).trim().toLowerCase();
+        const rawValue = part.slice(separator + 1).trim();
+        params[key] = rawValue.replace(/^"|"$/g, "");
+    }
+
+    return {
+        mediaType,
+        params
+    };
+}
+
+function isVoiceTurnContentType(value) {
+    const parsed = parseContentType(value);
+
+    return parsed.mediaType === "audio/l16" &&
+        parsed.params.rate === "16000" &&
+        parsed.params.channels === "1";
+}
+
+function isVoiceTurnAudioFormat(value) {
+    return String(value || "").trim().toLowerCase() === VOICE_TURN_AUDIO_FORMAT;
+}
+
+function readVoiceTurnConfig() {
+    return {
+        upstreamUrl: (process.env.VOICE_TURN_UPSTREAM_URL || "").trim(),
+        timeoutMs: readPositiveInteger(process.env.VOICE_TURN_TIMEOUT_MS, DEFAULT_VOICE_TURN_TIMEOUT_MS),
+        maxConcurrent: readPositiveInteger(process.env.VOICE_TURN_MAX_CONCURRENT, DEFAULT_VOICE_TURN_MAX_CONCURRENT),
+        mockEnabled: String(process.env.VOICE_TURN_MOCK || "").trim() === "1"
+    };
+}
+
+function readVoiceDeviceId(req) {
+    const value = req.get("X-Device-Id") ||
+        req.get("X-ESP-Device-Id") ||
+        req.get("X-Client-Id") ||
+        req.query.device_id ||
+        req.ip ||
+        "unknown";
+
+    return String(value).trim() || "unknown";
+}
+
+function validateVoiceTurnRequest(req) {
+    if (!isVoiceTurnContentType(req.get("Content-Type"))) {
+        return {
+            status: 415,
+            code: "VOICE_UNSUPPORTED_CONTENT_TYPE",
+            message: `Content-Type must be ${VOICE_TURN_CONTENT_TYPE}`
+        };
+    }
+
+    if (!isVoiceTurnAudioFormat(req.get("X-Audio-Format"))) {
+        return {
+            status: 415,
+            code: "VOICE_UNSUPPORTED_AUDIO_FORMAT",
+            message: `X-Audio-Format must be ${VOICE_TURN_AUDIO_FORMAT}`
+        };
+    }
+
+    if (!Buffer.isBuffer(req.body)) {
+        return {
+            status: 400,
+            code: "VOICE_BODY_REQUIRED",
+            message: "PCM request body is required"
+        };
+    }
+
+    if (req.body.length === 0) {
+        return {
+            status: 400,
+            code: "VOICE_BODY_EMPTY",
+            message: "PCM request body must not be empty"
+        };
+    }
+
+    if (req.body.length % 2 !== 0) {
+        return {
+            status: 400,
+            code: "VOICE_PCM_ALIGNMENT_INVALID",
+            message: "PCM s16le body length must be an even number of bytes"
+        };
+    }
+
+    return null;
+}
+
+function acquireVoiceTurn(deviceId, config) {
+    if (activeVoiceDevices.has(deviceId)) {
+        return {
+            status: 409,
+            code: "VOICE_DEVICE_BUSY",
+            message: "Device already has an active voice turn"
+        };
+    }
+
+    if (activeVoiceTurns >= config.maxConcurrent) {
+        return {
+            status: 429,
+            code: "VOICE_SERVER_BUSY",
+            message: "Voice turn concurrency limit reached"
+        };
+    }
+
+    activeVoiceDevices.add(deviceId);
+    activeVoiceTurns += 1;
+    return null;
+}
+
+function releaseVoiceTurn(deviceId) {
+    if (activeVoiceDevices.delete(deviceId)) {
+        activeVoiceTurns = Math.max(0, activeVoiceTurns - 1);
+    }
+}
+
+function createVoiceError(code, message, status) {
+    const error = new Error(message || code);
+    error.code = code;
+    error.status = status;
+    return error;
+}
+
+function describeVoiceError(error) {
+    const parts = [
+        `name=${error?.name || "Error"}`
+    ];
+
+    if (error?.code) {
+        parts.push(`code=${error.code}`);
+    }
+
+    if (typeof error?.status === "number") {
+        parts.push(`status=${error.status}`);
+    }
+
+    if (typeof error?.upstreamStatus === "number") {
+        parts.push(`upstream_status=${error.upstreamStatus}`);
+    }
+
+    if (typeof error?.bytes === "number") {
+        parts.push(`bytes=${error.bytes}`);
+    }
+
+    return parts.join(" ");
+}
+
+function sendVoiceError(res, status, code, message) {
+    if (res.headersSent) {
+        res.end();
+        return;
+    }
+
+    res
+        .status(status)
+        .set("X-Error-Code", code)
+        .json({
+            ok: false,
+            code,
+            error: message
+        });
+}
+
+function writeVoiceTurnHeaders(res) {
+    res
+        .status(200)
+        .set({
+            "Content-Type": VOICE_TURN_CONTENT_TYPE,
+            "X-Audio-Format": VOICE_TURN_AUDIO_FORMAT,
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff"
+        });
+}
+
+async function streamMockVoiceTurn(audioBuffer, res) {
+    writeVoiceTurnHeaders(res);
+    res.end(Buffer.alloc(audioBuffer.length));
+
+    return {
+        bytes: audioBuffer.length,
+        mode: "mock"
+    };
+}
+
+async function streamUpstreamVoiceTurn(audioBuffer, req, res, config, signal) {
+    if (!config.upstreamUrl) {
+        throw createVoiceError(
+            "VOICE_UPSTREAM_NOT_CONFIGURED",
+            "VOICE_TURN_UPSTREAM_URL is not configured",
+            503
+        );
+    }
+
+    if (typeof fetch !== "function") {
+        throw createVoiceError("VOICE_FETCH_UNAVAILABLE", "fetch is unavailable", 500);
+    }
+
+    const upstreamResponse = await fetch(config.upstreamUrl, {
+        method: "POST",
+        headers: {
+            "Content-Type": VOICE_TURN_CONTENT_TYPE,
+            "X-Audio-Format": VOICE_TURN_AUDIO_FORMAT,
+            "X-Device-Id": readVoiceDeviceId(req)
+        },
+        body: audioBuffer,
+        signal
+    });
+
+    if (!upstreamResponse.ok) {
+        const error = createVoiceError(
+            "VOICE_UPSTREAM_STATUS",
+            "Voice upstream request failed",
+            502
+        );
+        error.upstreamStatus = upstreamResponse.status;
+        throw error;
+    }
+
+    if (!upstreamResponse.body) {
+        throw createVoiceError("VOICE_UPSTREAM_EMPTY", "Voice upstream returned no audio stream", 502);
+    }
+
+    writeVoiceTurnHeaders(res);
+
+    let responseBytes = 0;
+    for await (const chunk of upstreamResponse.body) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        responseBytes += buffer.length;
+
+        if (!res.write(buffer)) {
+            await new Promise(resolve => res.once("drain", resolve));
+        }
+    }
+
+    res.end();
+
+    return {
+        bytes: responseBytes,
+        mode: "upstream"
+    };
+}
+
+async function handleVoiceTurn(req, res) {
+    const validationError = validateVoiceTurnRequest(req);
+    if (validationError) {
+        return sendVoiceError(
+            res,
+            validationError.status,
+            validationError.code,
+            validationError.message
+        );
+    }
+
+    const config = readVoiceTurnConfig();
+    const deviceId = readVoiceDeviceId(req);
+    const acquireError = acquireVoiceTurn(deviceId, config);
+    if (acquireError) {
+        console.warn(
+            `[voice-turn] rejected code=${acquireError.code} device_id=${maskLogValue(deviceId)} active=${activeVoiceTurns}/${config.maxConcurrent}`
+        );
+
+        return sendVoiceError(res, acquireError.status, acquireError.code, acquireError.message);
+    }
+
+    const requestBytes = req.body.length;
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+    }, config.timeoutMs);
+
+    const abortOnClientClose = () => {
+        if (!res.writableEnded) {
+            controller.abort();
+        }
+    };
+    req.on("aborted", abortOnClientClose);
+    res.on("close", abortOnClientClose);
+
+    console.log(
+        `[voice-turn] start device_id=${maskLogValue(deviceId)} bytes=${requestBytes} active=${activeVoiceTurns}/${config.maxConcurrent} mode=${config.mockEnabled ? "mock" : "upstream"} timeout_ms=${config.timeoutMs}`
+    );
+
+    try {
+        const result = config.mockEnabled
+            ? await streamMockVoiceTurn(req.body, res)
+            : await streamUpstreamVoiceTurn(req.body, req, res, config, controller.signal);
+        const elapsedMs = Date.now() - startedAt;
+
+        console.log(
+            `[voice-turn] success device_id=${maskLogValue(deviceId)} mode=${result.mode} request_bytes=${requestBytes} response_bytes=${result.bytes} elapsed_ms=${elapsedMs}`
+        );
+    } catch (error) {
+        const elapsedMs = Date.now() - startedAt;
+        const normalizedError = timedOut
+            ? createVoiceError("VOICE_TURN_TIMEOUT", "Voice turn timed out", 504)
+            : error;
+        const status = normalizedError.status || 500;
+        const code = normalizedError.code || "VOICE_TURN_FAILED";
+        const message = normalizedError.message || "Voice turn failed";
+
+        console.error(
+            `[voice-turn] failed device_id=${maskLogValue(deviceId)} elapsed_ms=${elapsedMs} ${describeVoiceError(normalizedError)}`
+        );
+
+        sendVoiceError(res, status, code, message);
+    } finally {
+        clearTimeout(timeout);
+        req.off("aborted", abortOnClientClose);
+        res.off("close", abortOnClientClose);
+        releaseVoiceTurn(deviceId);
+    }
 }
 
 function readLlmConfig() {

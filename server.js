@@ -19,6 +19,10 @@ const DEFAULT_LLM_TIMEOUT_MS = 30000;
 const LLM_TEXT_MAX_CHARS = 4000;
 const VOICE_TURN_CONTENT_TYPE = "audio/L16; rate=16000; channels=1";
 const VOICE_TURN_AUDIO_FORMAT = "pcm_s16le_mono_16k";
+const VOLC_GATEWAY_HOSTS = new Set([
+    "ai-gateway.vei.volces.com",
+    "fai-gateway.vei.volces.com"
+]);
 const DEFAULT_VOICE_TURN_TIMEOUT_MS = 45000;
 const DEFAULT_VOICE_TURN_MAX_CONCURRENT = 1;
 const DEFAULT_VOICE_TURN_MAX_BYTES = 4 * 1024 * 1024;
@@ -168,6 +172,54 @@ function readVoiceTurnConfig() {
         maxConcurrent: readPositiveInteger(process.env.VOICE_TURN_MAX_CONCURRENT, DEFAULT_VOICE_TURN_MAX_CONCURRENT),
         mockEnabled: String(process.env.VOICE_TURN_MOCK || "").trim() === "1"
     };
+}
+
+function validateVoiceTurnUpstreamUrl(upstreamUrl) {
+    if (!upstreamUrl) {
+        return {
+            status: 503,
+            code: "VOICE_UPSTREAM_NOT_CONFIGURED",
+            message: "VOICE_TURN_UPSTREAM_URL is not configured; set VOICE_TURN_MOCK=1 or configure a real HTTP voice upstream"
+        };
+    }
+
+    let parsed;
+    try {
+        parsed = new URL(upstreamUrl);
+    } catch (_) {
+        return {
+            status: 503,
+            code: "VOICE_UPSTREAM_INVALID",
+            message: "VOICE_TURN_UPSTREAM_URL must be an absolute http(s) URL"
+        };
+    }
+
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return {
+            status: 503,
+            code: "VOICE_UPSTREAM_INVALID",
+            message: "VOICE_TURN_UPSTREAM_URL must use http or https"
+        };
+    }
+
+    const normalizedPath = parsed.pathname.replace(/\/+$/, "").toLowerCase();
+    if (VOLC_GATEWAY_HOSTS.has(parsed.hostname.toLowerCase()) && normalizedPath === "/v1/voice") {
+        return {
+            status: 503,
+            code: "VOICE_UPSTREAM_INVALID",
+            message: "VOICE_TURN_UPSTREAM_URL points to unsupported Volc /v1/voice; set VOICE_TURN_MOCK=1 or configure a real HTTP voice upstream"
+        };
+    }
+
+    return null;
+}
+
+function validateVoiceTurnConfig(config) {
+    if (config.mockEnabled) {
+        return null;
+    }
+
+    return validateVoiceTurnUpstreamUrl(config.upstreamUrl);
 }
 
 function readVoiceDeviceId(req) {
@@ -376,14 +428,6 @@ async function streamMockVoiceTurn(audioBuffer, res) {
 }
 
 async function streamUpstreamVoiceTurn(audioBuffer, req, res, config, signal) {
-    if (!config.upstreamUrl) {
-        throw createVoiceError(
-            "VOICE_UPSTREAM_NOT_CONFIGURED",
-            "VOICE_TURN_UPSTREAM_URL is not configured",
-            503
-        );
-    }
-
     if (typeof fetch !== "function") {
         throw createVoiceError("VOICE_FETCH_UNAVAILABLE", "fetch is unavailable", 500);
     }
@@ -452,6 +496,15 @@ async function handleVoiceTurn(req, res) {
     }
 
     const config = readVoiceTurnConfig();
+    const configError = validateVoiceTurnConfig(config);
+    if (configError) {
+        console.warn(
+            `[voice-turn] rejected code=${configError.code} mode=upstream upstream_url=${maskLogValue(config.upstreamUrl)}`
+        );
+
+        return sendVoiceError(res, configError.status, configError.code, configError.message);
+    }
+
     const deviceId = readVoiceDeviceId(req);
     const acquireError = acquireVoiceTurn(deviceId, config);
     if (acquireError) {

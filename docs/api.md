@@ -75,7 +75,7 @@ LLM_TIMEOUT_MS=30000
 
 ### `POST /api/voice/turn`
 
-ESP 设备上传一轮 PCM 音频，服务器校验格式后转发到 `VOICE_TURN_UPSTREAM_URL` 指向的语音上游服务。该接口本身不直接调用火山引擎 Realtime API。
+ESP 设备上传一轮 PCM 音频，服务器校验格式后返回一轮语音音频。该接口默认不调用任何火山引擎语音地址，也不会把请求发到不存在的 `/v1/voice`。
 
 请求头：
 
@@ -94,12 +94,20 @@ X-Device-Id: esp32-c5-001
 服务器 `.env` 配置示例：
 
 ```dotenv
-VOICE_TURN_UPSTREAM_URL=<语音上游HTTP地址>
+VOICE_TURN_MOCK=1
+# VOICE_TURN_UPSTREAM_URL=<真实语音上游HTTP地址>
 VOICE_TURN_TIMEOUT_MS=45000
 VOICE_TURN_MAX_CONCURRENT=1
 VOICE_TURN_MAX_BYTES=4194304
-VOICE_TURN_MOCK=0
 ```
+
+配置说明：
+
+- 当前项目没有内置真实 ASR+LLM+TTS voice turn 上游时，请设置 `VOICE_TURN_MOCK=1`。服务器会稳定返回 `audio/L16; rate=16000; channels=1` 的 mock PCM 音频，用于验证 ESP32 和 Node 后端的 HTTP 音频链路。
+- 只有接入了真实 HTTP 语音上游服务时，才设置 `VOICE_TURN_MOCK=0` 并填写 `VOICE_TURN_UPSTREAM_URL`。
+- 火山网关当前已知可用的是文本 Chat Completions：`https://ai-gateway.vei.volces.com/v1/chat/completions`，以及 Realtime WebSocket：`wss://ai-gateway.vei.volces.com/v1/realtime?model=bigmodel`。这些都不是 `/api/voice/turn` 的 HTTP turn 上游。
+- 不要配置 `https://ai-gateway.vei.volces.com/v1/voice` 或 `https://fai-gateway.vei.volces.com/v1/voice`；服务器会返回 `VOICE_UPSTREAM_INVALID`，不会继续请求这个不存在的地址。
+- 当 `VOICE_TURN_MOCK` 不是 `1` 且 `VOICE_TURN_UPSTREAM_URL` 为空时，服务器会返回 `VOICE_UPSTREAM_NOT_CONFIGURED`。
 
 失败响应会返回结构化错误码。缺少 `X-Audio-Format` 时返回 HTTP `415`：
 
@@ -108,6 +116,26 @@ VOICE_TURN_MOCK=0
   "ok": false,
   "code": "VOICE_UNSUPPORTED_AUDIO_FORMAT",
   "error": "X-Audio-Format must be pcm_s16le_mono_16k"
+}
+```
+
+未启用 mock 且未配置真实语音上游时返回 HTTP `503`：
+
+```json
+{
+  "ok": false,
+  "code": "VOICE_UPSTREAM_NOT_CONFIGURED",
+  "error": "VOICE_TURN_UPSTREAM_URL is not configured; set VOICE_TURN_MOCK=1 or configure a real HTTP voice upstream"
+}
+```
+
+配置到无效火山 `/v1/voice` 地址时返回 HTTP `503`：
+
+```json
+{
+  "ok": false,
+  "code": "VOICE_UPSTREAM_INVALID",
+  "error": "VOICE_TURN_UPSTREAM_URL points to unsupported Volc /v1/voice; set VOICE_TURN_MOCK=1 or configure a real HTTP voice upstream"
 }
 ```
 

@@ -1,6 +1,9 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const express = require("express");
+const http = require("http");
+const https = require("https");
 const path = require("path");
 const sqlite3 = require("sqlite3").verbose();
 const {
@@ -17,18 +20,28 @@ const DEFAULT_LLM_CHAT_PATH = "/v1/chat/completions";
 const DEFAULT_LLM_MODEL = "Doubao-Seed-1.6-flash";
 const DEFAULT_LLM_TIMEOUT_MS = 30000;
 const LLM_TEXT_MAX_CHARS = 4000;
+const DEFAULT_VOLC_GATEWAY_WS_BASE_URL = "wss://ai-gateway.vei.volces.com";
+const DEFAULT_VOLC_GATEWAY_HTTP_BASE_URL = "https://ai-gateway.vei.volces.com";
+const DEFAULT_VOLC_GATEWAY_REALTIME_PATH = "/v1/realtime";
+const DEFAULT_VOLC_GATEWAY_CHAT_PATH = "/v1/chat/completions";
+const DEFAULT_VOLC_GATEWAY_ASR_MODEL = "bigmodel";
+const DEFAULT_VOLC_GATEWAY_CHAT_MODEL = DEFAULT_LLM_MODEL;
+const DEFAULT_VOLC_GATEWAY_ASR_FORMAT = "pcm";
+const DEFAULT_VOLC_GATEWAY_ASR_CODEC = "raw";
+const DEFAULT_VOLC_GATEWAY_ASR_RESOURCE_ID = "volc.bigasr.sauc.duration";
+const DEFAULT_VOLC_GATEWAY_TTS_SAMPLE_RATE = 16000;
+const DEFAULT_VOLC_GATEWAY_TTS_FORMAT = "pcm_s16le_mono_16k";
+const DEFAULT_VOLC_GATEWAY_WS_AUDIO_CHUNK_BYTES = 32000;
 const VOICE_TURN_CONTENT_TYPE = "audio/L16; rate=16000; channels=1";
 const VOICE_TURN_AUDIO_FORMAT = "pcm_s16le_mono_16k";
-const VOLC_GATEWAY_HOSTS = new Set([
-    "ai-gateway.vei.volces.com",
-    "fai-gateway.vei.volces.com"
-]);
 const DEFAULT_VOICE_TURN_TIMEOUT_MS = 45000;
 const DEFAULT_VOICE_TURN_MAX_CONCURRENT = 1;
 const DEFAULT_VOICE_TURN_MAX_BYTES = 4 * 1024 * 1024;
 const VOICE_TURN_SAMPLE_RATE = 16000;
 const VOICE_TURN_MOCK_BEEP_HZ = 1000;
 const VOICE_TURN_MOCK_BEEP_AMPLITUDE = 12000;
+const DEFAULT_TTS_FORMAT = VOICE_TURN_AUDIO_FORMAT;
+const DEFAULT_TTS_SAMPLE_RATE = VOICE_TURN_SAMPLE_RATE;
 const activeVoiceDevices = new Set();
 let activeVoiceTurns = 0;
 let legacyLlmBaseUrlWarned = false;
@@ -48,8 +61,12 @@ app.use((err, req, res, next) => {
         const code = err?.type === "entity.too.large"
             ? "VOICE_BODY_TOO_LARGE"
             : "VOICE_BODY_PARSE_FAILED";
+        const deviceId = readVoiceDeviceId(req);
+        const inputBytes = Number.isFinite(err?.received)
+            ? err.received
+            : (Number.isFinite(err?.length) ? err.length : 0);
 
-        console.warn(`[voice-turn] body parser failed code=${code} status=${status} message=${err?.message || "-"}`);
+        console.warn(`[voice-turn] body parser failed device_id=${maskLogValue(deviceId)} input_bytes=${inputBytes} elapsed_ms=0 code=${code} status=${status} message=${JSON.stringify(err?.message || "-")}`);
         return sendVoiceError(res, status, code, err?.message || "Invalid PCM request body");
     }
 
@@ -170,59 +187,273 @@ function isVoiceTurnAudioFormat(value) {
 
 function readVoiceTurnConfig() {
     return {
-        upstreamUrl: (process.env.VOICE_TURN_UPSTREAM_URL || "").trim(),
         timeoutMs: readPositiveInteger(process.env.VOICE_TURN_TIMEOUT_MS, DEFAULT_VOICE_TURN_TIMEOUT_MS),
         maxConcurrent: readPositiveInteger(process.env.VOICE_TURN_MAX_CONCURRENT, DEFAULT_VOICE_TURN_MAX_CONCURRENT),
-        mockEnabled: String(process.env.VOICE_TURN_MOCK || "").trim() === "1"
+        mockEnabled: String(process.env.VOICE_TURN_MOCK || "").trim() === "1",
+        wsAudioChunkBytes: readPositiveInteger(
+            process.env.VOLC_GATEWAY_WS_AUDIO_CHUNK_BYTES,
+            DEFAULT_VOLC_GATEWAY_WS_AUDIO_CHUNK_BYTES
+        )
     };
 }
 
-function validateVoiceTurnUpstreamUrl(upstreamUrl) {
-    if (!upstreamUrl) {
-        return {
-            status: 503,
-            code: "VOICE_UPSTREAM_NOT_CONFIGURED",
-            message: "VOICE_TURN_UPSTREAM_URL is not configured; set VOICE_TURN_MOCK=1 or configure a real HTTP voice upstream"
-        };
+function readTrimmedEnv(name, fallback = "") {
+    const value = process.env[name];
+    if (typeof value !== "string") {
+        return fallback;
     }
 
+    const trimmed = value.trim();
+    return trimmed || fallback;
+}
+
+function readBooleanFlag(value) {
+    const normalized = String(value || "").trim().toLowerCase();
+    return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function normalizeBaseUrl(value, fallback, expectedProtocols) {
+    const rawValue = readTrimmedEnv(value, fallback).replace(/\/+$/, "");
     let parsed;
     try {
-        parsed = new URL(upstreamUrl);
+        parsed = new URL(rawValue);
+    } catch (_) {
+        return rawValue;
+    }
+
+    if (expectedProtocols.includes(parsed.protocol)) {
+        return rawValue;
+    }
+
+    return rawValue;
+}
+
+function normalizeGatewayPathValue(value) {
+    const pathValue = String(value || "").trim();
+    if (!pathValue) {
+        return "";
+    }
+
+    if (/^https?:\/\//i.test(pathValue) || /^wss?:\/\//i.test(pathValue)) {
+        return pathValue;
+    }
+
+    return pathValue.startsWith("/") ? pathValue : `/${pathValue}`;
+}
+
+function readGatewayPathEnv(name, fallback) {
+    return normalizeGatewayPathValue(readTrimmedEnv(name, fallback));
+}
+
+function buildGatewayHttpUrl(baseUrl, pathValue) {
+    const normalizedPath = normalizeGatewayPathValue(pathValue);
+    if (/^https?:\/\//i.test(normalizedPath) || /^wss?:\/\//i.test(normalizedPath)) {
+        return normalizedPath;
+    }
+
+    return `${baseUrl.replace(/\/+$/, "")}${normalizedPath || "/"}`;
+}
+
+function buildGatewayRealtimeUrl(baseUrl, pathValue, model) {
+    const normalizedPath = normalizeGatewayPathValue(pathValue);
+    const rawUrl = /^wss?:\/\//i.test(normalizedPath) || /^https?:\/\//i.test(normalizedPath)
+        ? normalizedPath.replace(/^http/i, "ws")
+        : buildGatewayHttpUrl(baseUrl.replace(/^http/i, "ws"), normalizedPath);
+    const url = new URL(rawUrl);
+    url.searchParams.set("model", model);
+    return url.toString();
+}
+
+function buildGatewayTtsUrl(wsBaseUrl, pathValue, model) {
+    if (/^https?:\/\//i.test(pathValue) || /^wss?:\/\//i.test(pathValue)) {
+        const url = new URL(pathValue);
+        if (url.protocol === "ws:" || url.protocol === "wss:") {
+            url.searchParams.set("model", model);
+        }
+        return url.toString();
+    }
+
+    return buildGatewayRealtimeUrl(wsBaseUrl, pathValue, model);
+}
+
+function summarizeSecret(value) {
+    const secret = String(value || "");
+    const length = secret.length;
+    if (length === 0) {
+        return "len=0, masked=-";
+    }
+
+    if (length <= 8) {
+        return `len=${length}, masked=${secret.slice(0, 1)}***${secret.slice(-1)}`;
+    }
+
+    return `len=${length}, masked=${secret.slice(0, 4)}***${secret.slice(-4)}`;
+}
+
+function readVolcGatewayConfig() {
+    const apiKey = readTrimmedEnv("VOLC_GATEWAY_API_KEY");
+    const wsBaseUrl = normalizeBaseUrl(
+        "VOLC_GATEWAY_WS_BASE_URL",
+        DEFAULT_VOLC_GATEWAY_WS_BASE_URL,
+        ["ws:", "wss:"]
+    );
+    const httpBaseUrl = normalizeBaseUrl(
+        "VOLC_GATEWAY_HTTP_BASE_URL",
+        DEFAULT_VOLC_GATEWAY_HTTP_BASE_URL,
+        ["http:", "https:"]
+    );
+    const realtimePath = readGatewayPathEnv("VOLC_GATEWAY_REALTIME_PATH", DEFAULT_VOLC_GATEWAY_REALTIME_PATH);
+    const chatPath = readGatewayPathEnv("VOLC_GATEWAY_CHAT_PATH", DEFAULT_VOLC_GATEWAY_CHAT_PATH);
+    const asrModel = readTrimmedEnv("VOLC_GATEWAY_ASR_MODEL", DEFAULT_VOLC_GATEWAY_ASR_MODEL);
+    const chatModel = readTrimmedEnv("VOLC_GATEWAY_CHAT_MODEL", DEFAULT_VOLC_GATEWAY_CHAT_MODEL);
+    const ttsModel = readTrimmedEnv("VOLC_GATEWAY_TTS_MODEL");
+    const ttsVoice = readTrimmedEnv("VOLC_GATEWAY_TTS_VOICE");
+    const ttsPath = readGatewayPathEnv("VOLC_GATEWAY_TTS_PATH", ttsModel ? realtimePath : "");
+    const asrSampleRate = readPositiveInteger(
+        process.env.VOLC_GATEWAY_ASR_SAMPLE_RATE,
+        VOICE_TURN_SAMPLE_RATE
+    );
+    const asrBits = readPositiveInteger(process.env.VOLC_GATEWAY_ASR_BITS, 16);
+    const asrChannels = readPositiveInteger(process.env.VOLC_GATEWAY_ASR_CHANNELS, 1);
+    const ttsSampleRate = readPositiveInteger(
+        process.env.VOLC_GATEWAY_TTS_SAMPLE_RATE,
+        DEFAULT_VOLC_GATEWAY_TTS_SAMPLE_RATE
+    );
+    const ttsFormat = readTrimmedEnv("VOLC_GATEWAY_TTS_FORMAT", DEFAULT_VOLC_GATEWAY_TTS_FORMAT);
+    const ttsResourceId = readTrimmedEnv("VOLC_GATEWAY_TTS_RESOURCE_ID");
+
+    return {
+        apiKey,
+        keySummary: summarizeSecret(apiKey),
+        wsBaseUrl,
+        httpBaseUrl,
+        realtimePath,
+        chatPath,
+        asr: {
+            model: asrModel,
+            url: buildGatewayRealtimeUrl(wsBaseUrl, realtimePath, asrModel),
+            sampleRate: asrSampleRate,
+            bits: asrBits,
+            channels: asrChannels,
+            format: readTrimmedEnv("VOLC_GATEWAY_ASR_FORMAT", DEFAULT_VOLC_GATEWAY_ASR_FORMAT),
+            codec: readTrimmedEnv("VOLC_GATEWAY_ASR_CODEC", DEFAULT_VOLC_GATEWAY_ASR_CODEC),
+            useResourceId: readBooleanFlag(process.env.VOLC_GATEWAY_USE_RESOURCE_ID),
+            resourceId: readTrimmedEnv("VOLC_GATEWAY_ASR_RESOURCE_ID", DEFAULT_VOLC_GATEWAY_ASR_RESOURCE_ID)
+        },
+        chat: {
+            baseUrl: httpBaseUrl,
+            path: chatPath,
+            endpoint: buildGatewayHttpUrl(httpBaseUrl, chatPath),
+            model: chatModel
+        },
+        tts: {
+            model: ttsModel,
+            voice: ttsVoice,
+            path: ttsPath,
+            url: ttsModel && ttsPath ? buildGatewayTtsUrl(wsBaseUrl, ttsPath, ttsModel) : "",
+            sampleRate: ttsSampleRate,
+            format: ttsFormat,
+            useResourceId: readBooleanFlag(process.env.VOLC_GATEWAY_TTS_USE_RESOURCE_ID),
+            resourceId: ttsResourceId
+        }
+    };
+}
+
+function validateUrl(value, protocols, code, envName) {
+    let parsed;
+    try {
+        parsed = new URL(value);
     } catch (_) {
         return {
             status: 503,
-            code: "VOICE_UPSTREAM_INVALID",
-            message: "VOICE_TURN_UPSTREAM_URL must be an absolute http(s) URL"
+            code,
+            message: `${envName} must be an absolute http(s) URL`
         };
     }
 
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    if (!protocols.includes(parsed.protocol)) {
         return {
             status: 503,
-            code: "VOICE_UPSTREAM_INVALID",
-            message: "VOICE_TURN_UPSTREAM_URL must use http or https"
-        };
-    }
-
-    const normalizedPath = parsed.pathname.replace(/\/+$/, "").toLowerCase();
-    if (VOLC_GATEWAY_HOSTS.has(parsed.hostname.toLowerCase()) && normalizedPath === "/v1/voice") {
-        return {
-            status: 503,
-            code: "VOICE_UPSTREAM_INVALID",
-            message: "VOICE_TURN_UPSTREAM_URL points to unsupported Volc /v1/voice; set VOICE_TURN_MOCK=1 or configure a real HTTP voice upstream"
+            code,
+            message: `${envName} must use ${protocols.join(" or ").replace(/:/g, "")}`
         };
     }
 
     return null;
 }
 
-function validateVoiceTurnConfig(config) {
-    if (config.mockEnabled) {
-        return null;
+function validateVoiceAsrConfig(config) {
+    if (!config.apiKey || !config.asr.model) {
+        return {
+            status: 503,
+            code: "VOICE_ASR_NOT_CONFIGURED",
+            message: "VOLC_GATEWAY_API_KEY and VOLC_GATEWAY_ASR_MODEL must be configured when VOICE_TURN_MOCK is not 1"
+        };
     }
 
-    return validateVoiceTurnUpstreamUrl(config.upstreamUrl);
+    const urlError = validateUrl(config.asr.url, ["ws:", "wss:"], "VOICE_ASR_NOT_CONFIGURED", "VOLC_GATEWAY_WS_BASE_URL/VOLC_GATEWAY_REALTIME_PATH");
+    if (urlError) {
+        return urlError;
+    }
+
+    if (config.asr.sampleRate !== VOICE_TURN_SAMPLE_RATE ||
+        config.asr.bits !== 16 ||
+        config.asr.channels !== 1 ||
+        config.asr.format !== DEFAULT_VOLC_GATEWAY_ASR_FORMAT ||
+        config.asr.codec !== DEFAULT_VOLC_GATEWAY_ASR_CODEC) {
+        return {
+            status: 503,
+            code: "VOICE_ASR_NOT_CONFIGURED",
+            message: "VOLC_GATEWAY_ASR_* must describe pcm_s16le_mono_16k raw PCM"
+        };
+    }
+
+    return null;
+}
+
+function validateVoiceChatConfig(config) {
+    if (!config.apiKey || !config.chat.model) {
+        return {
+            status: 503,
+            code: "VOICE_LLM_NOT_CONFIGURED",
+            message: "VOLC_GATEWAY_API_KEY and VOLC_GATEWAY_CHAT_MODEL must be configured when VOICE_TURN_MOCK is not 1"
+        };
+    }
+
+    return validateUrl(config.chat.endpoint, ["http:", "https:"], "VOICE_LLM_NOT_CONFIGURED", "VOLC_GATEWAY_HTTP_BASE_URL/VOLC_GATEWAY_CHAT_PATH");
+}
+
+function validateVoiceTtsConfig(config) {
+    if (!config.apiKey || !config.tts.model || !config.tts.voice || !config.tts.path) {
+        return {
+            status: 503,
+            code: "VOICE_TTS_NOT_CONFIGURED",
+            message: "VOLC_GATEWAY_TTS_MODEL, VOLC_GATEWAY_TTS_VOICE, and VOLC_GATEWAY_TTS_PATH must be configured when VOICE_TURN_MOCK is not 1"
+        };
+    }
+
+    const urlError = validateUrl(config.tts.url, ["ws:", "wss:", "http:", "https:"], "VOICE_TTS_NOT_CONFIGURED", "VOLC_GATEWAY_WS_BASE_URL/VOLC_GATEWAY_TTS_PATH");
+    if (urlError) {
+        return urlError;
+    }
+
+    if (config.tts.format !== VOICE_TURN_AUDIO_FORMAT) {
+        return {
+            status: 503,
+            code: "VOICE_TTS_NOT_CONFIGURED",
+            message: `VOLC_GATEWAY_TTS_FORMAT must be ${VOICE_TURN_AUDIO_FORMAT}`
+        };
+    }
+
+    if (config.tts.sampleRate !== VOICE_TURN_SAMPLE_RATE) {
+        return {
+            status: 503,
+            code: "VOICE_TTS_NOT_CONFIGURED",
+            message: `VOLC_GATEWAY_TTS_SAMPLE_RATE must be ${VOICE_TURN_SAMPLE_RATE}`
+        };
+    }
+
+    return null;
 }
 
 function readVoiceDeviceId(req) {
@@ -356,6 +587,10 @@ function describeVoiceError(error) {
         `name=${error?.name || "Error"}`
     ];
 
+    if (error?.stage) {
+        parts.push(`stage=${error.stage}`);
+    }
+
     if (error?.code) {
         parts.push(`code=${error.code}`);
     }
@@ -374,6 +609,14 @@ function describeVoiceError(error) {
 
     if (typeof error?.bodyLength === "number") {
         parts.push(`body_len=${error.bodyLength}`);
+    }
+
+    if (error?.endpoint) {
+        parts.push(`endpoint=${error.endpoint}`);
+    }
+
+    if (error?.model) {
+        parts.push(`model=${error.model}`);
     }
 
     if (error?.bodyPreview) {
@@ -439,70 +682,1061 @@ async function streamMockVoiceTurn(audioBuffer, res) {
 
     return {
         bytes: audioBuffer.length,
-        mode: "mock"
+        mode: "mock",
+        asrTextLength: 0,
+        llmReplyLength: 0,
+        ttsPcmBytes: 0
     };
 }
 
-async function streamUpstreamVoiceTurn(audioBuffer, req, res, config, signal) {
-    if (typeof fetch !== "function") {
-        throw createVoiceError("VOICE_FETCH_UNAVAILABLE", "fetch is unavailable", 500);
+function createVoiceStageError(stage, code, message, status, details = {}) {
+    const error = createVoiceError(code, message, status);
+    error.stage = stage;
+    Object.assign(error, details);
+    return error;
+}
+
+function createUpstreamVoiceStageError(stage, code, response, responseBody, fallbackMessage) {
+    const upstreamMessage = extractErrorMessageFromBody(responseBody);
+    return createVoiceStageError(
+        stage,
+        code,
+        upstreamMessage || fallbackMessage,
+        502,
+        {
+            upstreamStatus: response.status,
+            bodyLength: responseBody.length,
+            bodyPreview: normalizeLogPreview(responseBody)
+        }
+    );
+}
+
+function findStringField(value, keys, visited = new Set()) {
+    if (!value || typeof value !== "object") {
+        return "";
     }
 
-    const upstreamResponse = await fetch(config.upstreamUrl, {
-        method: "POST",
-        headers: {
-            "Content-Type": VOICE_TURN_CONTENT_TYPE,
-            "X-Audio-Format": VOICE_TURN_AUDIO_FORMAT,
-            "X-Device-Id": readVoiceDeviceId(req)
-        },
-        body: audioBuffer,
-        signal
-    });
+    if (visited.has(value)) {
+        return "";
+    }
+    visited.add(value);
 
-    if (!upstreamResponse.ok) {
-        const responseBody = await upstreamResponse.text();
-        const upstreamMessage = extractErrorMessageFromBody(responseBody);
-        const status = upstreamResponse.status >= 400 && upstreamResponse.status < 500
-            ? upstreamResponse.status
-            : 502;
-        const error = createVoiceError(
-            "VOICE_UPSTREAM_STATUS",
-            upstreamMessage || "Voice upstream request failed",
-            status
-        );
-        error.upstreamStatus = upstreamResponse.status;
-        error.bodyLength = responseBody.length;
-        error.bodyPreview = normalizeLogPreview(responseBody);
-        throw error;
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const found = findStringField(item, keys, visited);
+            if (found) {
+                return found;
+            }
+        }
+
+        return "";
     }
 
-    if (!upstreamResponse.body) {
-        throw createVoiceError("VOICE_UPSTREAM_EMPTY", "Voice upstream returned no audio stream", 502);
-    }
-
-    writeVoiceTurnHeaders(res);
-
-    let responseBytes = 0;
-    for await (const chunk of upstreamResponse.body) {
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        responseBytes += buffer.length;
-
-        if (!res.write(buffer)) {
-            await new Promise(resolve => res.once("drain", resolve));
+    for (const key of keys) {
+        const fieldValue = value[key];
+        if (typeof fieldValue === "string" && fieldValue.trim()) {
+            return fieldValue.trim();
         }
     }
 
-    res.end();
+    for (const fieldValue of Object.values(value)) {
+        const found = findStringField(fieldValue, keys, visited);
+        if (found) {
+            return found;
+        }
+    }
+
+    return "";
+}
+
+function extractAsrTextFromBody(responseBody) {
+    const trimmed = responseBody.trim();
+    if (!trimmed) {
+        return "";
+    }
+
+    try {
+        const payload = JSON.parse(trimmed);
+        return findStringField(payload, [
+            "text",
+            "asr_text",
+            "transcript",
+            "utterance",
+            "result_text",
+            "final_text",
+            "content"
+        ]);
+    } catch (_) {
+        return trimmed;
+    }
+}
+
+function decodeBase64Buffer(value) {
+    if (typeof value !== "string") {
+        return null;
+    }
+
+    let normalized = value.trim();
+    const dataUrlMatch = normalized.match(/^data:[^,]+,(.+)$/i);
+    if (dataUrlMatch) {
+        normalized = dataUrlMatch[1];
+    }
+
+    normalized = normalized.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+    if (!normalized || normalized.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) {
+        return null;
+    }
+
+    const decoded = Buffer.from(normalized, "base64");
+    return decoded.length > 0 ? decoded : null;
+}
+
+function contentTypeIndicatesUnsupportedAudio(contentType) {
+    const normalized = String(contentType || "").toLowerCase();
+    return normalized.includes("audio/mpeg") ||
+        normalized.includes("audio/mp3") ||
+        normalized.includes("audio/ogg") ||
+        normalized.includes("audio/flac") ||
+        normalized.includes("audio/aac") ||
+        normalized.includes("audio/mp4") ||
+        normalized.includes("audio/webm");
+}
+
+function bufferLooksLikeUnsupportedAudio(buffer) {
+    if (!Buffer.isBuffer(buffer) || buffer.length < 4) {
+        return false;
+    }
+
+    return buffer.toString("ascii", 0, 3) === "ID3" ||
+        buffer.toString("ascii", 0, 4) === "OggS" ||
+        buffer.toString("ascii", 0, 4) === "fLaC" ||
+        buffer.toString("ascii", 4, 8) === "ftyp" ||
+        (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0);
+}
+
+function extractPcmFromWav(buffer) {
+    let fmt = null;
+    let dataStart = -1;
+    let dataEnd = -1;
+    let offset = 12;
+
+    while (offset + 8 <= buffer.length) {
+        const chunkId = buffer.toString("ascii", offset, offset + 4);
+        const chunkSize = buffer.readUInt32LE(offset + 4);
+        const chunkStart = offset + 8;
+        const chunkEnd = chunkStart + chunkSize;
+
+        if (chunkEnd > buffer.length) {
+            throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS WAV response is truncated", 502);
+        }
+
+        if (chunkId === "fmt ") {
+            if (chunkSize < 16) {
+                throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS WAV fmt chunk is invalid", 502);
+            }
+
+            fmt = {
+                audioFormat: buffer.readUInt16LE(chunkStart),
+                channels: buffer.readUInt16LE(chunkStart + 2),
+                sampleRate: buffer.readUInt32LE(chunkStart + 4),
+                bitsPerSample: buffer.readUInt16LE(chunkStart + 14)
+            };
+        } else if (chunkId === "data") {
+            dataStart = chunkStart;
+            dataEnd = chunkEnd;
+        }
+
+        offset = chunkEnd + (chunkSize % 2);
+    }
+
+    if (!fmt || dataStart < 0) {
+        throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS WAV response is missing fmt or data chunk", 502);
+    }
+
+    if (fmt.audioFormat !== 1 ||
+        fmt.channels !== 1 ||
+        fmt.sampleRate !== VOICE_TURN_SAMPLE_RATE ||
+        fmt.bitsPerSample !== 16) {
+        throw createVoiceStageError(
+            "tts",
+            "VOICE_TTS_FAILED",
+            "TTS WAV response must be PCM s16le mono 16kHz",
+            502
+        );
+    }
+
+    return buffer.subarray(dataStart, dataEnd);
+}
+
+function normalizeTtsPcmBuffer(buffer, contentType = "") {
+    if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+        throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS response did not contain audio", 502);
+    }
+
+    if (contentTypeIndicatesUnsupportedAudio(contentType) || bufferLooksLikeUnsupportedAudio(buffer)) {
+        throw createVoiceStageError("tts", "VOICE_TTS_UNSUPPORTED_AUDIO", "TTS response must be raw PCM or WAV PCM s16le mono 16kHz", 502, {
+            bodyLength: buffer.length
+        });
+    }
+
+    let pcmBuffer = buffer;
+    if (buffer.length >= 12 &&
+        buffer.toString("ascii", 0, 4) === "RIFF" &&
+        buffer.toString("ascii", 8, 12) === "WAVE") {
+        pcmBuffer = extractPcmFromWav(buffer);
+    }
+
+    if (pcmBuffer.length === 0 || pcmBuffer.length % 2 !== 0) {
+        throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS PCM response must be non-empty s16le data", 502);
+    }
+
+    return pcmBuffer;
+}
+
+function extractTtsPcmFromJson(responseBody) {
+    let payload;
+    try {
+        payload = JSON.parse(responseBody);
+    } catch (error) {
+        throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS JSON response could not be parsed", 502, {
+            bodyLength: responseBody.length,
+            bodyPreview: normalizeLogPreview(responseBody),
+            cause: error
+        });
+    }
+
+    const encodedAudio = findStringField(payload, [
+        "pcm_base64",
+        "audio_base64",
+        "pcm",
+        "audio",
+        "data"
+    ]);
+    const decoded = decodeBase64Buffer(encodedAudio);
+    if (!decoded) {
+        throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS JSON response did not contain base64 PCM audio", 502, {
+            bodyLength: responseBody.length,
+            bodyPreview: normalizeLogPreview(responseBody)
+        });
+    }
+
+    return normalizeTtsPcmBuffer(decoded);
+}
+
+function maybeExtractTtsPcmFromJson(responseBuffer) {
+    const responseBody = responseBuffer.toString("utf8");
+    const preview = responseBody.trimStart();
+    const trimmed = preview.trimEnd();
+    const looksLikeJson = (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+        (trimmed.startsWith("[") && trimmed.endsWith("]"));
+    if (!looksLikeJson) {
+        return null;
+    }
+
+    return extractTtsPcmFromJson(responseBody);
+}
+
+function buildVolcGatewayHeaders(config, purpose) {
+    const headers = {
+        Authorization: `Bearer ${config.apiKey}`
+    };
+
+    if (purpose === "asr" && config.asr.useResourceId && config.asr.resourceId) {
+        headers["X-Api-Resource-Id"] = config.asr.resourceId;
+    }
+
+    if (purpose === "tts" && config.tts.useResourceId && config.tts.resourceId) {
+        headers["X-Api-Resource-Id"] = config.tts.resourceId;
+    }
+
+    return headers;
+}
+
+function createAbortError() {
+    const error = new Error("Operation was aborted");
+    error.name = "AbortError";
+    return error;
+}
+
+function createWebSocketAcceptValue(key) {
+    return crypto
+        .createHash("sha1")
+        .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+        .digest("base64");
+}
+
+function encodeWebSocketFrame(opcode, payload = Buffer.alloc(0)) {
+    const body = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload));
+    const headerLength = body.length < 126 ? 2 : (body.length <= 0xffff ? 4 : 10);
+    const maskKey = crypto.randomBytes(4);
+    const frame = Buffer.alloc(headerLength + 4 + body.length);
+    frame[0] = 0x80 | opcode;
+
+    if (body.length < 126) {
+        frame[1] = 0x80 | body.length;
+        maskKey.copy(frame, 2);
+        for (let i = 0; i < body.length; i += 1) {
+            frame[6 + i] = body[i] ^ maskKey[i % 4];
+        }
+        return frame;
+    }
+
+    if (body.length <= 0xffff) {
+        frame[1] = 0x80 | 126;
+        frame.writeUInt16BE(body.length, 2);
+        maskKey.copy(frame, 4);
+        for (let i = 0; i < body.length; i += 1) {
+            frame[8 + i] = body[i] ^ maskKey[i % 4];
+        }
+        return frame;
+    }
+
+    frame[1] = 0x80 | 127;
+    frame.writeBigUInt64BE(BigInt(body.length), 2);
+    maskKey.copy(frame, 10);
+    for (let i = 0; i < body.length; i += 1) {
+        frame[14 + i] = body[i] ^ maskKey[i % 4];
+    }
+    return frame;
+}
+
+class MinimalWebSocket {
+    constructor(socket, stage) {
+        this.socket = socket;
+        this.stage = stage;
+        this.buffer = Buffer.alloc(0);
+        this.messages = [];
+        this.waiters = [];
+        this.closed = false;
+        this.closeError = null;
+        this.fragmentOpcode = 0;
+        this.fragmentBuffers = [];
+
+        socket.on("data", chunk => this.onData(chunk));
+        socket.on("error", error => this.fail(error));
+        socket.on("close", () => this.close());
+    }
+
+    sendText(text) {
+        if (this.closed) {
+            throw createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_FAILED`, "Realtime WebSocket is closed", 502);
+        }
+
+        this.socket.write(encodeWebSocketFrame(0x1, Buffer.from(text)));
+    }
+
+    sendClose() {
+        if (!this.closed) {
+            this.socket.end(encodeWebSocketFrame(0x8));
+        }
+    }
+
+    close() {
+        if (this.closed) {
+            return;
+        }
+
+        this.closed = true;
+        for (const waiter of this.waiters.splice(0)) {
+            waiter.reject(this.closeError || createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_FAILED`, "Realtime WebSocket closed before completion", 502));
+        }
+    }
+
+    fail(error) {
+        this.closeError = error?.code
+            ? error
+            : createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_FAILED`, error?.message || "Realtime WebSocket failed", 502, {
+                cause: error
+            });
+        this.close();
+    }
+
+    pushMessage(message) {
+        const waiter = this.waiters.shift();
+        if (waiter) {
+            waiter.resolve(message);
+            return;
+        }
+
+        this.messages.push(message);
+    }
+
+    onData(chunk) {
+        this.buffer = Buffer.concat([this.buffer, chunk]);
+
+        while (this.buffer.length >= 2) {
+            const first = this.buffer[0];
+            const second = this.buffer[1];
+            const fin = (first & 0x80) !== 0;
+            const opcode = first & 0x0f;
+            const masked = (second & 0x80) !== 0;
+            let payloadLength = second & 0x7f;
+            let offset = 2;
+
+            if (payloadLength === 126) {
+                if (this.buffer.length < offset + 2) {
+                    return;
+                }
+                payloadLength = this.buffer.readUInt16BE(offset);
+                offset += 2;
+            } else if (payloadLength === 127) {
+                if (this.buffer.length < offset + 8) {
+                    return;
+                }
+                const bigLength = this.buffer.readBigUInt64BE(offset);
+                if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) {
+                    this.fail(createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_FAILED`, "Realtime WebSocket frame is too large", 502));
+                    return;
+                }
+                payloadLength = Number(bigLength);
+                offset += 8;
+            }
+
+            let maskKey = null;
+            if (masked) {
+                if (this.buffer.length < offset + 4) {
+                    return;
+                }
+                maskKey = this.buffer.subarray(offset, offset + 4);
+                offset += 4;
+            }
+
+            if (this.buffer.length < offset + payloadLength) {
+                return;
+            }
+
+            let payload = this.buffer.subarray(offset, offset + payloadLength);
+            this.buffer = this.buffer.subarray(offset + payloadLength);
+
+            if (masked && maskKey) {
+                const unmasked = Buffer.alloc(payload.length);
+                for (let i = 0; i < payload.length; i += 1) {
+                    unmasked[i] = payload[i] ^ maskKey[i % 4];
+                }
+                payload = unmasked;
+            }
+
+            this.handleFrame(opcode, fin, payload);
+        }
+    }
+
+    handleFrame(opcode, fin, payload) {
+        if (opcode === 0x8) {
+            this.sendClose();
+            this.close();
+            return;
+        }
+
+        if (opcode === 0x9) {
+            this.socket.write(encodeWebSocketFrame(0xA, payload));
+            return;
+        }
+
+        if (opcode === 0xA) {
+            return;
+        }
+
+        if (opcode === 0x1 || opcode === 0x2) {
+            if (fin) {
+                this.pushMessage(payload.toString("utf8"));
+                return;
+            }
+            this.fragmentOpcode = opcode;
+            this.fragmentBuffers = [payload];
+            return;
+        }
+
+        if (opcode === 0x0 && this.fragmentOpcode !== 0) {
+            this.fragmentBuffers.push(payload);
+            if (fin) {
+                const message = Buffer.concat(this.fragmentBuffers).toString("utf8");
+                this.fragmentOpcode = 0;
+                this.fragmentBuffers = [];
+                this.pushMessage(message);
+            }
+            return;
+        }
+
+        this.fail(createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_FAILED`, `Unsupported Realtime WebSocket opcode ${opcode}`, 502));
+    }
+
+    nextMessage(signal) {
+        if (this.messages.length > 0) {
+            return Promise.resolve(this.messages.shift());
+        }
+
+        if (this.closed) {
+            return Promise.reject(this.closeError || createVoiceStageError(this.stage, `VOICE_${this.stage.toUpperCase()}_FAILED`, "Realtime WebSocket closed before completion", 502));
+        }
+
+        return new Promise((resolve, reject) => {
+            const waiter = { resolve, reject };
+            const onAbort = () => {
+                const index = this.waiters.indexOf(waiter);
+                if (index >= 0) {
+                    this.waiters.splice(index, 1);
+                }
+                reject(createAbortError());
+            };
+
+            if (signal?.aborted) {
+                reject(createAbortError());
+                return;
+            }
+
+            if (signal) {
+                signal.addEventListener("abort", onAbort, { once: true });
+            }
+
+            waiter.resolve = value => {
+                if (signal) {
+                    signal.removeEventListener("abort", onAbort);
+                }
+                resolve(value);
+            };
+            waiter.reject = error => {
+                if (signal) {
+                    signal.removeEventListener("abort", onAbort);
+                }
+                reject(error);
+            };
+            this.waiters.push(waiter);
+        });
+    }
+}
+
+function openRealtimeWebSocket(url, headers, signal, stage) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let request = null;
+        const parsed = new URL(url);
+        const isSecure = parsed.protocol === "wss:";
+        const transport = isSecure ? https : http;
+        const key = crypto.randomBytes(16).toString("base64");
+        const requestHeaders = {
+            Host: parsed.host,
+            Upgrade: "websocket",
+            Connection: "Upgrade",
+            "Sec-WebSocket-Key": key,
+            "Sec-WebSocket-Version": "13",
+            ...headers
+        };
+
+        const finishReject = error => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            if (signal) {
+                signal.removeEventListener("abort", onAbort);
+            }
+            reject(error);
+        };
+        const finishResolve = ws => {
+            if (settled) {
+                ws.sendClose();
+                return;
+            }
+            settled = true;
+            if (signal) {
+                signal.removeEventListener("abort", onAbort);
+            }
+            resolve(ws);
+        };
+        const onAbort = () => {
+            if (request) {
+                request.destroy(createAbortError());
+            }
+            finishReject(createAbortError());
+        };
+
+        if (signal?.aborted) {
+            finishReject(createAbortError());
+            return;
+        }
+        if (signal) {
+            signal.addEventListener("abort", onAbort, { once: true });
+        }
+
+        request = transport.request({
+            protocol: isSecure ? "https:" : "http:",
+            hostname: parsed.hostname,
+            port: parsed.port || (isSecure ? 443 : 80),
+            path: `${parsed.pathname}${parsed.search}`,
+            method: "GET",
+            headers: requestHeaders
+        });
+
+        request.once("upgrade", (response, socket, head) => {
+            const expectedAccept = createWebSocketAcceptValue(key);
+            const actualAccept = response.headers["sec-websocket-accept"];
+            if (response.statusCode !== 101 || actualAccept !== expectedAccept) {
+                socket.destroy();
+                finishReject(createVoiceStageError(stage, `VOICE_${stage.toUpperCase()}_FAILED`, "Realtime WebSocket upgrade was rejected", 502, {
+                    upstreamStatus: response.statusCode,
+                    endpoint: url
+                }));
+                return;
+            }
+
+            const ws = new MinimalWebSocket(socket, stage);
+            if (head && head.length > 0) {
+                ws.onData(head);
+            }
+            finishResolve(ws);
+        });
+
+        request.once("response", response => {
+            const chunks = [];
+            response.on("data", chunk => chunks.push(chunk));
+            response.on("end", () => {
+                const body = Buffer.concat(chunks).toString("utf8");
+                finishReject(createVoiceStageError(stage, `VOICE_${stage.toUpperCase()}_FAILED`, extractErrorMessageFromBody(body) || "Realtime WebSocket upgrade failed", 502, {
+                    upstreamStatus: response.statusCode,
+                    bodyLength: body.length,
+                    bodyPreview: normalizeLogPreview(body),
+                    endpoint: url
+                }));
+            });
+        });
+
+        request.once("error", error => {
+            if (error?.name === "AbortError") {
+                finishReject(error);
+                return;
+            }
+            finishReject(createVoiceStageError(stage, `VOICE_${stage.toUpperCase()}_FAILED`, error?.message || "Realtime WebSocket connection failed", 502, {
+                endpoint: url,
+                cause: error
+            }));
+        });
+
+        request.end();
+    });
+}
+
+function parseRealtimeJsonMessage(message, stage) {
+    try {
+        return JSON.parse(message);
+    } catch (error) {
+        throw createVoiceStageError(stage, `VOICE_${stage.toUpperCase()}_FAILED`, "Realtime WebSocket response was not valid JSON", 502, {
+            bodyLength: message.length,
+            bodyPreview: normalizeLogPreview(message),
+            cause: error
+        });
+    }
+}
+
+function readRealtimeEventName(payload) {
+    return typeof payload?.type === "string" && payload.type
+        ? payload.type
+        : (typeof payload?.event === "string" ? payload.event : "");
+}
+
+function extractRealtimeErrorMessage(payload) {
+    const errorValue = payload?.error;
+    if (typeof errorValue === "string" && errorValue.trim()) {
+        return errorValue.trim();
+    }
+
+    if (errorValue && typeof errorValue === "object") {
+        return findStringField(errorValue, ["message", "code", "error"]);
+    }
+
+    return findStringField(payload, ["message", "code"]);
+}
+
+function parseAsrRealtimeEvent(message) {
+    const payload = parseRealtimeJsonMessage(message, "asr");
+    const eventName = readRealtimeEventName(payload);
+    const lowerName = eventName.toLowerCase();
+    const text = findStringField(payload, [
+        "text",
+        "asr_text",
+        "transcript",
+        "utterance",
+        "result_text",
+        "final_text",
+        "content",
+        "delta"
+    ]);
 
     return {
-        bytes: responseBytes,
-        mode: "upstream"
+        eventName,
+        text,
+        isError: lowerName.includes("error") || Boolean(payload?.error),
+        errorMessage: extractRealtimeErrorMessage(payload),
+        isFinal: lowerName.includes("final") ||
+            lowerName.includes("completed") ||
+            lowerName.includes("conversation.item.input_audio_transcription.completed") ||
+            lowerName.includes("transcription.done") ||
+            payload?.final === true,
+        isPartial: lowerName.includes("partial") ||
+            lowerName.includes("conversation.item.input_audio_transcription.result") ||
+            lowerName.includes("delta") ||
+            lowerName.includes("transcription.delta")
     };
 }
 
+function parseTtsRealtimeEvent(message) {
+    const payload = parseRealtimeJsonMessage(message, "tts");
+    const eventName = readRealtimeEventName(payload);
+    const lowerName = eventName.toLowerCase();
+    const delta = typeof payload?.delta === "string" ? payload.delta : findStringField(payload, [
+        "audio_base64",
+        "pcm_base64",
+        "audio",
+        "data"
+    ]);
+
+    return {
+        eventName,
+        delta,
+        isError: lowerName.includes("error") || Boolean(payload?.error),
+        errorMessage: extractRealtimeErrorMessage(payload),
+        isSessionUpdated: lowerName === "tts_session.updated",
+        isAudioDelta: lowerName === "response.audio.delta" || lowerName.includes("audio.delta"),
+        isAudioDone: lowerName === "response.audio.done" ||
+            lowerName.includes("audio.done") ||
+            lowerName.includes("completed")
+    };
+}
+
+function buildAsrSessionUpdate(config) {
+    return JSON.stringify({
+        type: "transcription_session.update",
+        session: {
+            input_audio_format: config.asr.format,
+            input_audio_codec: config.asr.codec,
+            input_audio_sample_rate: config.asr.sampleRate,
+            input_audio_bits: config.asr.bits,
+            input_audio_channel: config.asr.channels,
+            input_audio_transcription: {
+                model: config.asr.model
+            }
+        }
+    });
+}
+
+function buildTtsSessionUpdate(config) {
+    return JSON.stringify({
+        type: "tts_session.update",
+        session: {
+            voice: config.tts.voice,
+            output_audio_format: "pcm",
+            output_audio_sample_rate: config.tts.sampleRate,
+            text_to_speech: {
+                model: config.tts.model
+            }
+        }
+    });
+}
+
+async function requestVoiceAsr(audioBuffer, config, voiceConfig, signal) {
+    let ws = null;
+    let latestText = "";
+    let finalText = "";
+
+    try {
+        ws = await openRealtimeWebSocket(
+            config.asr.url,
+            buildVolcGatewayHeaders(config, "asr"),
+            signal,
+            "asr"
+        );
+        ws.sendText(buildAsrSessionUpdate(config));
+
+        for (let offset = 0; offset < audioBuffer.length; offset += voiceConfig.wsAudioChunkBytes) {
+            const chunk = audioBuffer.subarray(offset, Math.min(offset + voiceConfig.wsAudioChunkBytes, audioBuffer.length));
+            ws.sendText(JSON.stringify({
+                type: "input_audio_buffer.append",
+                audio: chunk.toString("base64")
+            }));
+        }
+        ws.sendText(JSON.stringify({
+            type: "input_audio_buffer.commit"
+        }));
+
+        while (!signal?.aborted) {
+            const event = parseAsrRealtimeEvent(await ws.nextMessage(signal));
+            if (event.isError) {
+                throw createVoiceStageError("asr", "VOICE_ASR_FAILED", event.errorMessage || "ASR Realtime WebSocket returned an error", 502, {
+                    endpoint: config.asr.url,
+                    model: config.asr.model
+                });
+            }
+
+            if (event.text) {
+                latestText = event.text;
+                if (event.isFinal) {
+                    finalText = event.text;
+                }
+            }
+
+            if (event.isFinal) {
+                break;
+            }
+        }
+
+        const text = (finalText || latestText).trim();
+        if (!text) {
+            throw createVoiceStageError("asr", "VOICE_ASR_FAILED", "ASR Realtime response did not contain text", 502, {
+                endpoint: config.asr.url,
+                model: config.asr.model
+            });
+        }
+
+        return { text };
+    } catch (error) {
+        if (error?.code) {
+            throw error;
+        }
+
+        if (error?.name === "AbortError") {
+            throw createVoiceStageError("asr", "VOICE_ASR_FAILED", "ASR Realtime request was aborted or timed out", 502, {
+                endpoint: config.asr.url,
+                model: config.asr.model,
+                cause: error
+            });
+        }
+
+        throw createVoiceStageError("asr", "VOICE_ASR_FAILED", error?.message || "ASR Realtime request failed", 502, {
+            endpoint: config.asr.url,
+            model: config.asr.model,
+            cause: error
+        });
+    } finally {
+        if (ws) {
+            ws.sendClose();
+        }
+    }
+}
+
+async function requestVoiceTurnLlm(asrText, config, signal) {
+    try {
+        return await requestLlmText(asrText, {
+            apiKey: config.apiKey,
+            baseUrl: normalizeLlmBaseUrl(config.chat.baseUrl),
+            chatPath: config.chat.path,
+            model: config.chat.model,
+            timeoutMs: readPositiveInteger(process.env.LLM_TIMEOUT_MS, DEFAULT_LLM_TIMEOUT_MS)
+        }, signal);
+    } catch (error) {
+        throw createVoiceStageError("llm", "VOICE_LLM_FAILED", error?.message || "LLM request failed", 502, {
+            upstreamStatus: error?.status,
+            bodyLength: error?.bodyLength,
+            bodyPreview: error?.bodyPreview,
+            endpoint: error?.endpoint || config.chat.endpoint,
+            model: error?.model || config.chat.model,
+            cause: error
+        });
+    }
+}
+
+async function requestRealtimeVoiceTts(text, config, signal) {
+    let ws = null;
+    const audioChunks = [];
+
+    try {
+        ws = await openRealtimeWebSocket(
+            config.tts.url,
+            buildVolcGatewayHeaders(config, "tts"),
+            signal,
+            "tts"
+        );
+        ws.sendText(buildTtsSessionUpdate(config));
+        while (!signal?.aborted) {
+            const event = parseTtsRealtimeEvent(await ws.nextMessage(signal));
+            if (event.isError) {
+                throw createVoiceStageError("tts", "VOICE_TTS_FAILED", event.errorMessage || "TTS Realtime WebSocket returned an error", 502, {
+                    endpoint: config.tts.url,
+                    model: config.tts.model
+                });
+            }
+
+            if (event.isSessionUpdated) {
+                break;
+            }
+        }
+
+        ws.sendText(JSON.stringify({
+            type: "input_text.append",
+            delta: text
+        }));
+        ws.sendText(JSON.stringify({
+            type: "input_text.done"
+        }));
+
+        while (!signal?.aborted) {
+            const event = parseTtsRealtimeEvent(await ws.nextMessage(signal));
+            if (event.isError) {
+                throw createVoiceStageError("tts", "VOICE_TTS_FAILED", event.errorMessage || "TTS Realtime WebSocket returned an error", 502, {
+                    endpoint: config.tts.url,
+                    model: config.tts.model
+                });
+            }
+
+            if (event.isAudioDelta) {
+                const decoded = decodeBase64Buffer(event.delta);
+                if (!decoded) {
+                    throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS Realtime audio delta was not valid base64 PCM", 502, {
+                        endpoint: config.tts.url,
+                        model: config.tts.model
+                    });
+                }
+                audioChunks.push(decoded);
+            }
+
+            if (event.isAudioDone) {
+                break;
+            }
+        }
+
+        const audioBuffer = Buffer.concat(audioChunks);
+        return {
+            pcm: normalizeTtsPcmBuffer(audioBuffer)
+        };
+    } catch (error) {
+        if (error?.code) {
+            throw error;
+        }
+
+        if (error?.name === "AbortError") {
+            throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS Realtime request was aborted or timed out", 502, {
+                endpoint: config.tts.url,
+                model: config.tts.model,
+                cause: error
+            });
+        }
+
+        throw createVoiceStageError("tts", "VOICE_TTS_FAILED", error?.message || "TTS Realtime request failed", 502, {
+            endpoint: config.tts.url,
+            model: config.tts.model,
+            cause: error
+        });
+    } finally {
+        if (ws) {
+            ws.sendClose();
+        }
+    }
+}
+
+async function requestHttpVoiceTts(text, config, deviceId, signal) {
+    if (typeof fetch !== "function") {
+        throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "fetch is unavailable", 502);
+    }
+
+    try {
+        const upstreamResponse = await fetch(config.tts.url, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Accept: `${VOICE_TURN_CONTENT_TYPE}, audio/wav, audio/x-wav, application/octet-stream, application/json`,
+                "X-Device-Id": deviceId,
+                ...buildVolcGatewayHeaders(config, "tts")
+            },
+            body: JSON.stringify({
+                model: config.tts.model,
+                text,
+                input: text,
+                voice: config.tts.voice,
+                voice_type: config.tts.voice,
+                format: "pcm",
+                response_format: "pcm",
+                output_audio_format: "pcm",
+                sample_rate: config.tts.sampleRate,
+                output_audio_sample_rate: config.tts.sampleRate
+            }),
+            signal
+        });
+        const responseBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
+
+        if (!upstreamResponse.ok) {
+            const responseBody = responseBuffer.toString("utf8");
+            throw createUpstreamVoiceStageError(
+                "tts",
+                "VOICE_TTS_FAILED",
+                upstreamResponse,
+                responseBody,
+                "TTS upstream request failed"
+            );
+        }
+
+        const contentType = upstreamResponse.headers.get("content-type") || "";
+        const contentTypeLower = contentType.toLowerCase();
+        const pcmBuffer = contentTypeLower.includes("application/json")
+            ? extractTtsPcmFromJson(responseBuffer.toString("utf8"))
+            : (maybeExtractTtsPcmFromJson(responseBuffer) || normalizeTtsPcmBuffer(responseBuffer, contentType));
+
+        return {
+            pcm: pcmBuffer
+        };
+    } catch (error) {
+        if (error?.code) {
+            throw error;
+        }
+
+        if (error?.name === "AbortError") {
+            throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS request was aborted or timed out", 502, {
+                endpoint: config.tts.url,
+                model: config.tts.model,
+                cause: error
+            });
+        }
+
+        throw createVoiceStageError("tts", "VOICE_TTS_FAILED", error?.message || "TTS request failed", 502, {
+            endpoint: config.tts.url,
+            model: config.tts.model,
+            cause: error
+        });
+    }
+}
+
+async function requestVoiceTts(text, config, deviceId, signal) {
+    const protocol = new URL(config.tts.url).protocol;
+    if (protocol === "ws:" || protocol === "wss:") {
+        return requestRealtimeVoiceTts(text, config, signal);
+    }
+
+    return requestHttpVoiceTts(text, config, deviceId, signal);
+}
+
+async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConfig, signal, metrics) {
+    const asrResult = await requestVoiceAsr(audioBuffer, gatewayConfig, voiceConfig, signal);
+    metrics.asrTextLength = asrResult.text.length;
+
+    const llmResult = await requestVoiceTurnLlm(asrResult.text, gatewayConfig, signal);
+    metrics.llmReplyLength = llmResult.text.length;
+
+    const ttsResult = await requestVoiceTts(llmResult.text, gatewayConfig, deviceId, signal);
+    metrics.ttsPcmBytes = ttsResult.pcm.length;
+
+    return {
+        bytes: ttsResult.pcm.length,
+        mode: "chain",
+        asrTextLength: metrics.asrTextLength,
+        llmReplyLength: metrics.llmReplyLength,
+        ttsPcmBytes: metrics.ttsPcmBytes,
+        pcm: ttsResult.pcm
+    };
+}
+
+function sendVoiceTurnPcm(res, pcmBuffer) {
+    writeVoiceTurnHeaders(res);
+    res.end(pcmBuffer);
+}
+
 async function handleVoiceTurn(req, res) {
+    const startedAt = Date.now();
+    const deviceId = readVoiceDeviceId(req);
+    const requestBytes = Buffer.isBuffer(req.body) ? req.body.length : 0;
     const validationError = validateVoiceTurnRequest(req);
     if (validationError) {
+        const elapsedMs = Date.now() - startedAt;
+        console.warn(
+            `[voice-turn] rejected device_id=${maskLogValue(deviceId)} input_bytes=${requestBytes} elapsed_ms=${elapsedMs} code=${validationError.code} status=${validationError.status} message=${JSON.stringify(validationError.message)}`
+        );
+
         return sendVoiceError(
             res,
             validationError.status,
@@ -512,27 +1746,35 @@ async function handleVoiceTurn(req, res) {
     }
 
     const config = readVoiceTurnConfig();
-    const configError = validateVoiceTurnConfig(config);
-    if (configError) {
-        console.warn(
-            `[voice-turn] rejected code=${configError.code} mode=upstream upstream_url=${maskLogValue(config.upstreamUrl)}`
-        );
+    const gatewayConfig = readVolcGatewayConfig();
+    const asrConfigError = config.mockEnabled ? null : validateVoiceAsrConfig(gatewayConfig);
+    const chatConfigError = config.mockEnabled ? null : validateVoiceChatConfig(gatewayConfig);
+    const ttsConfigError = config.mockEnabled ? null : validateVoiceTtsConfig(gatewayConfig);
+    const configError = asrConfigError || chatConfigError || ttsConfigError;
 
+    if (configError) {
+        const elapsedMs = Date.now() - startedAt;
+        console.warn(
+            `[voice-turn] rejected device_id=${maskLogValue(deviceId)} input_bytes=${requestBytes} elapsed_ms=${elapsedMs} code=${configError.code} status=${configError.status} message=${JSON.stringify(configError.message)} mode=chain key_${gatewayConfig.keySummary}`
+        );
         return sendVoiceError(res, configError.status, configError.code, configError.message);
     }
 
-    const deviceId = readVoiceDeviceId(req);
     const acquireError = acquireVoiceTurn(deviceId, config);
     if (acquireError) {
+        const elapsedMs = Date.now() - startedAt;
         console.warn(
-            `[voice-turn] rejected code=${acquireError.code} device_id=${maskLogValue(deviceId)} active=${activeVoiceTurns}/${config.maxConcurrent}`
+            `[voice-turn] rejected device_id=${maskLogValue(deviceId)} input_bytes=${requestBytes} elapsed_ms=${elapsedMs} code=${acquireError.code} status=${acquireError.status} message=${JSON.stringify(acquireError.message)} active=${activeVoiceTurns}/${config.maxConcurrent}`
         );
 
         return sendVoiceError(res, acquireError.status, acquireError.code, acquireError.message);
     }
 
-    const requestBytes = req.body.length;
-    const startedAt = Date.now();
+    const metrics = {
+        asrTextLength: 0,
+        llmReplyLength: 0,
+        ttsPcmBytes: 0
+    };
     const controller = new AbortController();
     let timedOut = false;
     const timeout = setTimeout(() => {
@@ -549,21 +1791,33 @@ async function handleVoiceTurn(req, res) {
     res.on("close", abortOnClientClose);
 
     console.log(
-        `[voice-turn] start device_id=${maskLogValue(deviceId)} bytes=${requestBytes} active=${activeVoiceTurns}/${config.maxConcurrent} mode=${config.mockEnabled ? "mock" : "upstream"} timeout_ms=${config.timeoutMs}`
+        `[voice-turn] start device_id=${maskLogValue(deviceId)} input_bytes=${requestBytes} active=${activeVoiceTurns}/${config.maxConcurrent} mode=${config.mockEnabled ? "mock" : "chain"} timeout_ms=${config.timeoutMs} key_${gatewayConfig.keySummary}`
     );
 
     try {
-        const result = config.mockEnabled
-            ? await streamMockVoiceTurn(req.body, res)
-            : await streamUpstreamVoiceTurn(req.body, req, res, config, controller.signal);
+        let result;
+        if (config.mockEnabled) {
+            result = await streamMockVoiceTurn(req.body, res);
+        } else {
+            result = await runVoiceTurnChain(
+                req.body,
+                deviceId,
+                config,
+                gatewayConfig,
+                controller.signal,
+                metrics
+            );
+            sendVoiceTurnPcm(res, result.pcm);
+        }
+
         const elapsedMs = Date.now() - startedAt;
 
         console.log(
-            `[voice-turn] success device_id=${maskLogValue(deviceId)} mode=${result.mode} request_bytes=${requestBytes} response_bytes=${result.bytes} elapsed_ms=${elapsedMs}`
+            `[voice-turn] success device_id=${maskLogValue(deviceId)} mode=${result.mode} input_bytes=${requestBytes} asr_text_length=${result.asrTextLength} llm_reply_length=${result.llmReplyLength} tts_pcm_bytes=${result.ttsPcmBytes} response_bytes=${result.bytes} elapsed_ms=${elapsedMs}`
         );
     } catch (error) {
         const elapsedMs = Date.now() - startedAt;
-        const normalizedError = timedOut
+        const normalizedError = timedOut && !error?.code
             ? createVoiceError("VOICE_TURN_TIMEOUT", "Voice turn timed out", 504)
             : error;
         const status = normalizedError.status || 500;
@@ -571,7 +1825,7 @@ async function handleVoiceTurn(req, res) {
         const message = normalizedError.message || "Voice turn failed";
 
         console.error(
-            `[voice-turn] failed device_id=${maskLogValue(deviceId)} elapsed_ms=${elapsedMs} ${describeVoiceError(normalizedError)}`
+            `[voice-turn] failed device_id=${maskLogValue(deviceId)} input_bytes=${requestBytes} asr_text_length=${metrics.asrTextLength} llm_reply_length=${metrics.llmReplyLength} tts_pcm_bytes=${metrics.ttsPcmBytes} elapsed_ms=${elapsedMs} code=${code} status=${status} message=${JSON.stringify(message)} ${describeVoiceError(normalizedError)}`
         );
 
         sendVoiceError(res, status, code, message, {
@@ -586,16 +1840,26 @@ async function handleVoiceTurn(req, res) {
 }
 
 function readLlmConfig() {
-    const baseUrl = (process.env.LLM_BASE_URL || DEFAULT_LLM_BASE_URL)
-        .trim()
-        .replace(/\/+$/, "");
-    const chatPath = (process.env.LLM_CHAT_PATH || DEFAULT_LLM_CHAT_PATH).trim();
+    const apiKey = readTrimmedEnv("VOLC_GATEWAY_API_KEY", readTrimmedEnv("LLM_API_KEY"));
+    const baseUrl = readTrimmedEnv(
+        "VOLC_GATEWAY_HTTP_BASE_URL",
+        readTrimmedEnv("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
+    ).replace(/\/+$/, "");
+    const chatPath = readGatewayPathEnv(
+        "VOLC_GATEWAY_CHAT_PATH",
+        readTrimmedEnv("LLM_CHAT_PATH", DEFAULT_LLM_CHAT_PATH)
+    );
+    const model = readTrimmedEnv(
+        "VOLC_GATEWAY_CHAT_MODEL",
+        readTrimmedEnv("LLM_MODEL", DEFAULT_LLM_MODEL)
+    );
 
     return {
-        apiKey: (process.env.LLM_API_KEY || "").trim(),
+        apiKey,
+        keySummary: summarizeSecret(apiKey),
         baseUrl: normalizeLlmBaseUrl(baseUrl),
-        chatPath: chatPath.startsWith("/") ? chatPath : `/${chatPath}`,
-        model: (process.env.LLM_MODEL || DEFAULT_LLM_MODEL).trim() || DEFAULT_LLM_MODEL,
+        chatPath,
+        model,
         timeoutMs: readPositiveInteger(process.env.LLM_TIMEOUT_MS, DEFAULT_LLM_TIMEOUT_MS)
     };
 }
@@ -753,7 +2017,7 @@ function normalizeLlmBaseUrl(baseUrl) {
     return baseUrl;
 }
 
-async function requestLlmText(text, config) {
+async function requestLlmText(text, config, externalSignal) {
     if (!config.apiKey) {
         throw createLlmError("LLM_API_KEY_MISSING");
     }
@@ -765,6 +2029,12 @@ async function requestLlmText(text, config) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), config.timeoutMs);
     const endpoint = `${config.baseUrl}${config.chatPath}`;
+    const abortFromExternalSignal = () => controller.abort();
+    if (externalSignal?.aborted) {
+        controller.abort();
+    } else if (externalSignal) {
+        externalSignal.addEventListener("abort", abortFromExternalSignal, { once: true });
+    }
 
     try {
         const upstreamResponse = await fetch(endpoint, {
@@ -832,6 +2102,9 @@ async function requestLlmText(text, config) {
         throw error;
     } finally {
         clearTimeout(timer);
+        if (externalSignal) {
+            externalSignal.removeEventListener("abort", abortFromExternalSignal);
+        }
     }
 }
 
@@ -858,7 +2131,7 @@ app.post("/api/llm/text", async (req, res) => {
 
     const config = readLlmConfig();
     console.log(
-        `[llm-text] request text_len=${llmRequest.text.length} device_id=${maskLogValue(llmRequest.deviceId)} session_id=${maskLogValue(llmRequest.sessionId)} api_key_len=${config.apiKey.length} endpoint=${config.baseUrl}${config.chatPath} model=${config.model}`
+        `[llm-text] request text_len=${llmRequest.text.length} device_id=${maskLogValue(llmRequest.deviceId)} session_id=${maskLogValue(llmRequest.sessionId)} key_${config.keySummary} endpoint=${config.baseUrl}${config.chatPath} model=${config.model}`
     );
 
     try {

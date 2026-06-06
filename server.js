@@ -42,6 +42,7 @@ const VOICE_TURN_MOCK_BEEP_HZ = 1000;
 const VOICE_TURN_MOCK_BEEP_AMPLITUDE = 12000;
 const DEFAULT_TTS_FORMAT = VOICE_TURN_AUDIO_FORMAT;
 const DEFAULT_TTS_SAMPLE_RATE = VOICE_TURN_SAMPLE_RATE;
+const VOICE_WAKE_PROMPT_TEXT = "我在，你说";
 const activeVoiceDevices = new Set();
 let activeVoiceTurns = 0;
 let legacyLlmBaseUrlWarned = false;
@@ -53,6 +54,7 @@ const voiceTurnRawParser = express.raw({
 });
 
 app.post("/api/voice/turn", voiceTurnRawParser, handleVoiceTurn);
+app.get("/api/voice/prompt", handleVoicePrompt);
 
 app.use(express.json());
 app.use((err, req, res, next) => {
@@ -512,14 +514,22 @@ function validateVoiceTtsConfig(config) {
 }
 
 function readVoiceDeviceId(req) {
-    const value = req.get("X-Device-Id") ||
-        req.get("X-ESP-Device-Id") ||
-        req.get("X-Client-Id") ||
-        req.query.device_id ||
+    const value = readOptionalVoiceDeviceId(req) ||
         req.ip ||
         "unknown";
 
     return String(value).trim() || "unknown";
+}
+
+function readOptionalVoiceDeviceId(req) {
+    const value = req.get("device_id") ||
+        req.get("Device-Id") ||
+        req.get("X-Device-Id") ||
+        req.get("X-ESP-Device-Id") ||
+        req.get("X-Client-Id") ||
+        req.query.device_id;
+
+    return String(value || "").trim();
 }
 
 function validateVoiceTurnRequest(req) {
@@ -954,6 +964,20 @@ function normalizeTtsPcmBuffer(buffer, contentType = "") {
     }
 
     return pcmBuffer;
+}
+
+function isSilentPcmBuffer(pcmBuffer) {
+    if (!Buffer.isBuffer(pcmBuffer) || pcmBuffer.length === 0) {
+        return true;
+    }
+
+    for (let offset = 0; offset < pcmBuffer.length; offset += 1) {
+        if (pcmBuffer[offset] !== 0) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 function extractTtsPcmFromJson(responseBody) {
@@ -1799,6 +1823,81 @@ async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConf
 function sendVoiceTurnPcm(res, pcmBuffer) {
     writeVoiceTurnHeaders(res);
     res.end(pcmBuffer);
+}
+
+function formatOptionalDeviceLog(deviceId) {
+    return deviceId ? ` device_id=${maskLogValue(deviceId)}` : "";
+}
+
+async function handleVoicePrompt(req, res) {
+    const startedAt = Date.now();
+    const deviceId = readOptionalVoiceDeviceId(req);
+    const upstreamDeviceId = readVoiceDeviceId(req);
+    const gatewayConfig = readVolcGatewayConfig();
+    const ttsConfigError = validateVoiceTtsConfig(gatewayConfig);
+    let ttsPcmBytes = 0;
+
+    if (ttsConfigError) {
+        const elapsedMs = Date.now() - startedAt;
+        console.warn(
+            `[voice-prompt] rejected${formatOptionalDeviceLog(deviceId)} prompt_text=${JSON.stringify(VOICE_WAKE_PROMPT_TEXT)} tts_pcm_bytes=${ttsPcmBytes} elapsed_ms=${elapsedMs} code=${ttsConfigError.code} status=${ttsConfigError.status} message=${JSON.stringify(ttsConfigError.message)} key_${gatewayConfig.keySummary}`
+        );
+        return sendVoiceError(res, 503, "VOICE_TTS_NOT_CONFIGURED", ttsConfigError.message);
+    }
+
+    const config = readVoiceTurnConfig();
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+    }, config.timeoutMs);
+
+    const abortOnClientClose = () => {
+        if (!res.writableEnded) {
+            controller.abort();
+        }
+    };
+    req.on("aborted", abortOnClientClose);
+    res.on("close", abortOnClientClose);
+
+    try {
+        const ttsResult = await requestVoiceTts(
+            VOICE_WAKE_PROMPT_TEXT,
+            gatewayConfig,
+            upstreamDeviceId,
+            controller.signal
+        );
+        ttsPcmBytes = ttsResult.pcm.length;
+
+        if (isSilentPcmBuffer(ttsResult.pcm)) {
+            throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS prompt PCM must not be silent", 502);
+        }
+
+        sendVoiceTurnPcm(res, ttsResult.pcm);
+
+        const elapsedMs = Date.now() - startedAt;
+        console.log(
+            `[voice-prompt] success${formatOptionalDeviceLog(deviceId)} prompt_text=${JSON.stringify(VOICE_WAKE_PROMPT_TEXT)} tts_pcm_bytes=${ttsPcmBytes} elapsed_ms=${elapsedMs}`
+        );
+    } catch (error) {
+        const elapsedMs = Date.now() - startedAt;
+        const message = timedOut
+            ? "TTS prompt request timed out"
+            : (error?.message || "TTS prompt request failed");
+
+        console.error(
+            `[voice-prompt] failed${formatOptionalDeviceLog(deviceId)} prompt_text=${JSON.stringify(VOICE_WAKE_PROMPT_TEXT)} tts_pcm_bytes=${ttsPcmBytes} elapsed_ms=${elapsedMs} code=VOICE_TTS_FAILED status=502 message=${JSON.stringify(message)} ${describeVoiceError(error)}`
+        );
+
+        sendVoiceError(res, 502, "VOICE_TTS_FAILED", message, {
+            upstreamStatus: error?.upstreamStatus
+        });
+    } finally {
+        clearTimeout(timeout);
+        req.off("aborted", abortOnClientClose);
+        res.off("close", abortOnClientClose);
+    }
 }
 
 async function handleVoiceTurn(req, res) {

@@ -207,6 +207,21 @@ function readTrimmedEnv(name, fallback = "") {
     return trimmed || fallback;
 }
 
+function readFirstTrimmedEnv(names, fallback = "") {
+    for (const name of names) {
+        const value = readTrimmedEnv(name);
+        if (value) {
+            return value;
+        }
+    }
+
+    return fallback;
+}
+
+function readFirstGatewayPathEnv(names, fallback = "") {
+    return normalizeGatewayPathValue(readFirstTrimmedEnv(names, fallback));
+}
+
 function readBooleanFlag(value) {
     const normalized = String(value || "").trim().toLowerCase();
     return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
@@ -264,7 +279,7 @@ function buildGatewayRealtimeUrl(baseUrl, pathValue, model) {
     return url.toString();
 }
 
-function buildGatewayTtsUrl(wsBaseUrl, pathValue, model) {
+function buildGatewayTtsUrl(wsBaseUrl, httpBaseUrl, pathValue, model) {
     if (/^https?:\/\//i.test(pathValue) || /^wss?:\/\//i.test(pathValue)) {
         const url = new URL(pathValue);
         if (url.protocol === "ws:" || url.protocol === "wss:") {
@@ -273,7 +288,11 @@ function buildGatewayTtsUrl(wsBaseUrl, pathValue, model) {
         return url.toString();
     }
 
-    return buildGatewayRealtimeUrl(wsBaseUrl, pathValue, model);
+    if (pathValue.toLowerCase().includes("realtime")) {
+        return buildGatewayRealtimeUrl(wsBaseUrl, pathValue, model);
+    }
+
+    return buildGatewayHttpUrl(httpBaseUrl, pathValue);
 }
 
 function summarizeSecret(value) {
@@ -288,6 +307,24 @@ function summarizeSecret(value) {
     }
 
     return `len=${length}, masked=${secret.slice(0, 4)}***${secret.slice(-4)}`;
+}
+
+function maskUrlForLog(value) {
+    if (!value) {
+        return "-";
+    }
+
+    try {
+        const url = new URL(value);
+        for (const key of Array.from(url.searchParams.keys())) {
+            if (/key|token|secret|auth|password/i.test(key)) {
+                url.searchParams.set(key, "***");
+            }
+        }
+        return url.toString();
+    } catch (_) {
+        return normalizeLogPreview(value, 160);
+    }
 }
 
 function readVolcGatewayConfig() {
@@ -306,9 +343,27 @@ function readVolcGatewayConfig() {
     const chatPath = readGatewayPathEnv("VOLC_GATEWAY_CHAT_PATH", DEFAULT_VOLC_GATEWAY_CHAT_PATH);
     const asrModel = readTrimmedEnv("VOLC_GATEWAY_ASR_MODEL", DEFAULT_VOLC_GATEWAY_ASR_MODEL);
     const chatModel = readTrimmedEnv("VOLC_GATEWAY_CHAT_MODEL", DEFAULT_VOLC_GATEWAY_CHAT_MODEL);
-    const ttsModel = readTrimmedEnv("VOLC_GATEWAY_TTS_MODEL");
-    const ttsVoice = readTrimmedEnv("VOLC_GATEWAY_TTS_VOICE");
-    const ttsPath = readGatewayPathEnv("VOLC_GATEWAY_TTS_PATH", ttsModel ? realtimePath : "");
+    const ttsModel = readFirstTrimmedEnv([
+        "VOLC_GATEWAY_TTS_MODEL",
+        "LLM_MODEL_TTS",
+        "LLM_GATEWAY_TTS_MODEL",
+        "TTS_MODEL"
+    ]);
+    const ttsVoice = readFirstTrimmedEnv([
+        "VOLC_GATEWAY_TTS_VOICE",
+        "LLM_TTS_VOICE",
+        "TTS_VOICE",
+        "TTS_VOICE_TYPE",
+        "VOICE_TYPE"
+    ]);
+    const ttsPath = readFirstGatewayPathEnv([
+        "VOLC_GATEWAY_TTS_PATH",
+        "VOLC_GATEWAY_TTS_REALTIME_PATH",
+        "LLM_TTS_PATH",
+        "TTS_PATH",
+        "TTS_URL",
+        "TTS_ENDPOINT"
+    ], ttsModel ? realtimePath : "");
     const asrSampleRate = readPositiveInteger(
         process.env.VOLC_GATEWAY_ASR_SAMPLE_RATE,
         VOICE_TURN_SAMPLE_RATE
@@ -350,7 +405,7 @@ function readVolcGatewayConfig() {
             model: ttsModel,
             voice: ttsVoice,
             path: ttsPath,
-            url: ttsModel && ttsPath ? buildGatewayTtsUrl(wsBaseUrl, ttsPath, ttsModel) : "",
+            url: ttsModel && ttsPath ? buildGatewayTtsUrl(wsBaseUrl, httpBaseUrl, ttsPath, ttsModel) : "",
             sampleRate: ttsSampleRate,
             format: ttsFormat,
             useResourceId: readBooleanFlag(process.env.VOLC_GATEWAY_TTS_USE_RESOURCE_ID),
@@ -415,12 +470,12 @@ function validateVoiceChatConfig(config) {
     if (!config.apiKey || !config.chat.model) {
         return {
             status: 503,
-            code: "VOICE_LLM_NOT_CONFIGURED",
+            code: "VOICE_LLM_FAILED",
             message: "VOLC_GATEWAY_API_KEY and VOLC_GATEWAY_CHAT_MODEL must be configured when VOICE_TURN_MOCK is not 1"
         };
     }
 
-    return validateUrl(config.chat.endpoint, ["http:", "https:"], "VOICE_LLM_NOT_CONFIGURED", "VOLC_GATEWAY_HTTP_BASE_URL/VOLC_GATEWAY_CHAT_PATH");
+    return validateUrl(config.chat.endpoint, ["http:", "https:"], "VOICE_LLM_FAILED", "VOLC_GATEWAY_HTTP_BASE_URL/VOLC_GATEWAY_CHAT_PATH");
 }
 
 function validateVoiceTtsConfig(config) {
@@ -612,7 +667,7 @@ function describeVoiceError(error) {
     }
 
     if (error?.endpoint) {
-        parts.push(`endpoint=${error.endpoint}`);
+        parts.push(`endpoint=${maskUrlForLog(error.endpoint)}`);
     }
 
     if (error?.model) {
@@ -799,7 +854,11 @@ function contentTypeIndicatesUnsupportedAudio(contentType) {
         normalized.includes("audio/flac") ||
         normalized.includes("audio/aac") ||
         normalized.includes("audio/mp4") ||
-        normalized.includes("audio/webm");
+        normalized.includes("audio/webm") ||
+        normalized.includes("application/ogg") ||
+        normalized.includes("video/mp4") ||
+        normalized.includes("video/webm") ||
+        normalized.includes("application/json");
 }
 
 function bufferLooksLikeUnsupportedAudio(buffer) {
@@ -807,11 +866,15 @@ function bufferLooksLikeUnsupportedAudio(buffer) {
         return false;
     }
 
+    const trimmedStart = buffer.toString("utf8", 0, Math.min(buffer.length, 32)).trimStart();
     return buffer.toString("ascii", 0, 3) === "ID3" ||
         buffer.toString("ascii", 0, 4) === "OggS" ||
         buffer.toString("ascii", 0, 4) === "fLaC" ||
+        (buffer[0] === 0x1a && buffer[1] === 0x45 && buffer[2] === 0xdf && buffer[3] === 0xa3) ||
         buffer.toString("ascii", 4, 8) === "ftyp" ||
-        (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0);
+        (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0) ||
+        trimmedStart.startsWith("{") ||
+        trimmedStart.startsWith("[");
 }
 
 function extractPcmFromWav(buffer) {
@@ -874,7 +937,7 @@ function normalizeTtsPcmBuffer(buffer, contentType = "") {
     }
 
     if (contentTypeIndicatesUnsupportedAudio(contentType) || bufferLooksLikeUnsupportedAudio(buffer)) {
-        throw createVoiceStageError("tts", "VOICE_TTS_UNSUPPORTED_AUDIO", "TTS response must be raw PCM or WAV PCM s16le mono 16kHz", 502, {
+        throw createVoiceStageError("tts", "VOICE_TTS_UNSUPPORTED_FORMAT", "TTS response must be raw PCM or WAV PCM s16le mono 16kHz", 502, {
             bodyLength: buffer.length
         });
     }
@@ -1516,7 +1579,8 @@ async function requestVoiceTurnLlm(asrText, config, signal) {
     try {
         return await requestLlmText(asrText, {
             apiKey: config.apiKey,
-            baseUrl: normalizeLlmBaseUrl(config.chat.baseUrl),
+            endpoint: config.chat.endpoint,
+            baseUrl: config.chat.baseUrl,
             chatPath: config.chat.path,
             model: config.chat.model,
             timeoutMs: readPositiveInteger(process.env.LLM_TIMEOUT_MS, DEFAULT_LLM_TIMEOUT_MS)
@@ -1663,10 +1727,7 @@ async function requestHttpVoiceTts(text, config, deviceId, signal) {
         }
 
         const contentType = upstreamResponse.headers.get("content-type") || "";
-        const contentTypeLower = contentType.toLowerCase();
-        const pcmBuffer = contentTypeLower.includes("application/json")
-            ? extractTtsPcmFromJson(responseBuffer.toString("utf8"))
-            : (maybeExtractTtsPcmFromJson(responseBuffer) || normalizeTtsPcmBuffer(responseBuffer, contentType));
+        const pcmBuffer = normalizeTtsPcmBuffer(responseBuffer, contentType);
 
         return {
             pcm: pcmBuffer
@@ -1702,19 +1763,33 @@ async function requestVoiceTts(text, config, deviceId, signal) {
 }
 
 async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConfig, signal, metrics) {
+    let stageStartedAt = Date.now();
     const asrResult = await requestVoiceAsr(audioBuffer, gatewayConfig, voiceConfig, signal);
     metrics.asrTextLength = asrResult.text.length;
+    metrics.asrTextPreview = normalizeLogPreview(asrResult.text, 60);
+    console.log(
+        `[voice-turn] asr_success device_id=${maskLogValue(deviceId)} input_bytes=${audioBuffer.length} asr_ws_url=${maskUrlForLog(gatewayConfig.asr.url)} asr_text_length=${metrics.asrTextLength} asr_text=${JSON.stringify(metrics.asrTextPreview)} elapsed_ms=${Date.now() - stageStartedAt}`
+    );
 
+    stageStartedAt = Date.now();
     const llmResult = await requestVoiceTurnLlm(asrResult.text, gatewayConfig, signal);
     metrics.llmReplyLength = llmResult.text.length;
+    console.log(
+        `[voice-turn] llm_success device_id=${maskLogValue(deviceId)} asr_text_length=${metrics.asrTextLength} llm_reply_length=${metrics.llmReplyLength} elapsed_ms=${Date.now() - stageStartedAt}`
+    );
 
+    stageStartedAt = Date.now();
     const ttsResult = await requestVoiceTts(llmResult.text, gatewayConfig, deviceId, signal);
     metrics.ttsPcmBytes = ttsResult.pcm.length;
+    console.log(
+        `[voice-turn] tts_success device_id=${maskLogValue(deviceId)} llm_reply_length=${metrics.llmReplyLength} tts_pcm_bytes=${metrics.ttsPcmBytes} elapsed_ms=${Date.now() - stageStartedAt}`
+    );
 
     return {
         bytes: ttsResult.pcm.length,
         mode: "chain",
         asrTextLength: metrics.asrTextLength,
+        asrTextPreview: metrics.asrTextPreview,
         llmReplyLength: metrics.llmReplyLength,
         ttsPcmBytes: metrics.ttsPcmBytes,
         pcm: ttsResult.pcm
@@ -1772,6 +1847,7 @@ async function handleVoiceTurn(req, res) {
 
     const metrics = {
         asrTextLength: 0,
+        asrTextPreview: "",
         llmReplyLength: 0,
         ttsPcmBytes: 0
     };
@@ -1791,7 +1867,7 @@ async function handleVoiceTurn(req, res) {
     res.on("close", abortOnClientClose);
 
     console.log(
-        `[voice-turn] start device_id=${maskLogValue(deviceId)} input_bytes=${requestBytes} active=${activeVoiceTurns}/${config.maxConcurrent} mode=${config.mockEnabled ? "mock" : "chain"} timeout_ms=${config.timeoutMs} key_${gatewayConfig.keySummary}`
+        `[voice-turn] start device_id=${maskLogValue(deviceId)} input_bytes=${requestBytes} active=${activeVoiceTurns}/${config.maxConcurrent} mode=${config.mockEnabled ? "mock" : "chain"} asr_ws_url=${maskUrlForLog(gatewayConfig.asr.url)} timeout_ms=${config.timeoutMs} key_${gatewayConfig.keySummary}`
     );
 
     try {
@@ -1813,7 +1889,7 @@ async function handleVoiceTurn(req, res) {
         const elapsedMs = Date.now() - startedAt;
 
         console.log(
-            `[voice-turn] success device_id=${maskLogValue(deviceId)} mode=${result.mode} input_bytes=${requestBytes} asr_text_length=${result.asrTextLength} llm_reply_length=${result.llmReplyLength} tts_pcm_bytes=${result.ttsPcmBytes} response_bytes=${result.bytes} elapsed_ms=${elapsedMs}`
+            `[voice-turn] success device_id=${maskLogValue(deviceId)} mode=${result.mode} input_bytes=${requestBytes} asr_ws_url=${maskUrlForLog(gatewayConfig.asr.url)} asr_text_length=${result.asrTextLength} asr_text=${JSON.stringify(result.asrTextPreview || "")} llm_reply_length=${result.llmReplyLength} tts_pcm_bytes=${result.ttsPcmBytes} response_bytes=${result.bytes} elapsed_ms=${elapsedMs}`
         );
     } catch (error) {
         const elapsedMs = Date.now() - startedAt;
@@ -1825,7 +1901,7 @@ async function handleVoiceTurn(req, res) {
         const message = normalizedError.message || "Voice turn failed";
 
         console.error(
-            `[voice-turn] failed device_id=${maskLogValue(deviceId)} input_bytes=${requestBytes} asr_text_length=${metrics.asrTextLength} llm_reply_length=${metrics.llmReplyLength} tts_pcm_bytes=${metrics.ttsPcmBytes} elapsed_ms=${elapsedMs} code=${code} status=${status} message=${JSON.stringify(message)} ${describeVoiceError(normalizedError)}`
+            `[voice-turn] failed device_id=${maskLogValue(deviceId)} input_bytes=${requestBytes} asr_ws_url=${maskUrlForLog(gatewayConfig.asr.url)} asr_text_length=${metrics.asrTextLength} asr_text=${JSON.stringify(metrics.asrTextPreview)} llm_reply_length=${metrics.llmReplyLength} tts_pcm_bytes=${metrics.ttsPcmBytes} elapsed_ms=${elapsedMs} code=${code} status=${status} message=${JSON.stringify(message)} ${describeVoiceError(normalizedError)}`
         );
 
         sendVoiceError(res, status, code, message, {
@@ -2028,7 +2104,7 @@ async function requestLlmText(text, config, externalSignal) {
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), config.timeoutMs);
-    const endpoint = `${config.baseUrl}${config.chatPath}`;
+    const endpoint = config.endpoint || `${config.baseUrl}${config.chatPath}`;
     const abortFromExternalSignal = () => controller.abort();
     if (externalSignal?.aborted) {
         controller.abort();

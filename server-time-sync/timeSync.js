@@ -1,6 +1,7 @@
 const express = require("express");
 
 let latestPingRecord = null;
+const TIME_SYNC_DEVICE_ID_MAX_LENGTH = 128;
 
 function toFiniteNumber(value) {
     if (value === undefined || value === null || value === "") {
@@ -16,7 +17,8 @@ function toDeviceId(value) {
         return null;
     }
 
-    return String(value);
+    const text = String(value).trim();
+    return text ? text.slice(0, TIME_SYNC_DEVICE_ID_MAX_LENGTH) : null;
 }
 
 function makeServerTimeSnapshot(nowMs = Date.now()) {

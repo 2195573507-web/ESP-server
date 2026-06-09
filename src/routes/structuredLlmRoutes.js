@@ -16,6 +16,9 @@ const {
 const {
     maskLogValue
 } = require("../utils/logging");
+const {
+    buildLlmPrompt
+} = require("../services/llmPromptContextService");
 
 function createStructuredLlmRouter(options) {
     const router = express.Router();
@@ -37,7 +40,11 @@ function createStructuredLlmRouter(options) {
             ? req.body.target_device_id.trim()
             : "";
         const targetDeviceId = requestedTargetDeviceId || llmRequest.deviceId;
-        const prompt = buildStructuredPrompt(llmRequest.text);
+        const promptContext = await buildLlmPrompt(dbAll, llmRequest.text, {
+            deviceId: targetDeviceId || llmRequest.deviceId,
+            mode: "structured"
+        });
+        const prompt = buildStructuredPrompt(promptContext.prompt);
         logger.log(
             `[llm-structured] request text_len=${llmRequest.text.length} device_id=${maskLogValue(llmRequest.deviceId)} target_device_id=${maskLogValue(targetDeviceId)} session_id=${maskLogValue(llmRequest.sessionId)} key_${config.keySummary} endpoint=${config.endpoint} model=${config.model}`
         );

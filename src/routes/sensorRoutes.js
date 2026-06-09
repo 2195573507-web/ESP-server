@@ -3,6 +3,14 @@ const {
     buildSensorTimingFields,
     withTimeSyncStatus
 } = require("../../server-time-sync/timeSync");
+const {
+    mapDeviceStatus,
+    mapModuleStatus,
+    refreshDeviceActivity
+} = require("../services/deviceStatusService");
+const {
+    readDeviceMetadata
+} = require("../services/deviceMetadata");
 
 const SENSOR_DEVICE_ID_MAX_LENGTH = 128;
 
@@ -45,9 +53,53 @@ function sendSensorDbError(res, err, includeSuccess = false) {
     });
 }
 
+function parseJsonObject(value, fallback = null) {
+    if (!value) {
+        return fallback;
+    }
+
+    try {
+        const parsed = typeof value === "string" ? JSON.parse(value) : value;
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : fallback;
+    } catch (_) {
+        return fallback;
+    }
+}
+
+function enrichLatestSensorRow(row, deviceStatusRow, moduleStatusRow) {
+    const enriched = withTimeSyncStatus(row);
+    const deviceStatus = mapDeviceStatus(deviceStatusRow);
+    const moduleStatus = mapModuleStatus(moduleStatusRow);
+    const airQuality = parseJsonObject(row.air_quality_json, {
+        air_quality_score: row.air_quality_score,
+        air_quality_level: row.air_quality_level,
+        air_quality_confidence: row.air_quality_confidence,
+        air_quality_source: row.air_quality_source
+    });
+
+    return {
+        ...enriched,
+        online: Boolean(deviceStatus?.online),
+        device_online: Boolean(deviceStatus?.online),
+        sensor_online: Boolean(moduleStatus?.online),
+        latest_upload_delay_ms: deviceStatus?.latest_upload_delay_ms ?? row.upload_delay_ms ?? null,
+        avg_upload_delay_ms: deviceStatus?.avg_upload_delay_ms ?? null,
+        delay_sample_count: deviceStatus?.delay_sample_count ?? 0,
+        module_latest_upload_delay_ms: moduleStatus?.latest_upload_delay_ms ?? null,
+        module_avg_upload_delay_ms: moduleStatus?.avg_upload_delay_ms ?? null,
+        air_quality: airQuality,
+        air_quality_score: row.air_quality_score ?? airQuality?.air_quality_score ?? null,
+        air_quality_level: row.air_quality_level || airQuality?.air_quality_level || "",
+        air_quality_confidence: row.air_quality_confidence || airQuality?.air_quality_confidence || "",
+        air_quality_source: row.air_quality_source || airQuality?.air_quality_source || ""
+    };
+}
+
 function createSensorRouter(options) {
     const router = express.Router();
     const db = options.db;
+    const dbRun = options.dbRun;
+    const dbAll = options.dbAll;
     const logger = options.logger || console;
 
     router.post("/sensor", (req, res) => {
@@ -78,9 +130,25 @@ function createSensorRouter(options) {
                 timing.server_time_iso,
                 timing.upload_delay_ms
             ],
-            function (err) {
+            async function (err) {
                 if (err) {
                     return sendSensorDbError(res, err, true);
+                }
+
+                if (timing.device_id && typeof dbRun === "function" && typeof dbAll === "function") {
+                    try {
+                        await refreshDeviceActivity(dbRun, dbAll, readDeviceMetadata({
+                            body: {
+                                ...normalizedBody,
+                                payload_type: "sensor.bme690"
+                            },
+                            headers: req.headers,
+                            payloadType: "sensor.bme690",
+                            serverRecvMs
+                        }), "sensor.bme690");
+                    } catch (error) {
+                        logger.warn(`[sensor] legacy status refresh failed device_id=${timing.device_id || "-"} message=${JSON.stringify(error?.message || "-")}`);
+                    }
                 }
 
                 logger.log(
@@ -106,7 +174,32 @@ function createSensorRouter(options) {
                     return sendSensorDbError(res, err);
                 }
 
-                res.json(row ? withTimeSyncStatus(row) : {});
+                if (!row) {
+                    res.json({});
+                    return;
+                }
+
+                db.get(
+                    "SELECT * FROM device_status WHERE device_id=? LIMIT 1",
+                    [row.device_id],
+                    (statusErr, deviceStatusRow) => {
+                        if (statusErr) {
+                            return sendSensorDbError(res, statusErr);
+                        }
+
+                        db.get(
+                            "SELECT * FROM device_module_status WHERE device_id=? AND module_type='sensor.bme690' LIMIT 1",
+                            [row.device_id],
+                            (moduleErr, moduleStatusRow) => {
+                                if (moduleErr) {
+                                    return sendSensorDbError(res, moduleErr);
+                                }
+
+                                res.json(enrichLatestSensorRow(row, deviceStatusRow, moduleStatusRow));
+                            }
+                        );
+                    }
+                );
             }
         );
     });

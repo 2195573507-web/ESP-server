@@ -469,6 +469,8 @@ async function hasUniqueIndex(dbPath, tableName, expectedColumns) {
 async function assertUniqueIndexes(dbPath) {
     const expectations = [
         ["device_capabilities", ["device_id"]],
+        ["device_status", ["device_id"]],
+        ["device_module_status", ["device_id", "module_type"]],
         ["command_queue", ["command_id"]],
         ["conversation_turns", ["turn_id"]],
         ["long_term_profile", ["profile_key"]],
@@ -708,6 +710,7 @@ async function run() {
 
     const tempDir = makeTempDir();
     const dbPath = path.join(tempDir, "nested", "smoke.sqlite");
+    const promptCacheDir = path.join(tempDir, "voice_prompts");
     const port = String(44000 + Math.floor(Math.random() * 1000));
     const baseUrl = `http://127.0.0.1:${port}`;
     const mockLlm = await startMockLlmServer();
@@ -721,6 +724,7 @@ async function run() {
             ESP_SERVER_DB_PATH: dbPath,
             VOICE_TURN_MOCK: "1",
             VOICE_TURN_MAX_BYTES: "4096",
+            VOICE_PROMPT_CACHE_DIR: promptCacheDir,
             LLM_API_KEY: "smoke-llm-key",
             LLM_BASE_URL: mockLlm.baseUrl,
             LLM_CHAT_PATH: "/v1/chat/completions",
@@ -2203,6 +2207,182 @@ async function run() {
         assert.equal(result.body.devices[0].state.text, "归一化显示");
         assert.equal(result.body.devices[0].state.ttl_ms, 6000);
 
+        const bmeDeviceId = "esp32-c5-whole-001";
+        const validEspTimeMs = Date.now() - 120;
+        const bmeEnvelope = {
+            schema_version: 1,
+            device_id: bmeDeviceId,
+            device_type: "esp32c5_env_voice_node",
+            firmware_version: "0.1.0-smoke",
+            request_seq: 101,
+            esp_uptime_ms: 987654,
+            esp_time_ms: validEspTimeMs,
+            time_synced: true,
+            server_recv_ms: 1,
+            upload_delay_ms: 999999,
+            payload_type: "sensor.bme690",
+            payload: {
+                sensor_id: "bme690_01",
+                temperature_c: 29.57,
+                humidity_percent: 30.29,
+                pressure_hpa: 986.26,
+                gas_resistance_ohm: 35164,
+                air_quality_score: 72,
+                air_quality_level: "moderate",
+                air_quality_confidence: "low",
+                air_quality_algo_version: "esp-bme690-relative-v1",
+                air_quality_source: "esp",
+                gas_baseline_ohm: 82000,
+                gas_ratio: 0.43,
+                gas_score: 43,
+                humidity_score: 87,
+                baseline_ready: false,
+                warmup_done: false,
+                sample_count: 12
+            }
+        };
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", bmeEnvelope);
+        assert.equal(result.response.status, 201);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.data.device_id, bmeDeviceId);
+        assert.equal(result.body.data.payload_type, "sensor.bme690");
+        assert.equal(result.body.data.sensor_id, "bme690_01");
+        assert.equal(result.body.data.air_quality.air_quality_score, 72);
+        assert.equal(result.body.data.air_quality.air_quality_source, "esp");
+        assert.ok(result.body.data.upload_delay_ms >= 0);
+        assert.ok(result.body.data.upload_delay_ms < 60000);
+        assert.notEqual(result.body.server_recv_ms, bmeEnvelope.server_recv_ms);
+        assert.notEqual(result.body.data.upload_delay_ms, bmeEnvelope.upload_delay_ms);
+
+        let sensorRows = await dbAll(dbPath, "SELECT * FROM sensor_records WHERE id=? LIMIT 1", [result.body.data.id]);
+        assert.equal(sensorRows.length, 1);
+        assert.equal(sensorRows[0].device_id, bmeDeviceId);
+        assert.equal(sensorRows[0].temperature, 29.57);
+        assert.equal(sensorRows[0].humidity, 30.29);
+        assert.equal(sensorRows[0].pressure, 986.26);
+        assert.equal(sensorRows[0].gas_resistance, 35164);
+        assert.equal(sensorRows[0].payload_type, "sensor.bme690");
+        assert.equal(sensorRows[0].sensor_id, "bme690_01");
+        assert.equal(sensorRows[0].air_quality_score, 72);
+        assert.equal(sensorRows[0].air_quality_level, "moderate");
+        assert.equal(sensorRows[0].air_quality_confidence, "low");
+        assert.equal(sensorRows[0].air_quality_source, "esp");
+        assert.ok(sensorRows[0].raw_json.includes("\"sensor.bme690\""));
+        assert.ok(sensorRows[0].metadata_json.includes("\"time_synced\":true"));
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
+            ...bmeEnvelope,
+            request_seq: 102,
+            payload: {
+                ...bmeEnvelope.payload,
+                temperature_c: undefined
+            }
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.error.code, "INVALID_PAYLOAD");
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
+            ...bmeEnvelope,
+            request_seq: 103,
+            esp_time_ms: Date.now(),
+            time_synced: false,
+            payload: {
+                ...bmeEnvelope.payload,
+                air_quality_score: 999,
+                air_quality_level: "bad-level"
+            }
+        });
+        assert.equal(result.response.status, 201);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.data.upload_delay_ms, null);
+        assert.equal(result.body.data.air_quality.air_quality_source, "server_fallback");
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
+            ...bmeEnvelope,
+            request_seq: 104,
+            esp_time_ms: Date.now() + 5000,
+            time_synced: true
+        });
+        assert.equal(result.response.status, 201);
+        assert.equal(result.body.data.upload_delay_ms, null);
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
+            ...bmeEnvelope,
+            request_seq: 105,
+            esp_time_ms: Date.now() - 120000,
+            time_synced: true
+        });
+        assert.equal(result.response.status, 201);
+        assert.equal(result.body.data.upload_delay_ms, null);
+
+        result = await request(baseUrl, "GET", `/api/device/v1/status?${new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString()}`);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.status.device_id, bmeDeviceId);
+        assert.equal(result.body.status.online, true);
+        assert.equal(result.body.status.delay_sample_count, 1);
+        assert.ok(result.body.status.avg_upload_delay_ms >= 0);
+
+        result = await request(baseUrl, "GET", `/api/device/v1/modules/status?${new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString()}`);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        const bmeModule = result.body.modules.find(module => module.module_type === "sensor.bme690");
+        assert.ok(bmeModule);
+        assert.equal(bmeModule.online, true);
+        assert.equal(bmeModule.delay_sample_count, 1);
+
+        result = await request(baseUrl, "GET", `/api/device/v1/context?${new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString()}`);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.context.device.device_id, bmeDeviceId);
+        assert.equal(result.body.context.environment.available, true);
+        assert.equal(result.body.context.air_quality.available, true);
+        assert.equal(result.body.context.air_quality.score, 72);
+        assert.match(result.body.context.air_quality.note, /not national AQI/);
+        assert.equal(result.body.context.modules["csi.motion"].available, false);
+        assert.equal(result.body.context.modules["lcd.status"].available, false);
+
+        result = await request(baseUrl, "GET", `/api/device/v1/sensors/latest?${new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString()}`);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.sensor.device_id, bmeDeviceId);
+        assert.equal(result.body.sensor.air_quality_score, 72);
+
+        await dbRun(dbPath, "UPDATE device_module_status SET last_seen_ms=? WHERE device_id=? AND module_type='sensor.bme690'", [
+            Date.now() - 120000,
+            bmeDeviceId
+        ]);
+        result = await request(baseUrl, "GET", `/api/device/v1/status?${new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString()}`);
+        assert.equal(result.body.status.online, true);
+        result = await request(baseUrl, "GET", `/api/device/v1/modules/status?${new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString()}`);
+        const staleBmeModule = result.body.modules.find(module => module.module_type === "sensor.bme690");
+        assert.equal(staleBmeModule.online, false);
+
+        result = await request(baseUrl, "POST", "/api/llm/text", {
+            text: "现在房间环境怎么样",
+            device_id: bmeDeviceId
+        });
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.match(mockLlm.requests[mockLlm.requests.length - 1].body, /设备上下文/);
+        assert.match(mockLlm.requests[mockLlm.requests.length - 1].body, /BME690/);
+        assert.match(mockLlm.requests[mockLlm.requests.length - 1].body, /不是国标 AQI/);
+        assert.match(mockLlm.requests[mockLlm.requests.length - 1].body, /已过期|历史参考|not recent|offline/);
+
         result = await request(baseUrl, "POST", "/sensor", {
             temperature: 25.5,
             humidity: 57.2,
@@ -2349,13 +2529,65 @@ async function run() {
         assert.ok(Buffer.isBuffer(result.body));
         assert.ok(result.body.length > 0);
 
+        const promptPath = `/api/voice/prompt-cache?${new URLSearchParams({
+            prompt_key: "smoke_wake",
+            device_id: deviceId
+        }).toString()}`;
+        result = await request(baseUrl, "GET", promptPath);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.response.headers.get("x-audio-format"), "pcm_s16le_mono_16k");
+        assert.equal(result.response.headers.get("x-prompt-cache"), "miss");
+        assert.equal(result.body.length, 32000);
+        const promptCacheFiles = fs.readdirSync(promptCacheDir).filter(file => file.includes("smoke_wake"));
+        assert.ok(promptCacheFiles.some(file => file.endsWith(".pcm")));
+        assert.ok(promptCacheFiles.some(file => file.endsWith(".json")));
+
+        result = await request(baseUrl, "GET", promptPath);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.response.headers.get("x-prompt-cache"), "hit");
+        assert.equal(result.body.length, 32000);
+
         result = await request(baseUrl, "GET", `/api/voice/prompt?${new URLSearchParams({
             wake: "1",
+            prompt_key: "smoke_wake",
             device_id: deviceId
         }).toString()}`);
         assert.equal(result.response.status, 200);
-        assert.equal(result.response.headers.get("x-audio-format"), "pcm_s16le_mono_16k");
-        assert.equal(result.body.length, 32000);
+        assert.equal(result.response.headers.get("x-prompt-cache"), "hit");
+
+        const staleDbPath = path.join(tempDir, "nested", "stale-smoke.sqlite");
+        const stalePort = String(Number(port) + 1000);
+        const staleBaseUrl = `http://127.0.0.1:${stalePort}`;
+        const staleChild = spawn(process.execPath, ["server.js"], {
+            cwd: path.join(__dirname, ".."),
+            env: {
+                ...process.env,
+                PORT: stalePort,
+                ESP_SERVER_DB_PATH: staleDbPath,
+                VOICE_TURN_MOCK: "0",
+                VOICE_PROMPT_CACHE_DIR: promptCacheDir,
+                VOLC_GATEWAY_API_KEY: "",
+                LLM_API_KEY: "smoke-llm-key",
+                LLM_BASE_URL: mockLlm.baseUrl,
+                LLM_CHAT_PATH: "/v1/chat/completions"
+            },
+            stdio: ["ignore", "pipe", "pipe"]
+        });
+        try {
+            await waitForServer(staleChild);
+            result = await request(staleBaseUrl, "GET", `/api/voice/prompt-cache?${new URLSearchParams({
+                prompt_key: "smoke_wake",
+                device_id: deviceId,
+                refresh: "1"
+            }).toString()}`);
+            assert.equal(result.response.status, 200);
+            assert.equal(result.response.headers.get("x-prompt-cache"), "stale");
+            assert.equal(result.body.length, 32000);
+        } finally {
+            const staleStop = await stopServer(staleChild);
+            assert.equal(staleStop.killed, false);
+            assert.equal(staleStop.exited, true);
+        }
 
         const voiceTurnPcm = Buffer.alloc(3200);
         for (let i = 0; i < voiceTurnPcm.length; i += 2) {

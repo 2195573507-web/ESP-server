@@ -2,6 +2,9 @@ const {
     requestLlmText
 } = require("../llm/textClient");
 const {
+    buildLlmPrompt
+} = require("../services/llmPromptContextService");
+const {
     maskLogValue,
     maskUrlForLog,
     normalizeLogPreview
@@ -115,9 +118,15 @@ async function requestVoiceAsr(audioBuffer, config, voiceConfig, signal) {
     }
 }
 
-async function requestVoiceTurnLlm(asrText, config, signal) {
+async function requestVoiceTurnLlm(asrText, config, signal, options = {}) {
     try {
-        return await requestLlmText(asrText, {
+        const promptResult = typeof options.dbAll === "function"
+            ? await buildLlmPrompt(options.dbAll, asrText, {
+                deviceId: options.deviceId,
+                mode: "voice"
+            })
+            : { prompt: asrText };
+        return await requestLlmText(promptResult.prompt, {
             apiKey: config.apiKey,
             endpoint: config.chat.endpoint,
             baseUrl: config.chat.baseUrl,
@@ -302,7 +311,7 @@ async function requestVoiceTts(text, config, deviceId, signal) {
     return requestHttpVoiceTts(text, config, deviceId, signal);
 }
 
-async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConfig, signal, metrics, logger = console) {
+async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConfig, signal, metrics, logger = console, options = {}) {
     let stageStartedAt = Date.now();
     const asrResult = await requestVoiceAsr(audioBuffer, gatewayConfig, voiceConfig, signal);
     metrics.asrMs = Date.now() - stageStartedAt;
@@ -313,7 +322,10 @@ async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConf
     );
 
     stageStartedAt = Date.now();
-    const llmResult = await requestVoiceTurnLlm(asrResult.text, gatewayConfig, signal);
+    const llmResult = await requestVoiceTurnLlm(asrResult.text, gatewayConfig, signal, {
+        dbAll: options.dbAll,
+        deviceId
+    });
     metrics.llmMs = Date.now() - stageStartedAt;
     metrics.llmReplyLength = llmResult.text.length;
     logger.log(

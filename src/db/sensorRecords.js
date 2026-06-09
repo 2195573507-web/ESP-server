@@ -14,7 +14,26 @@ const SENSOR_RECORD_COLUMNS = [
     { name: "esp_uptime_ms", type: "INTEGER" },
     { name: "server_recv_ms", type: "INTEGER" },
     { name: "server_time_iso", type: "TEXT" },
-    { name: "upload_delay_ms", type: "INTEGER" }
+    { name: "upload_delay_ms", type: "INTEGER" },
+    { name: "schema_version", type: "INTEGER" },
+    { name: "device_type", type: "TEXT" },
+    { name: "firmware_version", type: "TEXT" },
+    { name: "request_seq", type: "INTEGER" },
+    { name: "time_synced", type: "INTEGER" },
+    { name: "payload_type", type: "TEXT" },
+    { name: "sensor_id", type: "TEXT" },
+    { name: "metadata_json", type: "TEXT" },
+    { name: "raw_json", type: "TEXT" },
+    { name: "air_quality_json", type: "TEXT" },
+    { name: "air_quality_score", type: "INTEGER" },
+    { name: "air_quality_level", type: "TEXT" },
+    { name: "air_quality_confidence", type: "TEXT" },
+    { name: "air_quality_algo_version", type: "TEXT" },
+    { name: "air_quality_source", type: "TEXT" },
+    { name: "gas_baseline_ohm", type: "REAL" },
+    { name: "gas_ratio", type: "REAL" },
+    { name: "gas_score", type: "INTEGER" },
+    { name: "humidity_score", type: "INTEGER" }
 ];
 
 function columnSql(columns) {
@@ -45,6 +64,19 @@ async function ensureSensorTimingColumns(dbRun, dbAll, logger = console) {
             logger.log(`[db] sensor_records added column ${column.name}`);
         }
     }
+
+    await dbRun(
+        `CREATE INDEX IF NOT EXISTS idx_sensor_records_device_recv_ms
+        ON sensor_records(device_id, server_recv_ms DESC)`
+    );
+    await dbRun(
+        `CREATE INDEX IF NOT EXISTS idx_sensor_records_recv_ms
+        ON sensor_records(server_recv_ms DESC)`
+    );
+    await dbRun(
+        `CREATE INDEX IF NOT EXISTS idx_sensor_records_payload_type_recv_ms
+        ON sensor_records(payload_type, server_recv_ms DESC)`
+    );
 }
 
 module.exports = {

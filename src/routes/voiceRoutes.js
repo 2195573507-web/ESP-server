@@ -30,6 +30,19 @@ const {
     streamMockVoiceTurn
 } = require("../voice/mockTurn");
 const {
+    DEFAULT_PROMPT_KEY,
+    readPromptCache,
+    safePromptKey,
+    sendPromptCachePcm,
+    writePromptCache
+} = require("../voice/promptCache");
+const {
+    readDeviceMetadata
+} = require("../services/deviceMetadata");
+const {
+    refreshDeviceActivity
+} = require("../services/deviceStatusService");
+const {
     readVoiceTurnConfig,
     readVoiceTurnMaxBytes
 } = require("../voice/turnConfig");
@@ -96,6 +109,7 @@ function createVoiceBodyParserErrorHandler(options) {
 function createVoiceRouter(options) {
     const router = express.Router();
     const dbRun = options.dbRun;
+    const dbAll = options.dbAll;
     const logger = options.logger || console;
     const activeVoiceDevices = new Set();
     let activeVoiceTurns = 0;
@@ -137,13 +151,45 @@ function createVoiceRouter(options) {
         const startedAt = Date.now();
         const deviceId = readOptionalVoiceDeviceId(req);
         const upstreamDeviceId = readVoiceDeviceId(req);
+        const metadata = readDeviceMetadata({
+            headers: req.headers,
+            query: req.query,
+            body: {},
+            deviceId: upstreamDeviceId,
+            payloadType: "voice.prompt",
+            serverRecvMs: startedAt
+        });
+        if (metadata.device_id && typeof dbRun === "function" && typeof dbAll === "function") {
+            try {
+                await refreshDeviceActivity(dbRun, dbAll, metadata, "voice.prompt");
+            } catch (error) {
+                logger.warn(`[voice-prompt] status refresh failed device_id=${maskLogValue(metadata.device_id)} message=${JSON.stringify(error?.message || "-")}`);
+            }
+        }
+
+        const promptKey = safePromptKey(req.query.prompt_key || DEFAULT_PROMPT_KEY);
+        const forceRefresh = req.query.refresh === "1" || req.query.force_refresh === "1";
+        const hit = readPromptCache(promptKey);
+        if (hit && !forceRefresh) {
+            const elapsedMs = Date.now() - startedAt;
+            sendPromptCachePcm(res, hit, "hit");
+            logger.log(
+                `[voice-prompt] cache_hit${formatOptionalDeviceLog(deviceId)} prompt_key=${promptKey} bytes=${hit.pcm.length} elapsed_ms=${elapsedMs}`
+            );
+            return;
+        }
+
         const config = readVoiceTurnConfig();
         if (config.mockEnabled) {
             const pcm = createMockVoicePromptPcm();
             const elapsedMs = Date.now() - startedAt;
-            sendVoiceTurnPcm(res, pcm);
+            const cached = writePromptCache(promptKey, VOICE_WAKE_PROMPT_TEXT, pcm, {
+                tts_provider: "mock",
+                tts_voice: "mock"
+            });
+            sendPromptCachePcm(res, cached, "miss");
             logger.log(
-                `[voice-prompt] success${formatOptionalDeviceLog(deviceId)} mode=mock prompt_text=${JSON.stringify(VOICE_WAKE_PROMPT_TEXT)} tts_pcm_bytes=${pcm.length} elapsed_ms=${elapsedMs}`
+                `[voice-prompt] cache_miss${formatOptionalDeviceLog(deviceId)} mode=mock prompt_key=${promptKey} prompt_text=${JSON.stringify(VOICE_WAKE_PROMPT_TEXT)} tts_pcm_bytes=${pcm.length} elapsed_ms=${elapsedMs}`
             );
             return;
         }
@@ -154,6 +200,15 @@ function createVoiceRouter(options) {
 
         if (ttsConfigError) {
             const elapsedMs = Date.now() - startedAt;
+            const stale = readPromptCache(promptKey);
+            if (stale) {
+                sendPromptCachePcm(res, stale, "stale");
+                logger.warn(
+                    `[voice-prompt] cache_stale${formatOptionalDeviceLog(deviceId)} prompt_key=${promptKey} reason=tts_config code=${ttsConfigError.code} elapsed_ms=${elapsedMs}`
+                );
+                return;
+            }
+
             logger.warn(
                 `[voice-prompt] rejected${formatOptionalDeviceLog(deviceId)} prompt_text=${JSON.stringify(VOICE_WAKE_PROMPT_TEXT)} tts_pcm_bytes=${ttsPcmBytes} elapsed_ms=${elapsedMs} code=${ttsConfigError.code} status=${ttsConfigError.status} message=${JSON.stringify(ttsConfigError.message)} key_${gatewayConfig.keySummary}`
             );
@@ -188,17 +243,29 @@ function createVoiceRouter(options) {
                 throw createVoiceStageError("tts", "VOICE_TTS_FAILED", "TTS prompt PCM must not be silent", 502);
             }
 
-            sendVoiceTurnPcm(res, ttsResult.pcm);
+            const cached = writePromptCache(promptKey, VOICE_WAKE_PROMPT_TEXT, ttsResult.pcm, {
+                tts_provider: "volc",
+                tts_voice: gatewayConfig.tts.voice || "server_prompt_v1"
+            });
+            sendPromptCachePcm(res, cached, "miss");
 
             const elapsedMs = Date.now() - startedAt;
             logger.log(
-                `[voice-prompt] success${formatOptionalDeviceLog(deviceId)} prompt_text=${JSON.stringify(VOICE_WAKE_PROMPT_TEXT)} tts_pcm_bytes=${ttsPcmBytes} elapsed_ms=${elapsedMs}`
+                `[voice-prompt] cache_miss${formatOptionalDeviceLog(deviceId)} prompt_key=${promptKey} prompt_text=${JSON.stringify(VOICE_WAKE_PROMPT_TEXT)} tts_pcm_bytes=${ttsPcmBytes} elapsed_ms=${elapsedMs}`
             );
         } catch (error) {
             const elapsedMs = Date.now() - startedAt;
             const message = timedOut
                 ? "TTS prompt request timed out"
                 : (error?.message || "TTS prompt request failed");
+            const stale = readPromptCache(promptKey);
+            if (stale) {
+                sendPromptCachePcm(res, stale, "stale");
+                logger.warn(
+                    `[voice-prompt] cache_stale${formatOptionalDeviceLog(deviceId)} prompt_key=${promptKey} tts_pcm_bytes=${stale.pcm.length} elapsed_ms=${elapsedMs} code=VOICE_TTS_FAILED message=${JSON.stringify(message)}`
+                );
+                return;
+            }
 
             logger.error(
                 `[voice-prompt] failed${formatOptionalDeviceLog(deviceId)} prompt_text=${JSON.stringify(VOICE_WAKE_PROMPT_TEXT)} tts_pcm_bytes=${ttsPcmBytes} elapsed_ms=${elapsedMs} code=VOICE_TTS_FAILED status=502 message=${JSON.stringify(message)} ${describeVoiceError(error)}`
@@ -219,6 +286,22 @@ function createVoiceRouter(options) {
         const deviceId = readVoiceDeviceId(req);
         const requestId = readVoiceRequestId(req);
         const requestBytes = Buffer.isBuffer(req.body) ? req.body.length : 0;
+        const metadata = readDeviceMetadata({
+            headers: req.headers,
+            query: req.query,
+            body: {},
+            deviceId,
+            payloadType: "voice.turn",
+            serverRecvMs: startedAt
+        });
+        if (metadata.device_id && typeof dbRun === "function" && typeof dbAll === "function") {
+            try {
+                await refreshDeviceActivity(dbRun, dbAll, metadata, "voice.turn");
+            } catch (error) {
+                logger.warn(`[voice-turn] status refresh failed device_id=${maskLogValue(metadata.device_id)} message=${JSON.stringify(error?.message || "-")}`);
+            }
+        }
+
         const validationError = validateVoiceTurnRequest(req);
         if (validationError) {
             const elapsedMs = Date.now() - startedAt;
@@ -339,7 +422,8 @@ function createVoiceRouter(options) {
                     gatewayConfig,
                     controller.signal,
                     metrics,
-                    logger
+                    logger,
+                    { dbAll }
                 );
             }
 
@@ -420,6 +504,7 @@ function createVoiceRouter(options) {
 
     router.post("/api/voice/turn", voiceTurnRawParser, handleVoiceTurn);
     router.get("/api/voice/prompt", handleVoicePrompt);
+    router.get("/api/voice/prompt-cache", handleVoicePrompt);
 
     return router;
 }

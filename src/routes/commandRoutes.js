@@ -11,6 +11,12 @@ const {
     COMMAND_DEVICE_ID_MAX_LENGTH,
     listCommandDefinitions
 } = require("../commands/schema");
+const {
+    readDeviceMetadata
+} = require("../services/deviceMetadata");
+const {
+    refreshDeviceActivity
+} = require("../services/deviceStatusService");
 
 function readRouteDeviceId(value) {
     return typeof value === "string" ? value.trim() : "";
@@ -57,6 +63,39 @@ function createCommandRouter(options) {
     const router = express.Router();
     const dbRun = options.dbRun;
     const dbAll = options.dbAll;
+    const logger = options.logger || console;
+
+    async function refreshCommandStatus(req, payloadType, fallbackDeviceId) {
+        const metadata = readDeviceMetadata({
+            body: req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body) ? req.body : {},
+            headers: req.headers,
+            query: req.query,
+            deviceId: fallbackDeviceId,
+            payloadType,
+            serverRecvMs: Date.now()
+        });
+        if (!metadata.device_id) {
+            return;
+        }
+
+        try {
+            await refreshDeviceActivity(dbRun, dbAll, metadata, payloadType);
+        } catch (error) {
+            logger.warn(`[commands] status refresh failed payload_type=${payloadType} device_id=${metadata.device_id} message=${JSON.stringify(error?.message || "-")}`);
+        }
+    }
+
+    async function readCommandDeviceId(commandId) {
+        if (!commandId) {
+            return "";
+        }
+
+        const rows = await dbAll(
+            "SELECT device_id FROM command_queue WHERE command_id=? LIMIT 1",
+            [commandId]
+        );
+        return rows[0]?.device_id || "";
+    }
 
     router.get("/api/commands/whitelist", (req, res) => {
         res.json({
@@ -71,6 +110,7 @@ function createCommandRouter(options) {
             return res.status(400).json(result);
         }
 
+        await refreshCommandStatus(req, "command.capabilities", result.device_id);
         return res.json(result);
     });
 
@@ -116,6 +156,7 @@ function createCommandRouter(options) {
         }
 
         const commands = await listPendingCommands(dbRun, dbAll, deviceId, req.query.limit);
+        await refreshCommandStatus(req, "command.poll", deviceId);
         return res.json({
             ok: true,
             commands,
@@ -124,6 +165,7 @@ function createCommandRouter(options) {
     });
 
     router.post("/api/commands/:command_id/ack", async (req, res) => {
+        const commandDeviceId = await readCommandDeviceId(req.params.command_id);
         const result = await ackCommand(dbRun, req.params.command_id, req.body);
         if (!result.ok) {
             if (result.code === "COMMAND_ACK_STATUS_INVALID") {
@@ -133,6 +175,7 @@ function createCommandRouter(options) {
             return res.status(404).json(result);
         }
 
+        await refreshCommandStatus(req, "command.ack", commandDeviceId);
         return res.json(result);
     });
 

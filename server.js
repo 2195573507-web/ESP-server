@@ -16,6 +16,9 @@ const {
     ensureSensorTimingColumns
 } = require("./src/db/sensorRecords");
 const {
+    ensureDeviceStatusTables
+} = require("./src/db/deviceStatus");
+const {
     ensureCommandTables
 } = require("./src/db/commands");
 const {
@@ -30,6 +33,9 @@ const {
 const {
     createCommandRouter
 } = require("./src/routes/commandRoutes");
+const {
+    createDeviceRouter
+} = require("./src/routes/deviceRoutes");
 const {
     createAgentStateRouter
 } = require("./src/routes/agentStateRoutes");
@@ -59,7 +65,7 @@ const app = express();
 const db = createDatabase(__dirname);
 const { dbRun, dbAll } = createDbHelpers(db);
 
-app.use(createVoiceRouter({ dbRun }));
+app.use(createVoiceRouter({ dbRun, dbAll }));
 app.use(express.json());
 app.use(createVoiceBodyParserErrorHandler({ dbRun }));
 app.use((err, req, res, next) => {
@@ -84,16 +90,17 @@ app.get("/dashboard", (req, res) => {
     res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-app.use(createLlmTextRouter({ dbRun }));
+app.use(createLlmTextRouter({ dbRun, dbAll }));
 app.use(createStructuredLlmRouter({ dbRun, dbAll }));
 app.use(createCommandRouter({ dbRun, dbAll }));
+app.use(createDeviceRouter({ dbRun, dbAll }));
 app.use(createMemoryRouter({ dbRun, dbAll }));
 app.use(createAgentStateRouter({ dbRun, dbAll }));
 app.use(createRecordRouter({ db }));
-app.use(createSensorRouter({ db }));
+app.use(createSensorRouter({ db, dbRun, dbAll }));
 
 // Health/debug API
-app.use("/api/time", createTimeSyncRouter());
+app.use("/api/time", createTimeSyncRouter({ dbRun, dbAll }));
 
 function isMachineApiPath(pathname) {
     return pathname === "/api" ||
@@ -181,6 +188,7 @@ async function shutdown(signal) {
 async function startServer() {
     await ensureRecordTables(dbRun, dbAll);
     await ensureSensorTimingColumns(dbRun, dbAll);
+    await ensureDeviceStatusTables(dbRun, dbAll);
     await ensureVoiceTurnsTable(dbRun, dbAll);
     await ensureCommandTables(dbRun, dbAll);
     await ensureMemoryTables(dbRun, dbAll);

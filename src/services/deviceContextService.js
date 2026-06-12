@@ -90,7 +90,7 @@ function moduleMapFromRows(rows) {
         modules[row.module_type] = row;
     }
 
-    for (const moduleType of ["sensor.bme690", "voice.turn", "voice.prompt", "command.capabilities", "command.poll", "command.ack", "time.ping"]) {
+    for (const moduleType of ["sensor.bme690", "voice.turn", "voice.prompt", "command.capabilities", "command.poll", "command.ack", "time.ping", "csi.motion", "lcd.status"]) {
         if (!modules[moduleType]) {
             modules[moduleType] = {
                 module_type: moduleType,
@@ -104,27 +104,12 @@ function moduleMapFromRows(rows) {
         }
     }
 
-    modules["csi.motion"] = modules["csi.motion"] || {
-        module_type: "csi.motion",
-        available: false,
-        online: false,
-        module_online: false,
-        last_seen_age_ms: null
-    };
-    modules["lcd.status"] = modules["lcd.status"] || {
-        module_type: "lcd.status",
-        available: false,
-        online: false,
-        module_online: false,
-        last_seen_age_ms: null
-    };
-
     return modules;
 }
 
 async function readLatestBmeRow(dbAll, deviceId) {
     const params = [];
-    let where = "WHERE (payload_type='sensor.bme690' OR payload_type IS NULL OR payload_type='')";
+    let where = "WHERE deleted_at IS NULL AND (payload_type='sensor.bme690' OR payload_type IS NULL OR payload_type='')";
     if (deviceId) {
         where += " AND device_id=?";
         params.push(deviceId);

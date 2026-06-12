@@ -273,6 +273,7 @@ async function listPendingCommands(dbRun, dbAll, deviceId, limit = 10) {
     const rows = await dbAll(
         `SELECT * FROM command_queue
         WHERE device_id=?
+          AND deleted_at IS NULL
           AND (
               status='queued'
               OR (
@@ -291,6 +292,7 @@ async function listPendingCommands(dbRun, dbAll, deviceId, limit = 10) {
             `UPDATE command_queue
             SET status='dispatched', dispatched_at=?, updated_at=?
             WHERE command_id=?
+              AND deleted_at IS NULL
               AND (
                   status='queued'
                   OR (
@@ -336,7 +338,7 @@ async function ackCommand(dbRun, commandId, input) {
     const result = await dbRun(
         `UPDATE command_queue
         SET status=?, result_json=?, error_code=?, error_message=?, completed_at=?, updated_at=?
-        WHERE command_id=? AND status IN ('queued','dispatched')`,
+        WHERE command_id=? AND deleted_at IS NULL AND status IN ('queued','dispatched')`,
         [
             status,
             resultJson,
@@ -365,8 +367,10 @@ async function listCommandHistory(dbAll, filters = {}) {
     const params = [];
     let where = "";
     if (filters.device_id) {
-        where = "WHERE device_id=?";
+        where = "WHERE device_id=? AND deleted_at IS NULL";
         params.push(filters.device_id);
+    } else {
+        where = "WHERE deleted_at IS NULL";
     }
     params.push(limit);
 

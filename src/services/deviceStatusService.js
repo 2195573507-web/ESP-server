@@ -52,7 +52,7 @@ function computeDelayStats(row, delayMs) {
 
 async function getDeviceStatusRow(dbAll, deviceId) {
     const rows = await dbAll(
-        "SELECT * FROM device_status WHERE device_id=? LIMIT 1",
+        "SELECT * FROM device_status WHERE device_id=? AND deleted_at IS NULL LIMIT 1",
         [deviceId]
     );
     return rowFirst(rows);
@@ -60,7 +60,7 @@ async function getDeviceStatusRow(dbAll, deviceId) {
 
 async function getModuleStatusRow(dbAll, deviceId, moduleType) {
     const rows = await dbAll(
-        "SELECT * FROM device_module_status WHERE device_id=? AND module_type=? LIMIT 1",
+        "SELECT * FROM device_module_status WHERE device_id=? AND module_type=? AND deleted_at IS NULL LIMIT 1",
         [deviceId, moduleType]
     );
     return rowFirst(rows);
@@ -108,6 +108,9 @@ async function updateDeviceStatus(dbRun, dbAll, metadata, options = {}) {
                 latest_upload_delay_ms=?,
                 avg_upload_delay_ms=?,
                 delay_sample_count=?,
+                created_at=CASE WHEN deleted_at IS NULL THEN created_at ELSE ? END,
+                deleted_at=NULL,
+                delete_reason=NULL,
                 updated_at=?
             WHERE device_id=?`,
         updateParams: [
@@ -124,6 +127,7 @@ async function updateDeviceStatus(dbRun, dbAll, metadata, options = {}) {
             stats.latest_upload_delay_ms,
             stats.avg_upload_delay_ms,
             stats.delay_sample_count,
+            updatedAt,
             updatedAt,
             deviceId
         ],
@@ -184,6 +188,9 @@ async function updateDeviceModuleStatus(dbRun, dbAll, metadata, moduleType) {
                 latest_upload_delay_ms=?,
                 avg_upload_delay_ms=?,
                 delay_sample_count=?,
+                created_at=CASE WHEN deleted_at IS NULL THEN created_at ELSE ? END,
+                deleted_at=NULL,
+                delete_reason=NULL,
                 updated_at=?
             WHERE device_id=? AND module_type=?`,
         updateParams: [
@@ -196,6 +203,7 @@ async function updateDeviceModuleStatus(dbRun, dbAll, metadata, moduleType) {
             stats.latest_upload_delay_ms,
             stats.avg_upload_delay_ms,
             stats.delay_sample_count,
+            updatedAt,
             updatedAt,
             deviceId,
             safeModuleType
@@ -295,8 +303,8 @@ function mapModuleStatus(row, nowMs = Date.now()) {
 async function readDeviceStatus(dbAll, deviceId, nowMs = Date.now()) {
     const rows = await dbAll(
         deviceId
-            ? "SELECT * FROM device_status WHERE device_id=? LIMIT 1"
-            : "SELECT * FROM device_status ORDER BY last_seen_ms DESC LIMIT 1",
+            ? "SELECT * FROM device_status WHERE device_id=? AND deleted_at IS NULL LIMIT 1"
+            : "SELECT * FROM device_status WHERE deleted_at IS NULL ORDER BY last_seen_ms DESC LIMIT 1",
         deviceId ? [deviceId] : []
     );
     return mapDeviceStatus(rowFirst(rows), nowMs);
@@ -306,8 +314,10 @@ async function readModuleStatuses(dbAll, deviceId, nowMs = Date.now()) {
     const params = [];
     let where = "";
     if (deviceId) {
-        where = "WHERE device_id=?";
+        where = "WHERE device_id=? AND deleted_at IS NULL";
         params.push(deviceId);
+    } else {
+        where = "WHERE deleted_at IS NULL";
     }
 
     const rows = await dbAll(

@@ -3,10 +3,14 @@ const {
     isSqliteUniqueConstraintError,
     runUpdateThenInsert
 } = require("../db/upsert");
+const {
+    isIsoDateString
+} = require("../utils/date");
 
 const MEMORY_LEVELS = new Set(["volatile", "episodic", "important", "profile_candidate", "archived"]);
 const PROFILE_STATUSES = new Set(["candidate", "active", "rejected", "archived"]);
 const DAILY_MEMORY_STATUSES = new Set(["candidate", "active", "rejected", "archived"]);
+const DAILY_MEMORY_TYPES = new Set(["daily_summary", "weekly_summary"]);
 const MEMORY_CORRECTION_STATUSES = new Set(["applied", "pending", "rejected", "archived"]);
 const MEMORY_JOB_STATUSES = new Set(["queued", "running", "completed", "failed", "skipped"]);
 const CONVERSATION_TURN_ID_MAX_LENGTH = 80;
@@ -103,10 +107,6 @@ function invalidFieldResult(code, field, error, value) {
     };
 }
 
-function isIsoDateString(value) {
-    return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value.trim());
-}
-
 function readUniqueKey(value, maxLength, code, field) {
     if (typeof value === "string" && value.trim().length > maxLength) {
         return invalidFieldResult(
@@ -190,7 +190,8 @@ function mapConversationTurn(row) {
         importance: row.importance,
         source: row.source || "",
         created_at: row.created_at,
-        updated_at: row.updated_at
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at || ""
     };
 }
 
@@ -285,6 +286,7 @@ async function listConversationTurns(dbAll, filters = {}) {
         where.push("device_id=?");
         params.push(deviceId);
     }
+    where.push("deleted_at IS NULL");
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
         `SELECT * FROM conversation_turns ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`,
@@ -299,13 +301,19 @@ function mapDailyMemory(row) {
         id: row.id,
         memory_date: row.memory_date,
         summary: row.summary,
+        memory_type: row.memory_type || "daily_summary",
         status: row.status,
         source: row.source || "",
         confidence: row.confidence,
         input: parseJson(row.input_json, null),
         raw: parseJson(row.raw_json, null),
+        evidence: parseJson(row.evidence_json, []),
+        window_start: row.window_start || "",
+        window_end: row.window_end || "",
+        sample_count: row.sample_count || 0,
         created_at: row.created_at,
-        updated_at: row.updated_at
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at || ""
     };
 }
 
@@ -329,18 +337,24 @@ async function createDailyMemory(dbRun, input) {
 
     const timestamp = nowIso();
     const status = chooseSetValue(input?.status, DAILY_MEMORY_STATUSES, "candidate");
+    const memoryType = chooseSetValue(input?.memory_type, DAILY_MEMORY_TYPES, "daily_summary");
     const result = await dbRun(
         `INSERT INTO daily_memory
-        (memory_date,summary,status,source,confidence,input_json,raw_json,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?)`,
+        (memory_date,summary,memory_type,status,source,confidence,input_json,raw_json,evidence_json,window_start,window_end,sample_count,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
             memoryDate,
             summary,
+            memoryType,
             status,
             boundedString(input?.source, 80, "api"),
             clampNumber(input?.confidence, 0, 1, 0.5),
             jsonText(input?.input),
             jsonText(input?.raw || input),
+            jsonText(Array.isArray(input?.evidence) ? input.evidence : []),
+            boundedString(input?.window_start, 40),
+            boundedString(input?.window_end, 40),
+            clampInteger(input?.sample_count, 0, 1000000000, 0),
             timestamp,
             timestamp
         ]
@@ -356,15 +370,20 @@ async function createDailyMemory(dbRun, input) {
 
 async function listDailyMemory(dbAll, filters = {}) {
     const params = [];
-    let where = "";
+    const where = ["deleted_at IS NULL"];
     const memoryDate = boundedString(filters.memory_date || filters.date, 20);
+    const memoryType = chooseSetValue(filters.memory_type, DAILY_MEMORY_TYPES, "");
     if (memoryDate) {
-        where = "WHERE memory_date=?";
+        where.push("memory_date=?");
         params.push(memoryDate);
+    }
+    if (memoryType) {
+        where.push("memory_type=?");
+        params.push(memoryType);
     }
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
-        `SELECT * FROM daily_memory ${where} ORDER BY id DESC LIMIT ?`,
+        `SELECT * FROM daily_memory WHERE ${where.join(" AND ")} ORDER BY id DESC LIMIT ?`,
         params
     );
 
@@ -383,7 +402,8 @@ function mapProfile(row) {
         correction_count: row.correction_count,
         source: row.source || "",
         created_at: row.created_at,
-        updated_at: row.updated_at
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at || ""
     };
 }
 
@@ -466,6 +486,7 @@ async function listProfiles(dbAll, filters = {}) {
         where.push("category=?");
         params.push(category);
     }
+    where.push("deleted_at IS NULL");
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
         `SELECT * FROM long_term_profile ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`,
@@ -537,7 +558,9 @@ async function applyMemoryCorrection(dbRun, input) {
                 correction_count=correction_count + 1,
                 status='candidate',
                 updated_at=?
-            WHERE profile_key=? OR CAST(id AS TEXT)=?`,
+            WHERE (profile_key=? OR CAST(id AS TEXT)=?)
+              AND deleted_at IS NULL
+              AND COALESCE(status, '') NOT IN ('deleted','inactive','archived')`,
             [
                 boundedString(input?.corrected_value, 4000),
                 timestamp,
@@ -606,6 +629,7 @@ async function listMemoryJobRuns(dbAll, filters = {}) {
         where.push("target_date=?");
         params.push(targetDate);
     }
+    where.push("deleted_at IS NULL");
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
         `SELECT * FROM memory_job_runs ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`,

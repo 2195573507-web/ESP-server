@@ -167,7 +167,7 @@ function createSensorRouter(options) {
 
     router.get("/sensor/latest", (req, res) => {
         db.get(
-            "SELECT * FROM sensor_records ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM sensor_records WHERE deleted_at IS NULL ORDER BY id DESC LIMIT 1",
             [],
             (err, row) => {
                 if (err) {
@@ -180,7 +180,7 @@ function createSensorRouter(options) {
                 }
 
                 db.get(
-                    "SELECT * FROM device_status WHERE device_id=? LIMIT 1",
+                    "SELECT * FROM device_status WHERE device_id=? AND deleted_at IS NULL LIMIT 1",
                     [row.device_id],
                     (statusErr, deviceStatusRow) => {
                         if (statusErr) {
@@ -188,7 +188,7 @@ function createSensorRouter(options) {
                         }
 
                         db.get(
-                            "SELECT * FROM device_module_status WHERE device_id=? AND module_type='sensor.bme690' LIMIT 1",
+                            "SELECT * FROM device_module_status WHERE device_id=? AND module_type='sensor.bme690' AND deleted_at IS NULL LIMIT 1",
                             [row.device_id],
                             (moduleErr, moduleStatusRow) => {
                                 if (moduleErr) {
@@ -209,7 +209,7 @@ function createSensorRouter(options) {
 
         db.all(
             `SELECT * FROM (
-                SELECT * FROM sensor_records ORDER BY id DESC LIMIT ?
+                SELECT * FROM sensor_records WHERE deleted_at IS NULL ORDER BY id DESC LIMIT ?
             ) ORDER BY id ASC`,
             [limit],
             (err, rows) => {

@@ -91,7 +91,7 @@ function createCommandRouter(options) {
         }
 
         const rows = await dbAll(
-            "SELECT device_id FROM command_queue WHERE command_id=? LIMIT 1",
+            "SELECT device_id FROM command_queue WHERE command_id=? AND deleted_at IS NULL LIMIT 1",
             [commandId]
         );
         return rows[0]?.device_id || "";

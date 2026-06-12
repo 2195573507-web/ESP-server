@@ -13,6 +13,9 @@ const {
     listProfiles,
     upsertProfile
 } = require("../memory/store");
+const {
+    isIsoDateString
+} = require("../utils/date");
 
 function sendResult(res, result, status = 201) {
     if (!result.ok) {
@@ -122,10 +125,6 @@ function readConversationFilters(res, query) {
     }
 
     return readOptionalStringFilter(res, deviceFilter.query, "session_id", 128, "SESSION_ID_INVALID");
-}
-
-function isIsoDateString(value) {
-    return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value.trim());
 }
 
 function readDailyMemoryFilters(res, query) {
@@ -295,12 +294,12 @@ function createMemoryRouter(options) {
     });
 
     router.post("/api/jobs/daily-summary/run", async (req, res) => {
-        const result = await runDailySummaryJob(dbRun, req.body);
+        const result = await runDailySummaryJob(dbRun, dbAll, req.body);
         return sendResult(res, result, 202);
     });
 
     router.post("/api/jobs/weekly-profile/run", async (req, res) => {
-        const result = await runWeeklyProfileJob(dbRun, req.body);
+        const result = await runWeeklyProfileJob(dbRun, dbAll, req.body);
         return sendResult(res, result, 202);
     });
 

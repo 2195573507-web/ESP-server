@@ -298,7 +298,8 @@ function mapEnvironmentProfile(row) {
         evidence: parseJson(row.evidence_json, []),
         source: row.source || "",
         created_at: row.created_at,
-        updated_at: row.updated_at
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at || ""
     };
 }
 
@@ -315,6 +316,7 @@ async function listEnvironmentProfiles(dbAll, filters = {}) {
         where.push("status=?");
         params.push(status);
     }
+    where.push("deleted_at IS NULL");
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
         `SELECT * FROM environment_profile ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`,
@@ -385,7 +387,8 @@ function mapExperience(row) {
         evidence: parseJson(row.evidence_json, []),
         source: row.source || "",
         created_at: row.created_at,
-        updated_at: row.updated_at
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at || ""
     };
 }
 
@@ -394,8 +397,10 @@ async function listExperienceMemory(dbAll, filters = {}) {
     let where = "";
     const status = boundedString(filters.status, 40);
     if (status) {
-        where = "WHERE status=?";
+        where = "WHERE status=? AND deleted_at IS NULL";
         params.push(status);
+    } else {
+        where = "WHERE deleted_at IS NULL";
     }
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
@@ -484,7 +489,8 @@ function mapRelation(row) {
         evidence: parseJson(row.evidence_json, []),
         source: row.source || "",
         created_at: row.created_at,
-        updated_at: row.updated_at
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at || ""
     };
 }
 
@@ -501,6 +507,7 @@ async function listRelationMemory(dbAll, filters = {}) {
         where.push("relation_type=?");
         params.push(relationType);
     }
+    where.push("deleted_at IS NULL");
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
         `SELECT * FROM relation_memory ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`,
@@ -589,7 +596,8 @@ function mapReminderRule(row) {
         suppress_until: row.suppress_until || "",
         source: row.source || "",
         created_at: row.created_at,
-        updated_at: row.updated_at
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at || ""
     };
 }
 
@@ -598,8 +606,10 @@ async function listReminderRules(dbAll, filters = {}) {
     let where = "";
     const status = boundedString(filters.status, 40);
     if (status) {
-        where = "WHERE status=?";
+        where = "WHERE status=? AND deleted_at IS NULL";
         params.push(status);
+    } else {
+        where = "WHERE deleted_at IS NULL";
     }
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
@@ -675,7 +685,8 @@ function mapReminderEvent(row) {
         result: parseJson(row.result_json, null),
         created_at: row.created_at,
         updated_at: row.updated_at,
-        completed_at: row.completed_at || ""
+        completed_at: row.completed_at || "",
+        deleted_at: row.deleted_at || ""
     };
 }
 
@@ -684,8 +695,10 @@ async function listReminderEvents(dbAll, filters = {}) {
     let where = "";
     const status = boundedString(filters.status, 40);
     if (status) {
-        where = "WHERE status=?";
+        where = "WHERE status=? AND deleted_at IS NULL";
         params.push(status);
+    } else {
+        where = "WHERE deleted_at IS NULL";
     }
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
@@ -774,7 +787,8 @@ function mapEmergency(row) {
         status: row.status,
         created_at: row.created_at,
         updated_at: row.updated_at,
-        resolved_at: row.resolved_at || ""
+        resolved_at: row.resolved_at || "",
+        deleted_at: row.deleted_at || ""
     };
 }
 
@@ -791,6 +805,7 @@ async function listEmergencyEvents(dbAll, filters = {}) {
         where.push("status=?");
         params.push(status);
     }
+    where.push("deleted_at IS NULL");
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
         `SELECT * FROM emergency_events ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`,
@@ -873,7 +888,8 @@ function mapCsiEvent(row) {
         summary: row.summary || "",
         occurred_at: row.occurred_at,
         created_at: row.created_at,
-        updated_at: row.updated_at
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at || ""
     };
 }
 
@@ -890,6 +906,7 @@ async function listCsiBehaviorEvents(dbAll, filters = {}) {
         where.push("behavior_type=?");
         params.push(behaviorType);
     }
+    where.push("deleted_at IS NULL");
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
         `SELECT * FROM csi_behavior_events ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`,
@@ -925,12 +942,16 @@ async function upsertLcdStatus(dbRun, input) {
             SET page=?,
                 state_json=?,
                 last_command_id=?,
+                created_at=CASE WHEN deleted_at IS NULL THEN created_at ELSE ? END,
+                deleted_at=NULL,
+                delete_reason=NULL,
                 updated_at=?
             WHERE device_id=?`,
         updateParams: [
             pageResult.value,
             jsonText(input?.state || {}),
             lastCommandIdResult.value,
+            timestamp,
             timestamp,
             deviceId
         ],
@@ -959,8 +980,10 @@ async function listLcdStatus(dbAll, filters = {}) {
     let where = "";
     const deviceId = boundedString(filters.device_id, 128);
     if (deviceId) {
-        where = "WHERE device_id=?";
+        where = "WHERE device_id=? AND deleted_at IS NULL";
         params.push(deviceId);
+    } else {
+        where = "WHERE deleted_at IS NULL";
     }
     params.push(readLimit(filters.limit));
     const rows = await dbAll(
@@ -973,7 +996,8 @@ async function listLcdStatus(dbAll, filters = {}) {
         state: parseJson(row.state_json, {}),
         last_command_id: row.last_command_id || "",
         updated_at: row.updated_at,
-        created_at: row.created_at
+        created_at: row.created_at,
+        deleted_at: row.deleted_at || ""
     }));
 }
 

@@ -28,6 +28,9 @@ const {
     ensureMemoryTables
 } = require("./src/db/memory");
 const {
+    ensureUserDataDeletionTables
+} = require("./src/db/userDataDeletion");
+const {
     ensureVoiceTurnsTable
 } = require("./src/db/voiceTurns");
 const {
@@ -36,6 +39,9 @@ const {
 const {
     createDeviceRouter
 } = require("./src/routes/deviceRoutes");
+const {
+    createDashboardRouter
+} = require("./src/routes/dashboardRoutes");
 const {
     createAgentStateRouter
 } = require("./src/routes/agentStateRoutes");
@@ -54,6 +60,9 @@ const {
 const {
     createStructuredLlmRouter
 } = require("./src/routes/structuredLlmRoutes");
+const {
+    createUserDataRouter
+} = require("./src/routes/userDataRoutes");
 const {
     createVoiceBodyParserErrorHandler,
     createVoiceRouter
@@ -94,8 +103,10 @@ app.use(createLlmTextRouter({ dbRun, dbAll }));
 app.use(createStructuredLlmRouter({ dbRun, dbAll }));
 app.use(createCommandRouter({ dbRun, dbAll }));
 app.use(createDeviceRouter({ dbRun, dbAll }));
+app.use("/api/dashboard/v1", createDashboardRouter({ dbAll }));
 app.use(createMemoryRouter({ dbRun, dbAll }));
 app.use(createAgentStateRouter({ dbRun, dbAll }));
+app.use(createUserDataRouter({ dbRun, dbAll }));
 app.use(createRecordRouter({ db }));
 app.use(createSensorRouter({ db, dbRun, dbAll }));
 
@@ -193,6 +204,7 @@ async function startServer() {
     await ensureCommandTables(dbRun, dbAll);
     await ensureMemoryTables(dbRun, dbAll);
     await ensureAgentStateTables(dbRun, dbAll);
+    await ensureUserDataDeletionTables(dbRun, dbAll);
 
     httpServer = app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);

@@ -26,6 +26,9 @@ const {
     ensureMemoryTables
 } = require("../src/db/memory");
 const {
+    ensureUserDataDeletionTables
+} = require("../src/db/userDataDeletion");
+const {
     createDatabase,
     createDbHelpers
 } = require("../src/db/sqlite");
@@ -42,6 +45,10 @@ const {
 
 const SERVER_START_TIMEOUT_MS = 15000;
 const SERVER_STOP_TIMEOUT_MS = 5000;
+const USER_DATA_DELETE_TOKEN = "smoke-user-data-token";
+const USER_DATA_HEADERS = {
+    "X-Admin-Token": USER_DATA_DELETE_TOKEN
+};
 
 function makeTempDir() {
     return fs.mkdtempSync(path.join(os.tmpdir(), "esp-server-smoke-"));
@@ -269,6 +276,25 @@ async function requestRaw(baseUrl, method, pathname, body, headers = {}) {
     };
 }
 
+function hasOwn(value, key) {
+    return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function assertDashboardEnvelope(body, expectedOk = true) {
+    assert.equal(typeof body.ok, "boolean");
+    assert.equal(body.ok, expectedOk);
+    assert.equal(typeof body.server_time_ms, "number");
+    assert.equal(hasOwn(body, "data"), true);
+    assert.equal(hasOwn(body, "error"), true);
+
+    if (expectedOk) {
+        assert.equal(body.error, null);
+    } else {
+        assert.ok(body.error);
+        assert.equal(typeof body.error.code, "string");
+    }
+}
+
 function dbRun(dbPath, sql, params = []) {
     return new Promise((resolve, reject) => {
         const db = new sqlite3.Database(dbPath);
@@ -483,7 +509,8 @@ async function assertUniqueIndexes(dbPath) {
         ["reminder_records", ["reminder_event_id"]],
         ["emergency_events", ["event_id"]],
         ["csi_behavior_events", ["event_id"]],
-        ["lcd_status", ["device_id"]]
+        ["lcd_status", ["device_id"]],
+        ["data_deletion_runs", ["run_id"]]
     ];
 
     for (const [tableName, columns] of expectations) {
@@ -572,6 +599,7 @@ async function assertDuplicateKeyUpserts() {
                 await ensureCommandTables(sqliteRun, sqliteAll);
                 await ensureMemoryTables(sqliteRun, sqliteAll);
                 await ensureAgentStateTables(sqliteRun, sqliteAll);
+                await ensureUserDataDeletionTables(sqliteRun, sqliteAll);
 
                 assert.equal(await hasUniqueIndex(dbPath, "device_capabilities", ["device_id"]), false);
                 assert.equal(await hasUniqueIndex(dbPath, "long_term_profile", ["profile_key"]), false);
@@ -728,6 +756,7 @@ async function run() {
             LLM_API_KEY: "smoke-llm-key",
             LLM_BASE_URL: mockLlm.baseUrl,
             LLM_CHAT_PATH: "/v1/chat/completions",
+            USER_DATA_DELETE_TOKEN,
             VOLC_GATEWAY_API_KEY: ""
         },
         stdio: ["ignore", "pipe", "pipe"]
@@ -1259,9 +1288,26 @@ async function run() {
         assert.equal(result.body.code, "DAILY_MEMORY_DATE_INVALID");
         assert.equal(result.body.error, "memory_date must use YYYY-MM-DD format");
 
+        result = await request(baseUrl, "GET", "/api/memory/daily?" + new URLSearchParams({
+            date: "2026-02-31"
+        }).toString());
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.code, "DAILY_MEMORY_DATE_INVALID");
+        assert.equal(result.body.error, "memory_date must use YYYY-MM-DD format");
+
         result = await request(baseUrl, "POST", "/api/memory/daily", {
             memory_date: "2026/06/09",
             summary: "invalid date format"
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.code, "DAILY_MEMORY_DATE_INVALID");
+        assert.equal(result.body.error, "memory_date must use YYYY-MM-DD format");
+
+        result = await request(baseUrl, "POST", "/api/memory/daily", {
+            memory_date: "2026-02-31",
+            summary: "invalid calendar date"
         });
         assert.equal(result.response.status, 400);
         assert.equal(result.body.ok, false);
@@ -1388,11 +1434,12 @@ async function run() {
         result = await request(baseUrl, "POST", "/api/jobs/daily-summary/run", {
             date: "2026-06-07",
             summary: "smoke daily job summary",
-            status: "completed"
+            force: true
         });
         assert.equal(result.response.status, 202);
         assert.equal(result.body.ok, true);
-        assert.equal(result.body.status, "queued");
+        assert.equal(result.body.status, "completed");
+        assert.equal(result.body.memory_type, "daily_summary");
 
         result = await request(baseUrl, "POST", "/api/jobs/daily-summary/run", {
             date: "2026/06/07"
@@ -1402,13 +1449,21 @@ async function run() {
         assert.equal(result.body.code, "DAILY_SUMMARY_DATE_INVALID");
         assert.equal(result.body.error, "date must use YYYY-MM-DD format");
 
+        result = await request(baseUrl, "POST", "/api/jobs/daily-summary/run", {
+            date: "2026-02-31"
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.code, "DAILY_SUMMARY_DATE_INVALID");
+        assert.equal(result.body.error, "date must use YYYY-MM-DD format");
+
         result = await request(baseUrl, "POST", "/api/jobs/weekly-profile/run", {
-            week_start: "2026-06-01",
-            status: "failed"
+            week_start: "2026-06-01"
         });
         assert.equal(result.response.status, 202);
         assert.equal(result.body.ok, true);
-        assert.equal(result.body.status, "queued");
+        assert.equal(result.body.status, "completed");
+        assert.equal(result.body.memory_type, "weekly_summary");
 
         result = await request(baseUrl, "POST", "/api/jobs/weekly-profile/run", {
             week_start: "2026/06/01"
@@ -1418,11 +1473,19 @@ async function run() {
         assert.equal(result.body.code, "WEEKLY_PROFILE_DATE_INVALID");
         assert.equal(result.body.error, "week_start must use YYYY-MM-DD format");
 
+        result = await request(baseUrl, "POST", "/api/jobs/weekly-profile/run", {
+            week_start: "2026-02-31"
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.code, "WEEKLY_PROFILE_DATE_INVALID");
+        assert.equal(result.body.error, "week_start must use YYYY-MM-DD format");
+
         result = await request(baseUrl, "GET", "/api/jobs/memory?limit=2");
         assert.equal(result.response.status, 200);
         assert.equal(result.body.jobs.length, 2);
-        assert.ok(result.body.jobs.every(job => job.status === "queued"));
-        assert.ok(result.body.jobs.every(job => job.completed_at === null));
+        assert.ok(result.body.jobs.every(job => job.status === "completed"));
+        assert.ok(result.body.jobs.every(job => job.completed_at));
 
         result = await request(baseUrl, "GET", "/api/jobs/memory?" + new URLSearchParams({
             job_name: " daily_summary ",
@@ -1435,6 +1498,14 @@ async function run() {
 
         result = await request(baseUrl, "GET", "/api/jobs/memory?" + new URLSearchParams({
             target_date: "2026/06/07"
+        }).toString());
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.code, "MEMORY_JOB_TARGET_DATE_INVALID");
+        assert.equal(result.body.error, "target_date must use YYYY-MM-DD format");
+
+        result = await request(baseUrl, "GET", "/api/jobs/memory?" + new URLSearchParams({
+            target_date: "2026-02-31"
         }).toString());
         assert.equal(result.response.status, 400);
         assert.equal(result.body.ok, false);
@@ -2350,6 +2421,116 @@ async function run() {
         assert.equal(result.body.context.modules["csi.motion"].available, false);
         assert.equal(result.body.context.modules["lcd.status"].available, false);
 
+        result = await request(baseUrl, "GET", `/api/dashboard/v1/overview?${new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString()}`);
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body, true);
+        assert.equal(result.body.data.devices.length, 1);
+        assert.equal(result.body.data.devices[0].occupancy.state, "unknown");
+        assert.equal(result.body.data.devices[0].occupancy.available, false);
+        assert.equal(result.body.data.devices[0].occupancy.motion_score, null);
+
+        const csiUpdatedAt = Date.now() - 5;
+        const csiMotionEnvelope = {
+            schema_version: 1,
+            device_id: bmeDeviceId,
+            device_type: "esp32c5_env_voice_node",
+            firmware_version: "0.1.0-smoke",
+            request_seq: 201,
+            esp_uptime_ms: 988001,
+            payload_type: "csi.motion",
+            room_id: "living_room",
+            payload: {
+                occupancy: {
+                    state: "occupied"
+                },
+                motion_score: 0.73,
+                variance: 0.0182,
+                rssi: -58,
+                sample_count: 96,
+                updated_at: csiUpdatedAt
+            }
+        };
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", csiMotionEnvelope);
+        assert.equal(result.response.status, 202);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.data.device_id, bmeDeviceId);
+        assert.equal(result.body.data.payload_type, "csi.motion");
+        assert.equal(result.body.data.occupancy.state, "occupied");
+        assert.equal(result.body.data.motion_score, 0.73);
+        assert.equal(result.body.data.sample_count, 96);
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
+            ...csiMotionEnvelope,
+            device_id: "esp32-c5-csi-002",
+            request_seq: 202,
+            room_id: "bedroom",
+            payload: {
+                ...csiMotionEnvelope.payload,
+                occupancy: {
+                    state: "vacant"
+                },
+                motion_score: 0.11,
+                variance: 0.0021,
+                rssi: -62,
+                sample_count: 64,
+                updated_at: csiUpdatedAt + 1
+            }
+        });
+        assert.equal(result.response.status, 202);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.data.device_id, "esp32-c5-csi-002");
+        assert.equal(result.body.data.occupancy.state, "vacant");
+
+        sensorRows = await dbAll(dbPath, "SELECT * FROM sensor_records WHERE payload_type='csi.motion'");
+        assert.equal(sensorRows.length, 0);
+
+        result = await request(baseUrl, "GET", `/api/device/v1/modules/status?${new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString()}`);
+        const csiModule = result.body.modules.find(module => module.module_type === "csi.motion");
+        assert.ok(csiModule);
+        assert.equal(csiModule.online, true);
+
+        result = await request(baseUrl, "GET", `/api/device/v1/context?${new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString()}`);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.context.modules["csi.motion"].available, true);
+
+        result = await request(baseUrl, "GET", `/api/dashboard/v1/overview?${new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString()}`);
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body, true);
+        assert.equal(result.body.data.devices.length, 1);
+        assert.equal(result.body.data.devices[0].occupancy.state, "occupied");
+        assert.equal(result.body.data.devices[0].occupancy.available, true);
+        assert.equal(result.body.data.devices[0].occupancy.motion_score, 0.73);
+
+        result = await request(baseUrl, "GET", "/api/dashboard/v1/overview");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body, true);
+        const csiOne = result.body.data.devices.find(device => device.device_id === bmeDeviceId);
+        const csiTwo = result.body.data.devices.find(device => device.device_id === "esp32-c5-csi-002");
+        assert.equal(csiOne.occupancy.state, "occupied");
+        assert.equal(csiTwo.occupancy.state, "vacant");
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
+            ...csiMotionEnvelope,
+            request_seq: 203,
+            payload: {
+                ...csiMotionEnvelope.payload,
+                occupancy: {
+                    state: "moving"
+                }
+            }
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.error.code, "INVALID_CSI_OCCUPANCY_STATE");
+
         result = await request(baseUrl, "GET", `/api/device/v1/sensors/latest?${new URLSearchParams({
             device_id: bmeDeviceId
         }).toString()}`);
@@ -2512,6 +2693,222 @@ async function run() {
         assert.equal(result.response.status, 200);
         assert.equal(result.body.prompt, "p".repeat(4000));
         assert.equal(result.body.response, "r".repeat(4000));
+
+        const dashboardDeviceQuery = new URLSearchParams({
+            device_id: bmeDeviceId
+        }).toString();
+        const dashboardHistoryQuery = new URLSearchParams({
+            device_id: bmeDeviceId,
+            limit: "5"
+        }).toString();
+
+        const dashboardSnapshot = {
+            schema_version: 2,
+            payload_type: "gateway.dashboard_snapshot",
+            source: "s3_gateway",
+            gateway: {
+                gateway_id: "sensair_s3_gateway_01",
+                online: true,
+                softap_ready: true,
+                sta_connected: true,
+                server_available: true,
+                voice_busy: false,
+                last_error: "",
+                timestamp: Date.now()
+            },
+            devices: [{
+                device_id: bmeDeviceId,
+                local_id: 1,
+                name: "SensaiShuttle",
+                room_name: "living_room",
+                online: true,
+                wifi_rssi: -58,
+                timestamp: Date.now(),
+                sensors: {
+                    temperature: 29.57,
+                    humidity: 30.29,
+                    pressure: 986.26,
+                    gas_resistance: 35164,
+                    air_quality_score: 72,
+                    air_quality_level: "moderate",
+                    air_quality_source: "s3_mapped"
+                },
+                occupancy: {
+                    state: "vacant",
+                    available: true,
+                    motion_score: 0.21,
+                    variance: 0.004,
+                    rssi: -61,
+                    sample_count: 48,
+                    updated_at: Date.now() + 1000
+                },
+                appliances: {
+                    air_conditioner: {
+                        power: false,
+                        mode: "cool",
+                        target_temperature: 26,
+                        source: "mock",
+                        mock: true
+                    }
+                }
+            }],
+            home_summary: {
+                online_device_count: 1,
+                offline_device_count: 0,
+                avg_temperature: 29.57,
+                avg_humidity: 30.29,
+                avg_air_quality: 72
+            },
+            history: [{
+                device_id: bmeDeviceId,
+                sensor_type: "bme690",
+                timestamp: Date.now(),
+                temperature: 29.57,
+                humidity: 30.29,
+                pressure: 986.26,
+                gas_resistance: 35164,
+                air_quality_score: 72,
+                air_quality_level: "moderate"
+            }],
+            recent_voice_events: [{
+                device_id: bmeDeviceId,
+                event: "voice_turn_completed",
+                timestamp: Date.now(),
+                duration_ms: 2000,
+                source: "s3_gateway"
+            }],
+            recent_commands: [{
+                command_id: "cmd-smoke-001",
+                device_id: bmeDeviceId,
+                command_code: 2,
+                status: "completed",
+                timestamp: Date.now(),
+                source: "s3_gateway"
+            }]
+        };
+
+        result = await request(baseUrl, "POST", "/api/device/v1/gateway-state", dashboardSnapshot);
+        assert.equal(result.response.status, 202);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.data.payload_type, "gateway.dashboard_snapshot");
+        assert.equal(result.body.data.gateway_id, "sensair_s3_gateway_01");
+        assert.equal(result.body.data.device_count, 1);
+
+        const dashboardEndpoints = [
+            `/api/dashboard/v1/overview?${dashboardDeviceQuery}`,
+            `/api/dashboard/v1/sensors/latest?${dashboardDeviceQuery}`,
+            `/api/dashboard/v1/sensors/history?${dashboardHistoryQuery}`,
+            `/api/dashboard/v1/devices/${encodeURIComponent(bmeDeviceId)}/history?limit=5`,
+            "/api/dashboard/v1/asr/latest",
+            "/api/dashboard/v1/llm/latest",
+            "/api/dashboard/v1/time/status",
+            `/api/dashboard/v1/device/status?${dashboardDeviceQuery}`,
+            `/api/dashboard/v1/modules/status?${dashboardDeviceQuery}`
+        ];
+
+        for (const endpoint of dashboardEndpoints) {
+            result = await request(baseUrl, "GET", endpoint);
+            assert.equal(result.response.status, 200, `${endpoint} should be reachable`);
+            assertDashboardEnvelope(result.body, true);
+        }
+
+        result = await request(baseUrl, "GET", `/api/dashboard/v1/sensors/latest?${dashboardDeviceQuery}`);
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body, true);
+        assert.equal(result.body.data.device_id, bmeDeviceId);
+        assert.equal(result.body.data.temperature, 29.57);
+        assert.equal(result.body.data.humidity, 30.29);
+        assert.equal(result.body.data.pressure, 986.26);
+        assert.equal(result.body.data.gas_resistance, 35164);
+        assert.equal(result.body.data.air_quality_score, 72);
+        assert.equal(result.body.data.air_quality_level, "moderate");
+        assert.equal(result.body.data.air_quality_confidence, "low");
+        assert.equal(result.body.data.air_quality_source, "esp");
+        assert.equal(result.body.data.air_quality.air_quality_score, 72);
+        assert.notStrictEqual(result.body.data.gas_resistance, result.body.data.air_quality_score);
+        assert.equal(typeof result.body.data.online, "boolean");
+        assert.equal(typeof result.body.data.device_online, "boolean");
+        assert.equal(typeof result.body.data.sensor_online, "boolean");
+        assert.equal(hasOwn(result.body.data, "latest_upload_delay_ms"), true);
+        assert.equal(hasOwn(result.body.data, "avg_upload_delay_ms"), true);
+        assert.equal(hasOwn(result.body.data, "delay_sample_count"), true);
+        assert.ok(result.body.data.time_sync);
+
+        result = await request(baseUrl, "GET", `/api/dashboard/v1/sensors/history?${dashboardHistoryQuery}`);
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body, true);
+        assert.ok(Array.isArray(result.body.data));
+        assert.ok(result.body.data.length >= 1);
+        const dashboardHistoryBme = result.body.data.find(row => row.gas_resistance === 35164 && row.air_quality_score === 72);
+        assert.ok(dashboardHistoryBme);
+        assert.equal(dashboardHistoryBme.air_quality_level, "moderate");
+        assert.equal(dashboardHistoryBme.air_quality_confidence, "low");
+        assert.equal(dashboardHistoryBme.air_quality_source, "esp");
+
+        result = await request(baseUrl, "GET", "/api/dashboard/v1/sensors/history?limit=bad");
+        assert.equal(result.response.status, 400);
+        assertDashboardEnvelope(result.body, false);
+        assert.equal(result.body.data, null);
+        assert.equal(result.body.error.code, "DASHBOARD_BAD_LIMIT");
+
+        result = await request(baseUrl, "GET", `/api/dashboard/v1/overview?${dashboardDeviceQuery}`);
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body, true);
+        assert.equal(result.body.data.gateway.gateway_id, "sensair_s3_gateway_01");
+        assert.equal(result.body.data.gateway.online, true);
+        assert.equal(result.body.data.devices.length, 1);
+        assert.equal(result.body.data.devices[0].device_id, bmeDeviceId);
+        assert.equal(result.body.data.devices[0].sensors.gas_resistance, 35164);
+        assert.equal(result.body.data.devices[0].sensors.air_quality_score, 72);
+        assert.equal(result.body.data.devices[0].occupancy.state, "vacant");
+        assert.equal(result.body.data.devices[0].occupancy.available, true);
+        assert.equal(result.body.data.devices[0].occupancy.motion_score, 0.21);
+        assert.equal(result.body.data.devices[0].appliances.air_conditioner.source, "mock");
+        assert.equal(result.body.data.devices[0].appliances.fan.mock, true);
+        assert.equal(result.body.data.home_summary.online_device_count, 1);
+        assert.equal(result.body.data.home_summary.avg_air_quality, 72);
+        assert.equal(result.body.data.history[0].device_id, bmeDeviceId);
+        assert.equal(result.body.data.history[0].air_quality_level, "moderate");
+        assert.equal(result.body.data.recent_voice_events[0].event, "voice_turn_completed");
+        assert.equal(result.body.data.recent_commands[0].command_id, "cmd-smoke-001");
+
+        result = await request(baseUrl, "GET", `/api/dashboard/v1/devices/${encodeURIComponent(bmeDeviceId)}/history?limit=5`);
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body, true);
+        assert.ok(Array.isArray(result.body.data));
+        assert.ok(result.body.data.some(row => row.device_id === bmeDeviceId));
+
+        result = await request(baseUrl, "GET", "/sensor/latest");
+        assert.equal(result.response.status, 200);
+        assert.equal(hasOwn(result.body, "data"), false);
+        assert.equal(hasOwn(result.body, "error"), false);
+        assert.equal(hasOwn(result.body, "server_time_ms"), false);
+
+        result = await request(baseUrl, "GET", "/sensor/history?limit=1");
+        assert.equal(result.response.status, 200);
+        assert.ok(Array.isArray(result.body));
+
+        result = await request(baseUrl, "GET", "/asr/latest");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.text, "a".repeat(4000));
+        assert.equal(hasOwn(result.body, "data"), false);
+
+        result = await request(baseUrl, "GET", "/llm/latest");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.prompt, "p".repeat(4000));
+        assert.equal(result.body.response, "r".repeat(4000));
+        assert.equal(hasOwn(result.body, "data"), false);
+
+        result = await request(baseUrl, "GET", "/api/time/status");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(hasOwn(result.body, "data"), false);
+
+        result = await request(baseUrl, "GET", `/api/device/v1/status?${dashboardDeviceQuery}`);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(hasOwn(result.body, "status"), true);
+        assert.equal(hasOwn(result.body, "data"), false);
 
         result = await request(baseUrl, "GET", "/api/not-found-for-smoke");
         assert.equal(result.response.status, 404);
@@ -2695,6 +3092,303 @@ async function run() {
         assert.equal(rows[0].status_code, 400);
         assert.equal(rows[0].error_code, "VOICE_PCM_ALIGNMENT_INVALID");
         assert.equal(rows[0].input_bytes, 1);
+
+        const smokeToday = new Date().toISOString().slice(0, 10);
+        const archivedTurnId = "smoke-archived-turn-delete";
+        result = await request(baseUrl, "POST", "/api/conversation/turns", {
+            turn_id: archivedTurnId,
+            input_text: "archived conversation must still be deleted",
+            memory_level: "archived"
+        });
+        assert.equal(result.response.status, 201);
+        const archivedProfileKey = "smoke.archived.profile.delete";
+        result = await request(baseUrl, "POST", "/api/memory/profile", {
+            profile_key: archivedProfileKey,
+            profile_value: "archived profile must still be deleted",
+            status: "archived"
+        });
+        assert.equal(result.response.status, 200);
+        const archivedDailyMemoryDate = smokeToday;
+        result = await request(baseUrl, "POST", "/api/memory/daily", {
+            memory_date: archivedDailyMemoryDate,
+            summary: "archived summary must still be deleted",
+            status: "archived"
+        });
+        assert.equal(result.response.status, 201);
+
+        result = await request(baseUrl, "GET", "/api/user-data/summary");
+        assert.equal(result.response.status, 401);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.code, "USER_DATA_ADMIN_REQUIRED");
+
+        result = await request(baseUrl, "GET", "/api/user-data/summary", null, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        const scopeSummary = scope => result.body.scopes.find(item => item.scope === scope);
+        assert.ok(scopeSummary("summaries").count >= 3);
+        assert.ok(scopeSummary("profiles").count >= 4);
+        assert.ok(scopeSummary("conversations").count >= 3);
+        assert.ok(scopeSummary("device_history").count >= 5);
+        assert.ok(scopeSummary("jobs").count >= 2);
+        assert.ok(scopeSummary("all_user_data").count >= scopeSummary("device_history").count);
+
+        const activeConversationRowsBefore = await dbAll(dbPath, "SELECT COUNT(*) AS count FROM conversation_turns WHERE deleted_at IS NULL");
+        const activeAsrRowsBefore = await dbAll(dbPath, "SELECT COUNT(*) AS count FROM asr_records WHERE deleted_at IS NULL");
+        const activeLlmRowsBefore = await dbAll(dbPath, "SELECT COUNT(*) AS count FROM llm_records WHERE deleted_at IS NULL");
+        result = await request(baseUrl, "POST", "/api/user-data/delete/preview", {
+            scope: "conversations",
+            mode: "soft_delete"
+        }, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.ok(result.body.run_id);
+        assert.equal(result.body.request_type, "preview");
+        assert.equal(result.body.required_confirm, "DELETE");
+        assert.equal(result.body.affected_counts.conversation_turns, activeConversationRowsBefore[0].count);
+        assert.equal(result.body.affected_counts.asr_records, activeAsrRowsBefore[0].count);
+        assert.equal(result.body.affected_counts.llm_records, activeLlmRowsBefore[0].count);
+        const previewRunId = result.body.run_id;
+        result = await request(baseUrl, "GET", `/api/user-data/deletion-runs?request_type=preview&limit=1`, null, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.runs[0].run_id, previewRunId);
+        assert.equal(result.body.runs[0].request_type, "preview");
+        assert.equal(result.body.runs[0].status, "completed");
+        assert.ok(result.body.runs[0].created_at);
+        let afterPreviewRows = await dbAll(dbPath, "SELECT COUNT(*) AS count FROM conversation_turns WHERE deleted_at IS NULL");
+        assert.equal(afterPreviewRows[0].count, activeConversationRowsBefore[0].count);
+
+        const rollbackDeviceId = "rollback-smoke-device";
+        result = await request(baseUrl, "POST", "/api/devices/capabilities", {
+            device_id: rollbackDeviceId,
+            protocol_version: "agent-command-v1",
+            capabilities: {
+                commands: ["display.show_text"]
+            }
+        });
+        assert.equal(result.response.status, 200);
+        result = await request(baseUrl, "POST", "/api/commands", {
+            name: "display.show_text",
+            target_device_id: rollbackDeviceId,
+            payload: {
+                text: "rollback smoke"
+            }
+        });
+        assert.equal(result.response.status, 201);
+        const rollbackCommandId = result.body.command.command_id;
+        result = await request(baseUrl, "POST", "/sensor", {
+            temperature: 23.5,
+            humidity: 45.2,
+            pressure: 1008.1,
+            gas_resistance: 321.4,
+            device_id: rollbackDeviceId
+        });
+        assert.equal(result.response.status, 200);
+        const rollbackSensorId = result.body.id;
+        await dbRun(dbPath, `
+            CREATE TRIGGER fail_command_queue_soft_delete
+            BEFORE UPDATE OF deleted_at ON command_queue
+            WHEN NEW.delete_reason='rollback_smoke'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced rollback smoke');
+            END
+        `);
+        result = await request(baseUrl, "POST", "/api/user-data/delete", {
+            scope: "device_history",
+            mode: "soft_delete",
+            confirm: "DELETE",
+            reason: "rollback_smoke",
+            requested_by: "smoke"
+        }, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 500);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.code, "USER_DATA_DELETE_FAILED");
+        await dbRun(dbPath, "DROP TRIGGER fail_command_queue_soft_delete");
+        rows = await dbAll(dbPath, "SELECT deleted_at FROM sensor_records WHERE id=? LIMIT 1", [rollbackSensorId]);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].deleted_at, null);
+        rows = await dbAll(dbPath, "SELECT deleted_at FROM command_queue WHERE command_id=? LIMIT 1", [rollbackCommandId]);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].deleted_at, null);
+        result = await request(baseUrl, "GET", "/api/user-data/deletion-runs?status=failed&limit=1", null, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.runs.length, 1);
+        assert.equal(result.body.runs[0].status, "failed");
+        assert.equal(result.body.runs[0].scope, "device_history");
+        assert.ok(result.body.runs[0].preview_counts.sensor_records >= 1);
+
+        result = await request(baseUrl, "POST", "/api/jobs/daily-summary/run", {
+            date: smokeToday,
+            force: true,
+            dry_run: true
+        });
+        assert.equal(result.response.status, 202);
+        assert.equal(result.body.status, "dry_run");
+        assert.ok(result.body.stats.sensor_records.count > 0);
+        assert.ok(result.body.stats.command_queue.count > 0);
+        assert.ok(result.body.stats.conversation_turns.count > 0);
+
+        result = await request(baseUrl, "POST", "/api/user-data/delete", {
+            scope: "conversations",
+            mode: "soft_delete",
+            confirm: "DELETE",
+            reason: "smoke_conversations",
+            requested_by: "smoke"
+        }, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.status, "completed");
+        assert.ok(result.body.affected_counts.conversation_turns >= activeConversationRowsBefore[0].count);
+        rows = await dbAll(dbPath, "SELECT memory_level, deleted_at FROM conversation_turns WHERE turn_id=? LIMIT 1", [archivedTurnId]);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].memory_level, "archived");
+        assert.ok(rows[0].deleted_at);
+        result = await request(baseUrl, "GET", "/api/user-data/summary", null, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.ok(result.body.scopes.find(item => item.scope === "conversations").last_deleted_at);
+        result = await request(baseUrl, "GET", "/api/conversation/turns?limit=10");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.turns.length, 0);
+        result = await request(baseUrl, "GET", "/asr/latest");
+        assert.equal(result.response.status, 200);
+        assert.deepEqual(result.body, {});
+        result = await request(baseUrl, "GET", "/llm/latest");
+        assert.equal(result.response.status, 200);
+        assert.deepEqual(result.body, {});
+
+        result = await request(baseUrl, "POST", "/api/user-data/delete", {
+            scope: "device_history",
+            mode: "soft_delete",
+            confirm: "DELETE",
+            reason: "smoke_device_history",
+            requested_by: "smoke"
+        }, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.status, "completed");
+        assert.ok(result.body.affected_counts.sensor_records > 0);
+        assert.equal(result.body.affected_counts.device_capabilities, undefined);
+        rows = await dbAll(dbPath, "SELECT status, deleted_at FROM command_queue WHERE command_id=? LIMIT 1", [rollbackCommandId]);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].status, "queued");
+        assert.ok(rows[0].deleted_at);
+        rows = await dbAll(dbPath, "SELECT status, deleted_at FROM voice_turns WHERE request_id=? LIMIT 1", ["smoke-turn-empty-body"]);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].status, "rejected");
+        assert.ok(rows[0].deleted_at);
+
+        result = await request(baseUrl, "POST", "/api/llm/text", {
+            text: "删除后现在房间环境怎么样",
+            device_id: bmeDeviceId
+        });
+        assert.equal(result.response.status, 200);
+        const postDeletePromptBody = mockLlm.requests[mockLlm.requests.length - 1].body;
+        assert.match(postDeletePromptBody, /当前没有可用的实时 BME690|当前没有可靠的 ESP 本地空气状态估算/);
+        assert.doesNotMatch(postDeletePromptBody, /moderate|72\/100|29\.57/);
+
+        result = await request(baseUrl, "POST", "/api/user-data/delete", {
+            scope: "summaries",
+            mode: "soft_delete",
+            confirm: "DELETE",
+            reason: "smoke_summaries",
+            requested_by: "smoke"
+        }, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.status, "completed");
+        rows = await dbAll(dbPath, "SELECT status, deleted_at FROM daily_memory WHERE memory_date=? AND summary=? LIMIT 1", [archivedDailyMemoryDate, "archived summary must still be deleted"]);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].status, "archived");
+        assert.ok(rows[0].deleted_at);
+        result = await request(baseUrl, "GET", "/api/memory/daily?limit=10");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.memories.length, 0);
+
+        result = await request(baseUrl, "POST", "/api/user-data/delete", {
+            scope: "profiles",
+            mode: "soft_delete",
+            confirm: "DELETE",
+            reason: "smoke_profiles",
+            requested_by: "smoke"
+        }, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.status, "completed");
+        rows = await dbAll(dbPath, "SELECT status, deleted_at FROM long_term_profile WHERE profile_key=? LIMIT 1", [archivedProfileKey]);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].status, "archived");
+        assert.ok(rows[0].deleted_at);
+        result = await request(baseUrl, "GET", "/api/memory/profile?status=archived&limit=10");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.profiles.some(profile => profile.profile_key === archivedProfileKey), false);
+
+        result = await request(baseUrl, "POST", "/api/jobs/daily-summary/run", {
+            date: smokeToday,
+            force: true,
+            dry_run: true
+        });
+        assert.equal(result.response.status, 202);
+        assert.equal(result.body.status, "dry_run");
+        assert.equal(result.body.stats.sensor_records.count, 0);
+        assert.equal(result.body.stats.command_queue.count, 0);
+        assert.equal(result.body.stats.conversation_turns.count, 0);
+
+        result = await request(baseUrl, "POST", "/api/jobs/weekly-profile/run", {
+            week_end: smokeToday,
+            force: true,
+            dry_run: true
+        });
+        assert.equal(result.response.status, 202);
+        assert.equal(result.body.status, "dry_run");
+        assert.equal(result.body.stats.daily_memory.count, 0);
+        assert.equal(result.body.stats.sensor_records.count, 0);
+        assert.equal(result.body.stats.conversation_turns.count, 0);
+
+        result = await request(baseUrl, "GET", "/api/user-data/deletion-runs?request_type=delete&limit=1", null, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        const hiddenAuditRunId = result.body.runs[0].run_id;
+        result = await request(baseUrl, "POST", "/api/user-data/delete", {
+            scope: "jobs",
+            mode: "soft_delete",
+            confirm: "DELETE",
+            reason: "smoke_audit_cleanup",
+            requested_by: "smoke",
+            include_audit_logs: true
+        }, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.status, "completed");
+        const auditCleanupRunId = result.body.run_id;
+        result = await request(baseUrl, "GET", "/api/user-data/deletion-runs?limit=50", null, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.ok(result.body.runs.some(run => run.run_id === auditCleanupRunId));
+        assert.equal(result.body.runs.some(run => run.run_id === hiddenAuditRunId), false);
+        result = await request(baseUrl, "GET", "/api/user-data/deletion-runs?include_deleted=true&limit=50", null, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.ok(result.body.runs.some(run => run.run_id === hiddenAuditRunId && run.deleted_at));
+
+        const capabilitiesBeforeDeleteRows = await dbAll(dbPath, "SELECT COUNT(*) AS count FROM device_capabilities");
+        assert.ok(capabilitiesBeforeDeleteRows[0].count > 0);
+        result = await request(baseUrl, "POST", "/api/user-data/delete", {
+            scope: "all_user_data",
+            mode: "hard_delete",
+            confirm: "DELETE",
+            reason: "smoke_hard_delete",
+            requested_by: "smoke"
+        }, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.status, "completed");
+        assert.ok(result.body.affected_counts.sensor_records > 0);
+        assert.equal(result.body.affected_counts.device_capabilities, undefined);
+        for (const tableName of ["sensor_records", "conversation_turns", "daily_memory", "command_queue", "voice_turns", "memory_job_runs"]) {
+            rows = await dbAll(dbPath, `SELECT COUNT(*) AS count FROM ${tableName}`);
+            assert.equal(rows[0].count, 0, `${tableName} should be hard deleted`);
+        }
+        const capabilitiesAfterDeleteRows = await dbAll(dbPath, "SELECT COUNT(*) AS count FROM device_capabilities");
+        assert.equal(capabilitiesAfterDeleteRows[0].count, capabilitiesBeforeDeleteRows[0].count);
+        rows = await dbAll(dbPath, "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('sensor_records','device_capabilities','data_deletion_runs') ORDER BY name");
+        assert.deepEqual(rows.map(row => row.name), ["data_deletion_runs", "device_capabilities", "sensor_records"]);
+        result = await request(baseUrl, "GET", "/api/user-data/deletion-runs?limit=5", null, USER_DATA_HEADERS);
+        assert.equal(result.response.status, 200);
+        assert.ok(result.body.runs.length >= 1);
+        assert.equal(result.body.runs[0].status, "completed");
+        assert.equal(result.body.runs[0].scope, "all_user_data");
+        assert.equal(result.body.runs[0].request_type, "delete");
+        assert.ok(result.body.runs[0].affected_counts.sensor_records > 0);
 
         await dbRun(dbPath, "DROP TABLE long_term_profile");
         result = await request(baseUrl, "GET", "/api/memory/profile?limit=1");

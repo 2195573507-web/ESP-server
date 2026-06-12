@@ -11,8 +11,14 @@ const {
     readModuleStatuses
 } = require("../services/deviceStatusService");
 const {
+    ingestCsiMotion
+} = require("../services/csiMotionService");
+const {
     ingestBme690
 } = require("../services/sensorBme690Service");
+const {
+    ingestDashboardSnapshot
+} = require("../services/dashboardService");
 
 function parseJsonObject(value, fallback = {}) {
     if (!value) {
@@ -65,7 +71,7 @@ function mapLatestSensor(row) {
 
 async function readLatestSensor(dbAll, deviceId) {
     const params = [];
-    let where = "WHERE (payload_type='sensor.bme690' OR payload_type IS NULL OR payload_type='')";
+    let where = "WHERE deleted_at IS NULL AND (payload_type='sensor.bme690' OR payload_type IS NULL OR payload_type='')";
     if (deviceId) {
         where += " AND device_id=?";
         params.push(deviceId);
@@ -90,19 +96,20 @@ function createDeviceRouter(options) {
     router.post("/api/device/v1/ingest", async (req, res) => {
         const serverRecvMs = Date.now();
         const payloadType = trimText(req.body?.payload_type, 80);
-        if (payloadType !== "sensor.bme690") {
+        if (payloadType !== "sensor.bme690" && payloadType !== "csi.motion") {
             return res.status(400).json(makeDeviceEnvelope({
                 ok: false,
                 serverRecvMs,
                 error: {
                     code: "UNSUPPORTED_PAYLOAD_TYPE",
-                    message: "payload_type must be sensor.bme690"
+                    message: "payload_type must be sensor.bme690 or csi.motion"
                 }
             }));
         }
 
         try {
-            const result = await ingestBme690(dbRun, dbAll, req.body, {
+            const ingest = payloadType === "csi.motion" ? ingestCsiMotion : ingestBme690;
+            const result = await ingest(dbRun, dbAll, req.body, {
                 headers: req.headers,
                 query: req.query,
                 serverRecvMs
@@ -119,7 +126,7 @@ function createDeviceRouter(options) {
             }
 
             logger.log(
-                `[device-v1] ingest payload_type=sensor.bme690 device_id=${result.data.device_id || "-"} id=${result.data.id} upload_delay_ms=${result.data.upload_delay_ms ?? "null"}`
+                `[device-v1] ingest payload_type=${result.data.payload_type} device_id=${result.data.device_id || "-"} id=${result.data.id ?? "-"} upload_delay_ms=${result.data.upload_delay_ms ?? "null"}`
             );
 
             return res.status(result.status).json(makeDeviceEnvelope({
@@ -135,6 +142,46 @@ function createDeviceRouter(options) {
                 error: {
                     code: "DEVICE_INGEST_FAILED",
                     message: "device ingest failed"
+                }
+            }));
+        }
+    });
+
+    router.post("/api/device/v1/gateway-state", async (req, res) => {
+        const serverRecvMs = Date.now();
+
+        try {
+            const result = await ingestDashboardSnapshot(req.body, {
+                serverRecvMs
+            });
+            if (!result.ok) {
+                return res.status(result.status || 400).json(makeDeviceEnvelope({
+                    ok: false,
+                    serverRecvMs,
+                    error: {
+                        code: result.code || "INVALID_DASHBOARD_SNAPSHOT",
+                        message: result.error || "invalid dashboard snapshot"
+                    }
+                }));
+            }
+
+            logger.log(
+                `[device-v1] gateway-state gateway_id=${result.data.gateway_id || "-"} devices=${result.data.device_count}`
+            );
+
+            return res.status(result.status).json(makeDeviceEnvelope({
+                ok: true,
+                serverRecvMs,
+                data: result.data
+            }));
+        } catch (error) {
+            logger.error(`[device-v1] gateway-state failed ${error?.message || error}`);
+            return res.status(500).json(makeDeviceEnvelope({
+                ok: false,
+                serverRecvMs,
+                error: {
+                    code: "GATEWAY_STATE_INGEST_FAILED",
+                    message: "gateway state ingest failed"
                 }
             }));
         }

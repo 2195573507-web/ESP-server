@@ -65,7 +65,7 @@ function createRecordRouter(options) {
 
     router.get("/asr/latest", (req, res) => {
         db.get(
-            "SELECT * FROM asr_records ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM asr_records WHERE deleted_at IS NULL ORDER BY id DESC LIMIT 1",
             [],
             (err, row) => {
                 if (err) {
@@ -79,7 +79,7 @@ function createRecordRouter(options) {
 
     router.get("/llm/latest", (req, res) => {
         db.get(
-            "SELECT * FROM llm_records ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM llm_records WHERE deleted_at IS NULL ORDER BY id DESC LIMIT 1",
             [],
             (err, row) => {
                 if (err) {

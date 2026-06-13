@@ -118,6 +118,9 @@ function buildTtsSessionUpdate(config) {
             voice: config.tts.voice,
             output_audio_format: "pcm",
             output_audio_sample_rate: config.tts.sampleRate,
+            speed: config.tts.speed,
+            pitch: config.tts.pitch,
+            volume: config.tts.volume,
             text_to_speech: {
                 model: config.tts.model
             }

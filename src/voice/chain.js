@@ -258,7 +258,10 @@ async function requestHttpVoiceTts(text, config, deviceId, signal) {
                 response_format: "pcm",
                 output_audio_format: "pcm",
                 sample_rate: config.tts.sampleRate,
-                output_audio_sample_rate: config.tts.sampleRate
+                output_audio_sample_rate: config.tts.sampleRate,
+                speed: config.tts.speed,
+                pitch: config.tts.pitch,
+                volume: config.tts.volume
             }),
             signal
         });

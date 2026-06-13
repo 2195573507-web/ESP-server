@@ -739,6 +739,7 @@ async function run() {
     const tempDir = makeTempDir();
     const dbPath = path.join(tempDir, "nested", "smoke.sqlite");
     const promptCacheDir = path.join(tempDir, "voice_prompts");
+    const promptConfigPath = path.join(tempDir, "voice_prompts", "wake_prompt_config.json");
     const port = String(44000 + Math.floor(Math.random() * 1000));
     const baseUrl = `http://127.0.0.1:${port}`;
     const mockLlm = await startMockLlmServer();
@@ -753,6 +754,7 @@ async function run() {
             VOICE_TURN_MOCK: "1",
             VOICE_TURN_MAX_BYTES: "4096",
             VOICE_PROMPT_CACHE_DIR: promptCacheDir,
+            VOICE_PROMPT_CONFIG_PATH: promptConfigPath,
             LLM_API_KEY: "smoke-llm-key",
             LLM_BASE_URL: mockLlm.baseUrl,
             LLM_CHAT_PATH: "/v1/chat/completions",
@@ -2926,6 +2928,34 @@ async function run() {
         assert.ok(Buffer.isBuffer(result.body));
         assert.ok(result.body.length > 0);
 
+        result = await request(baseUrl, "GET", "/api/voice/prompt/config");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.config.wake_prompt_text, "我在，你说");
+        assert.equal(result.body.config.sample_rate, 16000);
+        assert.equal(result.body.config.format, "s16le");
+        assert.equal(result.body.config.channels, 1);
+        assert.ok(result.body.config.voice_config_hash);
+        const initialPromptHash = result.body.config.voice_config_hash;
+
+        result = await request(baseUrl, "PUT", "/api/voice/prompt/config", {
+            wake_prompt_text: "你好，我在",
+            voice_id: "smoke_voice_v2",
+            speed: 1.05,
+            pitch: 1,
+            volume: 1,
+            sample_rate: 16000,
+            format: "s16le",
+            channels: 1
+        });
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.config.wake_prompt_text, "你好，我在");
+        assert.equal(result.body.config.voice_id, "smoke_voice_v2");
+        assert.notEqual(result.body.config.voice_config_hash, initialPromptHash);
+        const updatedPromptHash = result.body.config.voice_config_hash;
+        const updatedPromptVersion = result.body.config.prompt_version;
+
         const promptPath = `/api/voice/prompt-cache?${new URLSearchParams({
             prompt_key: "smoke_wake",
             device_id: deviceId
@@ -2933,6 +2963,10 @@ async function run() {
         result = await request(baseUrl, "GET", promptPath);
         assert.equal(result.response.status, 200);
         assert.equal(result.response.headers.get("x-audio-format"), "pcm_s16le_mono_16k");
+        assert.equal(result.response.headers.get("x-audio-sample-rate"), "16000");
+        assert.equal(result.response.headers.get("x-audio-channels"), "1");
+        assert.equal(result.response.headers.get("x-voice-config-hash"), updatedPromptHash);
+        assert.equal(result.response.headers.get("x-audio-version"), updatedPromptVersion);
         assert.equal(result.response.headers.get("x-prompt-cache"), "miss");
         assert.equal(result.body.length, 32000);
         const promptCacheFiles = fs.readdirSync(promptCacheDir).filter(file => file.includes("smoke_wake"));
@@ -2942,6 +2976,7 @@ async function run() {
         result = await request(baseUrl, "GET", promptPath);
         assert.equal(result.response.status, 200);
         assert.equal(result.response.headers.get("x-prompt-cache"), "hit");
+        assert.equal(result.response.headers.get("x-voice-config-hash"), updatedPromptHash);
         assert.equal(result.body.length, 32000);
 
         result = await request(baseUrl, "GET", `/api/voice/prompt?${new URLSearchParams({
@@ -2963,6 +2998,7 @@ async function run() {
                 ESP_SERVER_DB_PATH: staleDbPath,
                 VOICE_TURN_MOCK: "0",
                 VOICE_PROMPT_CACHE_DIR: promptCacheDir,
+                VOICE_PROMPT_CONFIG_PATH: promptConfigPath,
                 VOLC_GATEWAY_API_KEY: "",
                 LLM_API_KEY: "smoke-llm-key",
                 LLM_BASE_URL: mockLlm.baseUrl,

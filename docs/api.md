@@ -209,12 +209,15 @@ VOLC_GATEWAY_TTS_VOICE=<TTS 音色>
 VOLC_GATEWAY_TTS_PATH=/v1/realtime
 VOLC_GATEWAY_TTS_SAMPLE_RATE=16000
 VOLC_GATEWAY_TTS_FORMAT=pcm_s16le_mono_16k
+VOLC_GATEWAY_TTS_SPEED=1.0
+VOLC_GATEWAY_TTS_PITCH=1.0
+VOLC_GATEWAY_TTS_VOLUME=1.0
 ```
 
 配置说明：
 
 - 当前项目没有内置真实 ASR+LLM+TTS voice turn 上游时，请设置 `VOICE_TURN_MOCK=1`。服务器会稳定返回 `audio/L16; rate=16000; channels=1` 的 mock PCM 音频，用于验证 ESP32 和 Node 后端的 HTTP 音频链路。
-- `VOICE_TURN_MOCK=1` 也会让 `GET /api/voice/prompt` 返回 1 秒非静音 mock PCM，用于验证 wake prompt cache 下载、保存和播放链路；该 mock PCM 只是测试音，不代表真实“我在，你说”TTS 音色。
+- `VOICE_TURN_MOCK=1` 也会让 `GET /api/voice/prompt` 返回 1 秒非静音 mock PCM，用于验证 wake prompt cache 下载、保存和播放链路；该 mock PCM 只是测试音，不代表真实 wake prompt TTS 音色。
 - 只有接入真实火山网关 ASR -> LLM -> TTS 链路时，才设置 `VOICE_TURN_MOCK=0` 并填写 `VOLC_GATEWAY_*` 配置。
 - 火山网关当前已知可用的是文本 Chat Completions：`https://ai-gateway.vei.volces.com/v1/chat/completions`，以及 Realtime WebSocket：`wss://ai-gateway.vei.volces.com/v1/realtime?model=bigmodel`。这些都不是 `/v1/voice` HTTP turn 上游。
 - 当前后端实现使用 `VOLC_GATEWAY_*` 配置完成 ASR -> LLM -> TTS 链式处理；`VOICE_TURN_MOCK=1` 时不调用外部 ASR/LLM/TTS。
@@ -303,9 +306,58 @@ PCM 请求体超过 `VOICE_TURN_MAX_BYTES` 时返回 HTTP `413`：
 }
 ```
 
+### `GET /api/voice/prompt/config`
+
+读取 wake prompt 当前配置。ESPS3 会先读取本接口，比较 `voice_config_hash` 与本地 metadata；hash 变化时重新拉取 PCM 缓存。C5 不调用本接口，也不解析提示词文本。
+
+```json
+{
+  "ok": true,
+  "config": {
+    "wake_prompt_text": "我在，你说",
+    "provider": "volc",
+    "voice_id": "server_prompt_v1",
+    "speaker_id": "",
+    "speed": 1,
+    "pitch": 1,
+    "volume": 1,
+    "sample_rate": 16000,
+    "format": "s16le",
+    "channels": 1,
+    "prompt_version": "wake:...",
+    "voice_config_hash": "...",
+    "updated_at_ms": 1780732144669
+  }
+}
+```
+
+`voice_config_hash` 由 `wake_prompt_text`、`provider`、`voice_id`、`speaker_id`、`speed`、`pitch`、`volume`、`sample_rate`、`format`、`channels` 生成；任一字段变化都会改变 hash。
+
+### `PUT /api/voice/prompt/config`
+
+更新 wake prompt 文本或必要 TTS 参数。配置保存到服务器本地 JSON 文件，默认位于 `cache/voice_prompts/wake_prompt_config.json`；测试可用 `VOICE_PROMPT_CONFIG_PATH` 指向临时文件。修改后不需要重新烧录 C5/S3，下一次 S3 请求会按 hash 重新拉取。
+
+```http
+PUT /api/voice/prompt/config
+Content-Type: application/json
+```
+
+```json
+{
+  "wake_prompt_text": "你好，我在",
+  "voice_id": "server_prompt_v2",
+  "speed": 1,
+  "pitch": 1,
+  "volume": 1,
+  "sample_rate": 16000,
+  "format": "s16le",
+  "channels": 1
+}
+```
+
 ### `GET /api/voice/prompt-cache`
 
-ESP 唤醒提示音服务器缓存接口。当前 `Whole-project` wake prompt 主路径请求：
+ESP 唤醒提示音服务器缓存接口。当前 ESP-111 主链路是 ESPS3 请求 Server 缓存/生成 wake prompt PCM，C5 再从 ESPS3 `/local/v1/audio/wake-prompt` 获取二进制流播放。
 
 ```http
 GET /api/voice/prompt-cache?prompt_key=wake_ack_zh&device_id=esp32-c5-whole-001
@@ -320,6 +372,10 @@ Content-Type: audio/L16; rate=16000; channels=1
 X-Prompt-Key: wake_ack_zh
 X-Prompt-Cache: hit
 X-Audio-Format: pcm_s16le_mono_16k
+X-Audio-Sample-Rate: 16000
+X-Audio-Channels: 1
+X-Audio-Version: wake:...
+X-Voice-Config-Hash: ...
 X-Sample-Rate: 16000
 X-Channels: 1
 X-Server-Time-Ms: 1780732144669

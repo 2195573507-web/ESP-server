@@ -51,7 +51,7 @@ Response:
 }
 ```
 
-If `esp_send_ms` is missing or not numeric, `estimated_one_way_delay_ms` is `null`.
+`device_id` is trimmed and capped at 128 characters. If `esp_send_ms` is missing or not numeric, `estimated_one_way_delay_ms` is `null`.
 
 ### `GET /api/time/status`
 

@@ -1,6 +1,13 @@
 const express = require("express");
+const {
+    readDeviceMetadata
+} = require("../src/services/deviceMetadata");
+const {
+    refreshDeviceActivity
+} = require("../src/services/deviceStatusService");
 
 let latestPingRecord = null;
+const TIME_SYNC_DEVICE_ID_MAX_LENGTH = 128;
 
 function toFiniteNumber(value) {
     if (value === undefined || value === null || value === "") {
@@ -16,7 +23,8 @@ function toDeviceId(value) {
         return null;
     }
 
-    return String(value);
+    const text = String(value).trim();
+    return text ? text.slice(0, TIME_SYNC_DEVICE_ID_MAX_LENGTH) : null;
 }
 
 function makeServerTimeSnapshot(nowMs = Date.now()) {
@@ -78,6 +86,8 @@ function withTimeSyncStatus(payload) {
 function createTimeSyncRouter(options = {}) {
     const router = express.Router();
     const logger = options.logger || console;
+    const dbRun = options.dbRun;
+    const dbAll = options.dbAll;
 
     router.get("/now", (req, res) => {
         const snapshot = makeServerTimeSnapshot();
@@ -92,10 +102,28 @@ function createTimeSyncRouter(options = {}) {
         res.json(getTimeSyncStatus());
     });
 
-    router.post("/ping", (req, res) => {
+    router.post("/ping", async (req, res) => {
         const serverRecvMs = Date.now();
         const record = buildPingRecord(req.body, serverRecvMs);
         latestPingRecord = record;
+        const metadata = readDeviceMetadata({
+            body: {
+                ...req.body,
+                device_id: record.device_id,
+                payload_type: "time.ping",
+                esp_time_ms: req.body?.esp_time_ms ?? req.body?.esp_send_ms
+            },
+            headers: req.headers,
+            payloadType: "time.ping",
+            serverRecvMs
+        });
+        if (metadata.device_id && typeof dbRun === "function" && typeof dbAll === "function") {
+            try {
+                await refreshDeviceActivity(dbRun, dbAll, metadata, "time.ping");
+            } catch (error) {
+                logger.warn(`[time-sync] status refresh failed device_id=${record.device_id || "-"} message=${JSON.stringify(error?.message || "-")}`);
+            }
+        }
 
         logger.log(
             `[time-sync] ping device_id=${record.device_id || "-"} esp_send_ms=${record.esp_send_ms ?? "null"} server_recv_ms=${record.server_recv_ms} estimated_one_way_delay_ms=${record.estimated_one_way_delay_ms ?? "null"}`

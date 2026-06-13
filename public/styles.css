@@ -1,15 +1,19 @@
 :root,
+:root[data-theme="dark"],
 body[data-theme="dark"] {
     /* 主题变量：默认深色模式，JS 通过 body[data-theme] 在 dark 和 light 之间切换。 */
     --page-bg: #020617;
     --panel-bg: #0f172a;
     --card-bg: #111827;
-    --text-main: #f8fafc;
-    --text-muted: #94a3b8;
+    --text-primary: #ffffff;
+    --text-secondary: #d0d0d0;
+    --text-muted: #a0a0a0;
+    --card-text: #ffffff;
+    --text-main: var(--text-primary);
     --border-color: rgba(148, 163, 184, 0.24);
     --button-bg: #1e293b;
-    --button-text: #f8fafc;
-    --ink: var(--text-main);
+    --button-text: var(--text-primary);
+    --ink: var(--text-primary);
     --muted: var(--text-muted);
     --line: var(--border-color);
     --panel: var(--card-bg);
@@ -29,31 +33,41 @@ body[data-theme="dark"] {
     --sidebar-bg: var(--panel-bg);
     --card-muted: var(--text-muted);
     --chart-grid: rgba(148, 163, 184, 0.28);
-    --chart-label: #cbd5e1;
-    --chart-axis-label: #f8fafc;
+    --chart-label: #cccccc;
+    --chart-axis-label: #cccccc;
+    --chart-tooltip-bg: #0f172a;
+    --chart-tooltip-text: var(--text-primary);
     --chart-temperature: #93c5fd;
     --chart-humidity: #34d399;
     --chart-air: #d8b4fe;
     color-scheme: dark;
 }
 
+:root[data-theme="light"],
 body[data-theme="light"] {
     /* 主题变量：浅色模式，按钮点击后写入 body[data-theme="light"]。 */
     --page-bg: #f6f9fe;
     --panel-bg: #ffffff;
     --card-bg: #ffffff;
-    --text-main: #12213f;
-    --text-muted: #667896;
+    --text-primary: #1a1a1a;
+    --text-secondary: #333333;
+    --text-muted: #555555;
+    --card-text: #1f1f1f;
+    --text-main: var(--text-primary);
     --border-color: #e3ebf6;
     --button-bg: #f2f6fc;
-    --button-text: #1e3358;
+    --button-text: var(--text-secondary);
+    --ink: var(--text-primary);
+    --muted: var(--text-muted);
+    --line: var(--border-color);
+    --panel: var(--card-bg);
     --surface-bg: #ffffff;
     --surface-soft: #f5f8fd;
     --control-bg: #f3f7fd;
     --table-head-bg: #f7faff;
     --header-bg: rgba(255, 255, 255, 0.94);
     --sidebar-bg: rgba(255, 255, 255, 0.92);
-    --card-muted: #72839f;
+    --card-muted: var(--text-muted);
     --blue: #2f6df6;
     --green: #10b981;
     --purple: #8b5cf6;
@@ -61,8 +75,10 @@ body[data-theme="light"] {
     --red: #ef3f4f;
     --shadow: 0 4px 16px rgba(30, 64, 175, 0.05), 0 2px 10px rgba(15, 23, 42, 0.04);
     --chart-grid: #dde7f3;
-    --chart-label: #607799;
-    --chart-axis-label: #6f83a2;
+    --chart-label: #333333;
+    --chart-axis-label: #333333;
+    --chart-tooltip-bg: #ffffff;
+    --chart-tooltip-text: var(--text-primary);
     --chart-temperature: #3b73f6;
     --chart-humidity: #10b981;
     --chart-air: #8b5cf6;
@@ -143,7 +159,7 @@ svg {
     width: 34px;
     height: 34px;
     border-radius: 8px;
-    color: #fff;
+    color: var(--text-primary);
     background: linear-gradient(145deg, #2a78ff, #6f9cff);
     box-shadow: 0 10px 20px rgba(42, 120, 255, 0.25);
 }
@@ -411,7 +427,7 @@ svg {
     padding: 0 6px;
     border: 2px solid #fff;
     border-radius: 999px;
-    color: #fff;
+    color: var(--text-primary);
     background: var(--red);
     font-size: 12px;
     font-weight: 800;
@@ -430,7 +446,7 @@ svg {
     place-items: center;
     width: 38px;
     height: 38px;
-    color: #fff;
+    color: var(--text-primary);
     border-radius: 999px;
     background: linear-gradient(145deg, #2f6df5, #7ba7ff);
 }
@@ -494,7 +510,7 @@ svg {
     width: 62px;
     height: 62px;
     border-radius: 999px;
-    color: #fff;
+    color: var(--text-primary);
     background: var(--accent);
     box-shadow: 0 12px 24px var(--glow);
 }
@@ -530,6 +546,10 @@ svg {
     border-radius: 8px;
     font-size: 13px;
     font-weight: 850;
+}
+
+.state-badge.is-empty {
+    visibility: hidden;
 }
 
 .state-normal,
@@ -580,6 +600,295 @@ svg {
     z-index: 1;
     width: 100%;
     height: 58px;
+}
+
+.dashboard-page[hidden] {
+    display: none !important;
+}
+
+.c-device-page {
+    display: block;
+}
+
+.s3-page {
+    padding: 22px 0 20px;
+}
+
+.s3-dashboard {
+    display: grid;
+    gap: 18px;
+}
+
+.s3-page-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    min-width: 0;
+}
+
+.s3-page-header h1 {
+    margin: 0;
+    color: var(--ink);
+    font-size: 28px;
+    line-height: 1.2;
+    font-weight: 850;
+}
+
+.s3-page-header p {
+    margin: 6px 0 0;
+    color: var(--muted);
+    font-size: 14px;
+    font-weight: 700;
+}
+
+.s3-overview-grid,
+.s3-activity-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 18px;
+}
+
+.s3-gateway-panel,
+.s3-summary-panel,
+.s3-device-card {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.s3-status-grid,
+.s3-summary-grid,
+.s3-device-grid,
+.s3-sensor-grid,
+.s3-appliance-grid {
+    display: grid;
+    min-width: 0;
+}
+
+.s3-status-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.s3-status-tile,
+.s3-summary-tile,
+.s3-sensor-metric,
+.s3-appliance {
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface-bg);
+}
+
+.s3-status-tile {
+    position: relative;
+    display: grid;
+    gap: 8px;
+    min-height: 92px;
+    padding: 14px;
+    overflow: hidden;
+}
+
+.s3-status-tile span,
+.s3-summary-tile span,
+.s3-sensor-metric span,
+.s3-appliance small,
+.s3-section-heading span,
+.s3-module-row small {
+    color: var(--muted);
+}
+
+.s3-status-tile strong {
+    color: var(--ink);
+    font-size: 21px;
+    line-height: 1.1;
+}
+
+.s3-status-line {
+    position: absolute;
+    right: 12px;
+    bottom: 10px;
+    width: 42px;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--green);
+}
+
+.s3-status-line.warning {
+    background: var(--orange);
+}
+
+.s3-status-line.danger {
+    background: var(--red);
+}
+
+.s3-module-list {
+    display: grid;
+    gap: 10px;
+    margin-top: 14px;
+}
+
+.s3-module-row {
+    display: grid;
+    grid-template-columns: 10px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface-soft);
+}
+
+.s3-module-row strong,
+.s3-appliance strong {
+    display: block;
+    color: var(--ink);
+    font-size: 14px;
+}
+
+.s3-module-row small,
+.s3-appliance small {
+    display: block;
+    margin-top: 3px;
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.s3-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.s3-summary-tile {
+    display: grid;
+    gap: 12px;
+    min-height: 116px;
+    padding: 16px;
+}
+
+.s3-summary-tile strong {
+    color: var(--ink);
+    font-size: 29px;
+    line-height: 1;
+    font-weight: 850;
+}
+
+.s3-summary-tile.blue {
+    border-color: color-mix(in srgb, var(--blue) 28%, var(--line));
+}
+
+.s3-summary-tile.green {
+    border-color: color-mix(in srgb, var(--green) 28%, var(--line));
+}
+
+.s3-summary-tile.purple {
+    border-color: color-mix(in srgb, var(--purple) 28%, var(--line));
+}
+
+.s3-summary-tile.orange {
+    border-color: color-mix(in srgb, var(--orange) 28%, var(--line));
+}
+
+.s3-section {
+    display: grid;
+    gap: 12px;
+}
+
+.s3-section-heading {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.s3-section-heading h2 {
+    margin: 0;
+    color: var(--ink);
+    font-size: 20px;
+    line-height: 1.2;
+}
+
+.s3-section-heading span {
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.s3-device-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px;
+}
+
+.s3-sensor-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.s3-sensor-metric {
+    display: grid;
+    gap: 8px;
+    padding: 13px;
+}
+
+.s3-sensor-metric strong {
+    color: var(--ink);
+    font-size: 16px;
+    line-height: 1.25;
+}
+
+.s3-appliance-grid {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 10px;
+    margin-top: 14px;
+}
+
+.s3-appliance {
+    display: grid;
+    place-items: center;
+    gap: 7px;
+    min-height: 112px;
+    padding: 12px 10px;
+    color: var(--muted);
+    text-align: center;
+    background: var(--surface-soft);
+    transition: border-color 160ms ease, background 160ms ease, color 160ms ease, transform 160ms ease;
+}
+
+.s3-appliance.is-on {
+    color: var(--ink);
+    border-color: color-mix(in srgb, var(--green) 42%, var(--line));
+    background: color-mix(in srgb, var(--green) 14%, var(--surface-bg));
+}
+
+.s3-appliance.is-off {
+    opacity: 0.74;
+}
+
+.s3-appliance-icon {
+    display: grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--surface-bg);
+    font-size: 21px;
+    line-height: 1;
+}
+
+.s3-appliance.is-on .s3-appliance-icon {
+    border-color: color-mix(in srgb, var(--green) 36%, var(--line));
+    background: color-mix(in srgb, var(--green) 16%, var(--surface-bg));
+}
+
+.s3-appliance small {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+}
+
+.s3-table td {
+    white-space: normal;
 }
 
 .middle-grid {
@@ -759,7 +1068,7 @@ svg {
     min-width: 24px;
     height: 24px;
     padding: 0 8px;
-    color: #fff;
+    color: var(--text-primary);
     background: var(--red);
     border-radius: 999px;
     font-size: 13px;
@@ -860,7 +1169,7 @@ svg {
     width: 28px;
     height: 28px;
     border-radius: 7px;
-    color: #fff;
+    color: var(--text-primary);
     background: var(--accent);
 }
 
@@ -953,7 +1262,7 @@ tbody tr:last-child td {
     width: 20px;
     height: 20px;
     border-radius: 6px;
-    color: #fff;
+    color: var(--text-primary);
     background: var(--accent);
 }
 
@@ -1313,7 +1622,7 @@ body.log-modal-open {
 }
 
 .smart-device-option.is-active {
-    color: #fff;
+    color: var(--text-primary);
     background: var(--blue);
 }
 
@@ -1566,7 +1875,7 @@ body.log-modal-open {
 }
 
 .primary-action {
-    color: #fff;
+    color: var(--text-primary);
     background: var(--blue);
 }
 
@@ -2052,6 +2361,100 @@ body[data-theme="light"] .data-source-panel strong {
     color: #162744;
 }
 
+/* Light theme readability: keep dashboard text on semantic theme colors. */
+body[data-theme="light"] {
+    color: var(--text-primary);
+}
+
+body[data-theme="light"] .brand,
+body[data-theme="light"] .nav-item,
+body[data-theme="light"] .top-status strong,
+body[data-theme="light"] .search input,
+body[data-theme="light"] .metric-name,
+body[data-theme="light"] .metric-value,
+body[data-theme="light"] .panel-header h2,
+body[data-theme="light"] .current-state,
+body[data-theme="light"] .legend,
+body[data-theme="light"] .summary-row,
+body[data-theme="light"] .summary-value,
+body[data-theme="light"] .system-log,
+body[data-theme="light"] .device-online-table td,
+body[data-theme="light"] .chart-panel,
+body[data-theme="light"] .s3-page-header h1,
+body[data-theme="light"] .s3-status-tile strong,
+body[data-theme="light"] .s3-summary-tile strong,
+body[data-theme="light"] .s3-section-heading h2,
+body[data-theme="light"] .s3-sensor-metric strong,
+body[data-theme="light"] .s3-module-row strong,
+body[data-theme="light"] .s3-appliance strong,
+body[data-theme="light"] .smart-device-name,
+body[data-theme="light"] .operation-log-header strong,
+body[data-theme="light"] .operation-log-title,
+body[data-theme="light"] .custom-command-form label,
+body[data-theme="light"] .command-modal-header h2,
+body[data-theme="light"] .command-modal p,
+body[data-theme="light"] td,
+body[data-theme="light"] .data-source-panel strong {
+    color: var(--text-primary);
+}
+
+body[data-theme="light"] .metric-value small,
+body[data-theme="light"] .summary-state,
+body[data-theme="light"] .range-button,
+body[data-theme="light"] .icon-button,
+body[data-theme="light"] .user-menu,
+body[data-theme="light"] .theme-toggle-btn,
+body[data-theme="light"] .command-button,
+body[data-theme="light"] .s3-appliance-icon,
+body[data-theme="light"] .device-online-state,
+body[data-theme="light"] .custom-command-form textarea,
+body[data-theme="light"] .secondary-action {
+    color: var(--text-secondary);
+}
+
+body[data-theme="light"] .nav-icon,
+body[data-theme="light"] .top-status small,
+body[data-theme="light"] .search,
+body[data-theme="light"] .search input::placeholder,
+body[data-theme="light"] .metric-change,
+body[data-theme="light"] .link-button,
+body[data-theme="light"] .system-log time,
+body[data-theme="light"] .footer,
+body[data-theme="light"] .data-source-panel,
+body[data-theme="light"] th,
+body[data-theme="light"] .device-online-table th,
+body[data-theme="light"] .s3-page-header p,
+body[data-theme="light"] .s3-status-tile span,
+body[data-theme="light"] .s3-summary-tile span,
+body[data-theme="light"] .s3-section-heading span,
+body[data-theme="light"] .s3-sensor-metric span,
+body[data-theme="light"] .s3-module-row small,
+body[data-theme="light"] .s3-appliance small,
+body[data-theme="light"] .smart-home-note,
+body[data-theme="light"] .smart-device-status,
+body[data-theme="light"] .operation-log-header span,
+body[data-theme="light"] .operation-log-meta time,
+body[data-theme="light"] .operation-log-content,
+body[data-theme="light"] .operation-log-result,
+body[data-theme="light"] .custom-command-footer,
+body[data-theme="light"] .command-form-error {
+    color: var(--text-muted);
+}
+
+body[data-theme="light"] .metric-card,
+body[data-theme="light"] .panel,
+body[data-theme="light"] .s3-status-tile,
+body[data-theme="light"] .s3-summary-tile,
+body[data-theme="light"] .s3-sensor-metric,
+body[data-theme="light"] .s3-appliance,
+body[data-theme="light"] .device-online-table,
+body[data-theme="light"] table,
+body[data-theme="light"] .smart-device-row,
+body[data-theme="light"] .operation-log-item,
+body[data-theme="light"] .command-modal {
+    color: var(--card-text);
+}
+
 @media (max-width: 1180px) {
     .shell {
         grid-template-columns: 210px minmax(0, 1fr);
@@ -2107,6 +2510,20 @@ body[data-theme="light"] .data-source-panel strong {
 
     .middle-grid {
         grid-template-columns: 1fr;
+    }
+
+    .s3-overview-grid,
+    .s3-activity-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .s3-status-grid,
+    .s3-summary-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .s3-appliance-grid {
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
     }
 
     .bottom-grid {
@@ -2275,7 +2692,47 @@ body[data-theme="light"] .data-source-panel strong {
         gap: 14px;
     }
 
-    /* 手机端数据卡片：温度/湿度一行，气体阻值/ESP 状态一行，保持两列可读布局。 */
+    .s3-page {
+        padding: 16px 0 14px;
+    }
+
+    .s3-page-header,
+    .s3-section-heading {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .s3-page-header h1 {
+        font-size: 24px;
+    }
+
+    .s3-dashboard {
+        gap: 14px;
+    }
+
+    .s3-status-grid,
+    .s3-summary-grid,
+    .s3-device-grid,
+    .s3-sensor-grid,
+    .s3-activity-grid {
+        grid-template-columns: 1fr;
+        gap: 12px;
+    }
+
+    .s3-module-row {
+        grid-template-columns: 10px minmax(0, 1fr);
+    }
+
+    .s3-module-row .level-badge {
+        grid-column: 2;
+        justify-self: start;
+    }
+
+    .s3-appliance-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    /* 手机端数据卡片：温度/湿度一行，空气质量/ESP 状态一行，保持两列可读布局。 */
     .metric-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 12px;

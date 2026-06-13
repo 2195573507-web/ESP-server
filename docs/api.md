@@ -70,6 +70,114 @@ LLM_TIMEOUT_MS=30000
 - 调用成功后会写入现有 `llm_records` 表：`prompt=text`，`response=模型回复`，因此 `GET /llm/latest` 仍可显示最新回复。
 - 该接口不新增 WebSocket，不处理 ASR 音频，不处理 TTS 音频，不代理 ASR/TTS。
 
+### `POST /api/voice/prepare`
+
+ESP 唤醒后可先调用该接口预占一次服务器 voice turn。当前是 mock 协议阶段，只做会话锁、全局并发限制和状态记录，不接真实 ASR/TTS。
+
+请求体：
+
+```json
+{
+  "device_id": "esp32-c5-001",
+  "session_id": "可选"
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "turn_id": "c6b5d4c2-...",
+  "status": "prepared",
+  "expires_at_ms": 1780000000000
+}
+```
+
+失败响应：
+
+```json
+{
+  "ok": false,
+  "error": "VOICE_DEVICE_BUSY",
+  "status": "prepared",
+  "turn_id": "已有turn_id"
+}
+```
+
+说明：
+
+- 单个 `device_id` 同时只允许一个 active voice turn。
+- 全局 active voice turn 默认最多 `2` 个，可通过 `VOICE_MAX_CONCURRENT` 调整。
+- `VOICE_TURN_TTL_MS` 控制 active turn 超时，默认 `120000` 毫秒。
+
+### `GET /api/voice/status/:turn_id`
+
+读取一次 voice turn 的后端状态。该接口只返回 JSON 调试状态，不返回音频。
+
+响应：
+
+```json
+{
+  "ok": true,
+  "turn_id": "c6b5d4c2-...",
+  "device_id": "esp32-c5-001",
+  "session_id": "可选",
+  "status": "completed",
+  "pcm_in_bytes": 1024,
+  "pcm_out_bytes": 10240,
+  "timings": {
+    "prepared_ms": 1780000000000,
+    "receive_start_ms": 1780000000100,
+    "receive_end_ms": 1780000000200,
+    "stream_start_ms": 1780000000201,
+    "stream_end_ms": 1780000000300,
+    "completed_ms": 1780000000300
+  },
+  "error": null,
+  "expires_at_ms": 1780000000300
+}
+```
+
+找不到 turn 时返回 HTTP `404`：
+
+```json
+{
+  "ok": false,
+  "error": "VOICE_TURN_NOT_FOUND"
+}
+```
+
+### `POST /api/voice/turn`
+
+ESP 上传一轮录音 PCM，服务器在 mock 阶段统计输入字节数并流式返回固定测试 PCM。后续真实阶段将在该接口内部串接 ASR -> LLM -> 分段 TTS，并继续向 ESP 返回裸 PCM。
+
+请求头：
+
+```http
+X-Device-Id: esp32-c5-001
+X-Turn-Id: prepare返回的turn_id，可选
+Content-Type: audio/L16; rate=16000; channels=1
+```
+
+请求体为裸 PCM 字节流，默认约定 `16kHz / mono / signed 16-bit little-endian`。
+
+成功响应：
+
+```http
+HTTP/1.1 200 OK
+Content-Type: audio/L16; rate=16000; channels=1
+Cache-Control: no-store
+```
+
+响应体为裸 PCM chunked 流。
+
+说明：
+
+- 未提供 `X-Turn-Id` 时，服务器会为该 `device_id` 自动创建并执行一个 turn。
+- mock 阶段不调用云端 ASR/TTS，不解析 TTS JSON/base64，不新增 WebSocket。
+- 客户端断开时服务器会把 turn 标记为 `aborted` 并释放设备锁。
+
 ### `POST /sensor`
 
 ESP 设备上传传感器数据。该接口是当前传感器数据的写入入口，不要为了前端展示随意改变字段名。

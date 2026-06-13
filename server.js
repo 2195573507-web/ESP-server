@@ -8,6 +8,7 @@ const {
     createTimeSyncRouter,
     withTimeSyncStatus
 } = require("./server-time-sync/timeSync");
+const { createVoiceRouter } = require("./routes/voice");
 
 const app = express();
 
@@ -341,6 +342,13 @@ app.post("/api/llm/text", async (req, res) => {
         });
     }
 });
+
+// ESP server-side voice turn mock/protocol API
+app.use("/api/voice", createVoiceRouter({
+    db,
+    requestLlmText,
+    readLlmConfig
+}));
 
 // ESP ingest API
 // 写入 Sensor

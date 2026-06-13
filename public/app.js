@@ -144,6 +144,8 @@ let selectedChartRangeHours = DEFAULT_CHART_RANGE_HOURS;
 let activeLogModalType = null;
 let pendingConfirmAction = null;
 let pendingSmartHomeAction = null;
+let activeDashboardPage = "c51";
+let s3DashboardRendered = false;
 
 // 主题功能：读取 CSS 主题变量，Canvas 图表调用它来适配黑色/白色背景。
 function readThemeColor(name, fallback) {
@@ -296,9 +298,13 @@ function normalizeHistoryPoint(point) {
 
     const temperature = toNumber(pickFirst(point, ["temperature", "temp"]));
     const humidity = toNumber(pickFirst(point, ["humidity"]));
-    const aqi = toNumber(pickFirst(point, ["aqi", "air_quality", "air"]));
-    const gas = toNumber(pickFirst(point, ["gas_resistance", "gas"]));
-    const air = aqi ?? gas;
+    const airQualityObject = isPlainObject(point.air_quality) ? point.air_quality : {};
+    const air = toNumber(pickFirst(point, [
+        "air_quality_score",
+        "aqi",
+        "air_quality",
+        "air"
+    ])) ?? toNumber(pickFirst(airQualityObject, ["air_quality_score", "score", "aqi"]));
 
     if (temperature === null && humidity === null && air === null) {
         return null;
@@ -531,8 +537,12 @@ function normalizeSensor(rawSensor, source) {
     const temperature = toNumber(pickFirst(rawSensor, ["temperature", "temp"]));
     const humidity = toNumber(pickFirst(rawSensor, ["humidity"]));
     const pressure = toNumber(pickFirst(rawSensor, ["pressure"]));
-    const aqi = toNumber(pickFirst(rawSensor, ["aqi", "air_quality"]));
-    const gas = toNumber(pickFirst(rawSensor, ["gas_resistance", "gas"]));
+    const airQualityObject = isPlainObject(rawSensor?.air_quality) ? rawSensor.air_quality : {};
+    const aqi = toNumber(pickFirst(rawSensor, [
+        "air_quality_score",
+        "aqi",
+        "air_quality"
+    ])) ?? toNumber(pickFirst(airQualityObject, ["air_quality_score", "score", "aqi"]));
     const timestampValue = pickFirst(rawSensor, [
         "timestamp",
         "created_at",
@@ -551,15 +561,8 @@ function normalizeSensor(rawSensor, source) {
 
     let airValue = aqi;
     let airMode = "aqi";
-    let airLabel = "空气质量 (AQI)";
-    let airUnit = "";
-
-    if (airValue === null && gas !== null) {
-        airValue = gas;
-        airMode = "gas";
-        airLabel = "气体阻值";
-        airUnit = "Ω";
-    }
+    let airLabel = "空气质量";
+    let airUnit = "AQI";
 
     if (airValue === null) {
         airValue = metricDefinitions.air.mockValue;
@@ -581,7 +584,7 @@ function normalizeSensor(rawSensor, source) {
         usedMockFields: {
             temperature: temperature === null,
             humidity: humidity === null,
-            air: aqi === null && gas === null
+            air: aqi === null
         }
     };
 }
@@ -598,10 +601,7 @@ function getHumidityLevel(value) {
     return "normal";
 }
 
-function getAirLevel(value, mode) {
-    if (mode === "gas") {
-        return "normal";
-    }
+function getAirLevel(value) {
     if (value > 150) return "danger";
     if (value > 100) return "warning";
     return "normal";
@@ -652,7 +652,7 @@ function buildMetrics(sensor) {
         },
         air: {
             value: sensor.airValue,
-            display: sensor.airMode === "gas" ? formatNumber(sensor.airValue, 0) : formatNumber(sensor.airValue, 0),
+            display: formatNumber(sensor.airValue, 0),
             level: getAirLevel(sensor.airValue, sensor.airMode),
             mode: sensor.airMode,
             label: sensor.airLabel,
@@ -724,6 +724,14 @@ function setStateBadge(selector, levelKey) {
     element.className = `state-badge state-${level.className}`;
 }
 
+function clearStateBadge(selector) {
+    const element = document.querySelector(selector);
+    if (!element) return;
+
+    element.textContent = "";
+    element.className = "state-badge is-empty";
+}
+
 function setMetricChange(selector, text, levelKey = "normal") {
     const element = document.querySelector(selector);
     if (!element) return;
@@ -750,16 +758,12 @@ function renderMetricCards() {
 
     setStateBadge('[data-field="temperatureStatus"]', metrics.temperature.level);
     setStateBadge('[data-field="humidityStatus"]', metrics.humidity.level);
-    setStateBadge('[data-field="airStatus"]', metrics.air.level);
+    clearStateBadge('[data-field="airStatus"]');
     setStateBadge('[data-field="espStatusBadge"]', metrics.esp.level);
 
     setMetricChange('[data-field="temperatureChange"]', `来源：${metrics.temperature.source}`, metrics.temperature.level);
     setMetricChange('[data-field="humidityChange"]', `来源：${metrics.humidity.source}`, metrics.humidity.level);
-    setMetricChange(
-        '[data-field="airChange"]',
-        metrics.air.mode === "gas" ? "气体阻值/占位 AQI" : `来源：${metrics.air.source}`,
-        metrics.air.level
-    );
+    setMetricChange('[data-field="airChange"]', `来源：${metrics.air.source}`, "normal");
     setMetricChange('[data-field="espLatency"]', metrics.esp.note, metrics.esp.level);
 }
 
@@ -904,7 +908,7 @@ function buildDynamicAlertLogs(metrics) {
     if (metrics.air.level !== "normal") {
         alerts.push({
             time: now,
-            type: metrics.air.mode === "gas" ? "气体阻值提示" : "空气质量异常",
+            type: "空气质量异常",
             content: `${metrics.air.label} ${metrics.air.display}${metrics.air.unit || ""}，状态 ${LEVELS[metrics.air.level].label}`,
             level: metrics.air.level,
             status: "未处理"
@@ -982,35 +986,115 @@ function renderAlertLogs() {
     }).join("");
 }
 
+function formatCommandCandidate(commandValue) {
+    if (commandValue === undefined || commandValue === null || commandValue === "") {
+        return "--";
+    }
+
+    if (Array.isArray(commandValue)) {
+        const commands = commandValue.map(item => {
+            if (isPlainObject(item)) {
+                return pickFirst(item, ["command", "name", "command_name", "commandName", "command_id", "commandId"]) || JSON.stringify(item);
+            }
+            return String(item);
+        }).filter(Boolean);
+        return commands.length ? commands.join(", ") : "--";
+    }
+
+    if (isPlainObject(commandValue)) {
+        return pickFirst(commandValue, ["command", "name", "command_name", "commandName", "command_id", "commandId"]) || JSON.stringify(commandValue);
+    }
+
+    return String(commandValue);
+}
+
+function formatLatestCommand(...records) {
+    const commandKeys = [
+        "command",
+        "last_command",
+        "lastCommand",
+        "command_name",
+        "commandName",
+        "last_command_id",
+        "lastCommandId"
+    ];
+    const commandListKeys = ["commands", "recent_commands", "command_queue", "commandQueue"];
+
+    for (const record of records) {
+        if (!isPlainObject(record)) continue;
+
+        const candidates = [
+            pickFirst(record, commandKeys),
+            pickFirst(record, commandListKeys)
+        ];
+
+        if (isPlainObject(record.structured)) {
+            candidates.push(pickFirst(record.structured, commandKeys));
+            candidates.push(pickFirst(record.structured, commandListKeys));
+        }
+
+        if (isPlainObject(record.command)) {
+            candidates.push(record.command);
+        }
+
+        for (const candidate of candidates) {
+            const formatted = formatCommandCandidate(candidate);
+            if (formatted !== "--") {
+                return formatted;
+            }
+        }
+    }
+
+    return "--";
+}
+
+function formatLatestAirQuality(rawSensor, metrics) {
+    const airQualityObject = isPlainObject(rawSensor?.air_quality) ? rawSensor.air_quality : {};
+    const score = toNumber(pickFirst(rawSensor || {}, [
+        "air_quality",
+        "air_quality_score",
+        "aqi",
+        "air"
+    ])) ?? toNumber(pickFirst(airQualityObject, ["air_quality_score", "score", "aqi"]));
+    const level = pickFirst(rawSensor || {}, [
+        "air_quality_level",
+        "air_quality_label"
+    ]) ?? pickFirst(airQualityObject, ["air_quality_level", "level", "label"]);
+
+    if (score !== null && level) {
+        return `${formatNumber(score, 0)} (${level})`;
+    }
+    if (score !== null) {
+        return formatNumber(score, 0);
+    }
+    if (level) {
+        return String(level);
+    }
+    if (metrics?.air && metrics.air.display !== "--") {
+        return metrics.air.display;
+    }
+    return "--";
+}
+
 function buildSystemLogs(sensor, asr, llm, sources) {
     const logs = [];
     const sensorTime = sensor.timestamp ? formatTime(sensor.timestamp) : formatTime();
+    const commandText = formatLatestCommand(sensor.raw, asr, llm);
+    const airQualityText = formatLatestAirQuality(sensor.raw, dashboardState.metrics);
 
     logs.push({
         time: sensorTime,
-        text: `传感器数据更新：温度 ${dashboardState.metrics.temperature.display}°C，湿度 ${dashboardState.metrics.humidity.display}%，${dashboardState.metrics.air.label} ${dashboardState.metrics.air.display}${dashboardState.metrics.air.unit}`,
+        text: `传感器数据更新：温度 ${dashboardState.metrics.temperature.display}°C，湿度 ${dashboardState.metrics.humidity.display}%，Air Quality: ${airQualityText}`,
         color: "#10b981",
         source: sources.sensor
     });
 
-    if (sources.asr === "real" && asr.text) {
-        logs.push({
-            time: formatTime(asr.timestamp || asr.created_at || asr.time || Date.now()),
-            text: `ASR 最新识别：${asr.text}`,
-            color: "#2874ff",
-            source: "real"
-        });
-    }
-
-    const llmText = llm.response || llm.answer || llm.text || llm.prompt;
-    if (sources.llm === "real" && llmText) {
-        logs.push({
-            time: formatTime(llm.timestamp || llm.created_at || llm.time || Date.now()),
-            text: `LLM 最新回复：${llmText}`,
-            color: "#7c3aed",
-            source: "real"
-        });
-    }
+    logs.push({
+        time: sensorTime,
+        text: `Command: ${commandText}`,
+        color: "#2874ff",
+        source: sources.sensor
+    });
 
     if (logs.length === 1 && sources.asr === "mock" && sources.llm === "mock") {
         logs.push(...mockSystemLogs);
@@ -1568,8 +1652,12 @@ function buildSensorSnapshotText(rawSensor, sensor) {
     const parts = [];
     const temperature = toNumber(pickFirst(rawSensor, ["temperature", "temp"]));
     const humidity = toNumber(pickFirst(rawSensor, ["humidity"]));
-    const gas = toNumber(pickFirst(rawSensor, ["gas_resistance", "gas"]));
-    const aqi = toNumber(pickFirst(rawSensor, ["aqi", "air_quality"]));
+    const airQualityObject = isPlainObject(rawSensor?.air_quality) ? rawSensor.air_quality : {};
+    const aqi = toNumber(pickFirst(rawSensor, [
+        "air_quality_score",
+        "aqi",
+        "air_quality"
+    ])) ?? toNumber(pickFirst(airQualityObject, ["air_quality_score", "score", "aqi"]));
 
     if (temperature !== null) {
         parts.push(`温度 ${formatNumber(temperature)}°C`);
@@ -1577,11 +1665,8 @@ function buildSensorSnapshotText(rawSensor, sensor) {
     if (humidity !== null) {
         parts.push(`湿度 ${formatNumber(humidity)}%`);
     }
-    if (gas !== null) {
-        parts.push(`气体阻值 ${formatNumber(gas, 0)}Ω`);
-    }
     if (aqi !== null) {
-        parts.push(`空气质量 ${formatNumber(aqi, 0)}`);
+        parts.push(`空气质量 ${formatNumber(aqi, 0)} AQI`);
     }
     if (sensor && sensor.hasTimestamp) {
         parts.push(`时间 ${formatTime(sensor.timestamp)}`);
@@ -2005,12 +2090,86 @@ function bindMobileSidebar() {
     });
 }
 
+function normalizeDashboardPage(value) {
+    return ["s3", "c51", "c52"].includes(value) ? value : "c51";
+}
+
+function getDashboardPageFromHash() {
+    return normalizeDashboardPage(window.location.hash.replace("#", ""));
+}
+
+function renderS3DashboardIfNeeded(force = false) {
+    const container = document.querySelector("[data-s3-dashboard]");
+    if (!container || !window.S3Dashboard || typeof window.S3Dashboard.render !== "function") {
+        return;
+    }
+
+    if (!s3DashboardRendered || force) {
+        window.S3Dashboard.render(container);
+        s3DashboardRendered = true;
+    }
+}
+
+function updateRouteChrome(page) {
+    document.querySelectorAll("[data-dashboard-page]").forEach(item => {
+        const isActive = item.dataset.dashboardPage === page;
+        item.classList.toggle("active", isActive);
+        item.setAttribute("aria-current", isActive ? "page" : "false");
+    });
+
+    const s3Page = document.querySelector('[data-page="s3"]');
+    const cDevicePage = document.querySelector("[data-c-device-page]");
+    if (s3Page) {
+        s3Page.hidden = page !== "s3";
+    }
+    if (cDevicePage) {
+        cDevicePage.hidden = page === "s3";
+        cDevicePage.dataset.activeDevice = page === "c52" ? "c52" : "c51";
+    }
+
+    const dataSourcePanel = document.getElementById("dataSourcePanel");
+    if (dataSourcePanel) {
+        dataSourcePanel.hidden = page === "s3";
+    }
+}
+
+function setDashboardPage(page, options = {}) {
+    const nextPage = normalizeDashboardPage(page);
+    activeDashboardPage = nextPage;
+    updateRouteChrome(nextPage);
+
+    if (nextPage === "s3") {
+        cleanupDashboardTimers();
+        renderS3DashboardIfNeeded();
+        return;
+    }
+
+    if (options.refresh !== false) {
+        updateDashboard();
+    }
+    startDashboardTimers();
+}
+
+function handleDashboardRoute() {
+    setDashboardPage(getDashboardPageFromHash());
+}
+
 window.addEventListener("resize", () => {
+    if (activeDashboardPage === "s3") {
+        renderS3DashboardIfNeeded(true);
+        return;
+    }
+
     renderMainChart();
 });
 
 // 主题功能：切换黑白模式后只重绘现有 Canvas 图表颜色，不改变图表数据来源。
 window.updateChartTheme = () => {
+    if (activeDashboardPage === "s3") {
+        renderS3DashboardIfNeeded(true);
+        return;
+    }
+
     renderMainChart();
 };
 
@@ -2047,8 +2206,8 @@ document.addEventListener("DOMContentLoaded", () => {
     initCommandControls();
     initSmartHomeControls();
     bindMobileSidebar();
-    updateDashboard();
-    startDashboardTimers();
+    window.addEventListener("hashchange", handleDashboardRoute);
+    handleDashboardRoute();
 });
 
 window.addEventListener("beforeunload", cleanupDashboardTimers);

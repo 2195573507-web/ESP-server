@@ -21,6 +21,8 @@ const SENSOR_RECORD_COLUMNS = [
     { name: "request_seq", type: "INTEGER" },
     { name: "time_synced", type: "INTEGER" },
     { name: "payload_type", type: "TEXT" },
+    { name: "raw_payload", type: "TEXT" },
+    { name: "payload_json", type: "TEXT" },
     { name: "sensor_id", type: "TEXT" },
     { name: "metadata_json", type: "TEXT" },
     { name: "raw_json", type: "TEXT" },

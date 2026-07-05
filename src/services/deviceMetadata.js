@@ -2,9 +2,20 @@ const DEVICE_ID_MAX_LENGTH = 128;
 const METADATA_TEXT_MAX_LENGTH = 128;
 const PAYLOAD_TYPE_MAX_LENGTH = 80;
 const MAX_VALID_UPLOAD_DELAY_MS = 60000;
+const DEFAULT_CLOCK_MAX_FUTURE_SKEW_MS = 10000;
+const DEFAULT_CLOCK_MAX_PAST_SKEW_MS = 24 * 60 * 60 * 1000;
 
 function readHeader(headers = {}, name) {
     return headers[String(name || "").toLowerCase()];
+}
+
+function readPositiveIntegerEnv(name, fallback) {
+    const numeric = Number.parseInt(process.env[name], 10);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+        return fallback;
+    }
+
+    return numeric;
 }
 
 function trimText(value, maxLength = METADATA_TEXT_MAX_LENGTH) {
@@ -87,6 +98,50 @@ function buildUploadDelayMs(metadata, serverRecvMs) {
     return isValidUploadDelay(delay) ? delay : null;
 }
 
+function readDeviceTimestampMs(body = {}, headers = {}) {
+    return toIntegerOrNull(firstValue(
+        body.esp_time_ms,
+        body.timestamp,
+        body.client_time_ms,
+        readHeader(headers, "x-esp-time-ms"),
+        readHeader(headers, "x-client-time-ms")
+    ));
+}
+
+function readClockSkewWarning(body = {}, headers = {}, serverRecvMs = Date.now()) {
+    const deviceTimeMs = readDeviceTimestampMs(body, headers);
+    if (deviceTimeMs === null || deviceTimeMs <= 0) {
+        return null;
+    }
+
+    const futureSkewMs = readPositiveIntegerEnv("DEVICE_CLOCK_MAX_FUTURE_SKEW_MS", DEFAULT_CLOCK_MAX_FUTURE_SKEW_MS);
+    const pastSkewMs = readPositiveIntegerEnv("DEVICE_CLOCK_MAX_PAST_SKEW_MS", DEFAULT_CLOCK_MAX_PAST_SKEW_MS);
+    const skewMs = deviceTimeMs - serverRecvMs;
+    if (skewMs > futureSkewMs) {
+        return {
+            code: "DEVICE_CLOCK_FUTURE_SKEW",
+            message: "device timestamp is too far in the future",
+            device_time_ms: deviceTimeMs,
+            server_recv_ms: serverRecvMs,
+            skew_ms: skewMs,
+            max_future_skew_ms: futureSkewMs
+        };
+    }
+
+    if (skewMs < -pastSkewMs) {
+        return {
+            code: "DEVICE_CLOCK_PAST_SKEW",
+            message: "device timestamp is too far in the past",
+            device_time_ms: deviceTimeMs,
+            server_recv_ms: serverRecvMs,
+            skew_ms: skewMs,
+            max_past_skew_ms: pastSkewMs
+        };
+    }
+
+    return null;
+}
+
 function readDeviceMetadata(input = {}) {
     const body = isObject(input.body) ? input.body : {};
     const query = isObject(input.query) ? input.query : {};
@@ -107,13 +162,21 @@ function readDeviceMetadata(input = {}) {
         device_id: trimText(
             firstValue(
                 body.device_id,
+                body.id,
+                body.sensor_id,
+                body.mac,
+                body.client_id,
                 readHeader(headers, "x-device-id"),
+                readHeader(headers, "x-esp-device-id"),
+                readHeader(headers, "x-client-id"),
                 query.device_id,
                 input.deviceId
             ),
             DEVICE_ID_MAX_LENGTH
         ),
         device_type: trimText(firstValue(body.device_type, readHeader(headers, "x-device-type"))),
+        room_id: trimText(firstValue(body.room_id, query.room_id, readHeader(headers, "x-room-id"))),
+        room_name: trimText(firstValue(body.room_name, body.room, query.room_name, readHeader(headers, "x-room-name"))),
         firmware_version: trimText(firstValue(body.firmware_version, readHeader(headers, "x-firmware-version"))),
         request_seq: toIntegerOrNull(firstValue(body.request_seq, readHeader(headers, "x-request-seq"))),
         esp_uptime_ms: toIntegerOrNull(firstValue(body.esp_uptime_ms, readHeader(headers, "x-esp-uptime-ms"))),
@@ -122,7 +185,8 @@ function readDeviceMetadata(input = {}) {
         payload_type: payloadType,
         server_recv_ms: serverRecvMs,
         server_time_iso: new Date(serverRecvMs).toISOString(),
-        upload_delay_ms: null
+        upload_delay_ms: null,
+        clock_skew_warning: readClockSkewWarning(body, headers, serverRecvMs)
     };
 
     metadata.upload_delay_ms = buildUploadDelayMs(metadata, serverRecvMs);
@@ -134,6 +198,8 @@ function metadataForStorage(metadata) {
         schema_version: metadata.schema_version,
         device_id: metadata.device_id,
         device_type: metadata.device_type,
+        room_id: metadata.room_id,
+        room_name: metadata.room_name,
         firmware_version: metadata.firmware_version,
         request_seq: metadata.request_seq,
         esp_uptime_ms: metadata.esp_uptime_ms,
@@ -142,28 +208,33 @@ function metadataForStorage(metadata) {
         payload_type: metadata.payload_type,
         server_recv_ms: metadata.server_recv_ms,
         server_time_iso: metadata.server_time_iso,
-        upload_delay_ms: metadata.upload_delay_ms
+        upload_delay_ms: metadata.upload_delay_ms,
+        clock_skew_warning: metadata.clock_skew_warning
     };
 }
 
 function makeDeviceEnvelope({ ok, serverRecvMs = Date.now(), requestId = "", data = null, error = null }) {
     return {
         ok,
+        server_time_ms: serverRecvMs,
         server_recv_ms: serverRecvMs,
         server_time_iso: new Date(serverRecvMs).toISOString(),
         request_id: requestId || "",
         error,
-        ...(data === null ? {} : { data })
+        data
     };
 }
 
 module.exports = {
     DEVICE_ID_MAX_LENGTH,
+    DEFAULT_CLOCK_MAX_FUTURE_SKEW_MS,
+    DEFAULT_CLOCK_MAX_PAST_SKEW_MS,
     MAX_VALID_UPLOAD_DELAY_MS,
     isValidUploadDelay,
     makeDeviceEnvelope,
     metadataForStorage,
     readDeviceMetadata,
+    readClockSkewWarning,
     toFiniteNumber,
     toIntegerOrNull,
     trimText

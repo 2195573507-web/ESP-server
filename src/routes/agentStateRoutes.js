@@ -20,6 +20,9 @@ const {
     upsertEnvironmentProfile,
     upsertLcdStatus
 } = require("../agent/stateStore");
+const {
+    recordEvent
+} = require("../services/eventLogService");
 
 function sendResult(res, result, status = 201) {
     if (!result.ok) {
@@ -314,7 +317,25 @@ function createAgentStateRouter(options) {
     });
 
     router.post("/api/emergency/events", async (req, res) => {
-        return sendResult(res, await createEmergencyEvent(dbRun, req.body));
+        const result = await createEmergencyEvent(dbRun, req.body);
+        if (result.ok) {
+            try {
+                await recordEvent(dbRun, {
+                    event_type: "alarm",
+                    event_name: "alarm_created",
+                    event_id: result.event_id,
+                    device_id: req.body?.device_id || "",
+                    severity: req.body?.severity || "warning",
+                    message: req.body?.event_type || "emergency event",
+                    payload: req.body || {},
+                    source: "emergency_events",
+                    server_recv_ms: Date.now()
+                });
+            } catch (_) {
+                // Emergency event has already been persisted in its source table.
+            }
+        }
+        return sendResult(res, result);
     });
 
     router.get("/api/emergency/events", async (req, res) => {
@@ -330,7 +351,25 @@ function createAgentStateRouter(options) {
     });
 
     router.post("/api/csi/behavior", async (req, res) => {
-        return sendResult(res, await createCsiBehaviorEvent(dbRun, req.body));
+        const result = await createCsiBehaviorEvent(dbRun, req.body);
+        if (result.ok) {
+            try {
+                await recordEvent(dbRun, {
+                    event_type: "csi",
+                    event_name: "system_log_created",
+                    event_id: result.event_id,
+                    device_id: req.body?.device_id || "",
+                    severity: "info",
+                    message: req.body?.behavior_type || "csi behavior",
+                    payload: req.body || {},
+                    source: "csi_behavior",
+                    server_recv_ms: Date.now()
+                });
+            } catch (_) {
+                // CSI source row is already persisted.
+            }
+        }
+        return sendResult(res, result);
     });
 
     router.get("/api/csi/behavior", async (req, res) => {

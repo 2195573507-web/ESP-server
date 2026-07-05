@@ -11,8 +11,12 @@ const {
 const {
     readDeviceMetadata
 } = require("../services/deviceMetadata");
+const {
+    recordEvent
+} = require("../services/eventLogService");
 
 const SENSOR_DEVICE_ID_MAX_LENGTH = 128;
+const LEGACY_SENSOR_FALLBACK_DEVICE_ID = "unknown_device";
 
 function toFiniteSensorNumber(value) {
     if (value === undefined || value === null || value === "") {
@@ -24,15 +28,22 @@ function toFiniteSensorNumber(value) {
 }
 
 function normalizeSensorBody(body = {}) {
+    const inferredDeviceId = typeof body.device_id === "string"
+        ? body.device_id
+        : (body.device_id ?? body.id ?? body.sensor_id ?? body.mac ?? body.client_id);
+
     return {
         ...body,
         temperature: toFiniteSensorNumber(body.temperature),
         humidity: toFiniteSensorNumber(body.humidity),
         pressure: toFiniteSensorNumber(body.pressure),
         gas_resistance: toFiniteSensorNumber(body.gas_resistance),
-        device_id: typeof body.device_id === "string"
-            ? body.device_id.trim().slice(0, SENSOR_DEVICE_ID_MAX_LENGTH)
-            : body.device_id
+        payload_type: typeof body.payload_type === "string" && body.payload_type.trim()
+            ? body.payload_type.trim().slice(0, 80)
+            : "sensor.bme690",
+        device_id: inferredDeviceId === undefined || inferredDeviceId === null
+            ? ""
+            : String(inferredDeviceId).trim().slice(0, SENSOR_DEVICE_ID_MAX_LENGTH)
     };
 }
 
@@ -112,53 +123,90 @@ function createSensorRouter(options) {
         } = normalizedBody;
         const serverRecvMs = Date.now();
         const timing = buildSensorTimingFields(normalizedBody, serverRecvMs);
+        let deviceId = timing.device_id || normalizedBody.device_id;
+        const usedFallbackDeviceId = !deviceId;
+        if (!deviceId) {
+            deviceId = LEGACY_SENSOR_FALLBACK_DEVICE_ID;
+        }
+        timing.device_id = deviceId;
+        const payloadType = normalizedBody.payload_type || "sensor.bme690";
+        const rawPayload = JSON.stringify(req.body || {});
+        const payloadJson = JSON.stringify({
+            temperature,
+            humidity,
+            pressure,
+            gas_resistance
+        });
 
         db.run(
             `INSERT INTO sensor_records
-            (timestamp,temperature,humidity,pressure,gas_resistance,device_id,esp_time_ms,esp_uptime_ms,server_recv_ms,server_time_iso,upload_delay_ms)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+            (timestamp,temperature,humidity,pressure,gas_resistance,device_id,esp_time_ms,esp_uptime_ms,server_recv_ms,server_time_iso,upload_delay_ms,payload_type,raw_payload,payload_json,raw_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
             [
                 serverRecvMs,
                 temperature,
                 humidity,
                 pressure,
                 gas_resistance,
-                timing.device_id,
+                deviceId,
                 timing.esp_time_ms,
                 timing.esp_uptime_ms,
                 timing.server_recv_ms,
                 timing.server_time_iso,
-                timing.upload_delay_ms
+                timing.upload_delay_ms,
+                payloadType,
+                rawPayload,
+                payloadJson,
+                rawPayload
             ],
             async function (err) {
                 if (err) {
                     return sendSensorDbError(res, err, true);
                 }
 
-                if (timing.device_id && typeof dbRun === "function" && typeof dbAll === "function") {
+                if (typeof dbRun === "function" && typeof dbAll === "function") {
                     try {
                         await refreshDeviceActivity(dbRun, dbAll, readDeviceMetadata({
                             body: {
                                 ...normalizedBody,
-                                payload_type: "sensor.bme690"
+                                device_id: deviceId,
+                                payload_type: payloadType
                             },
                             headers: req.headers,
-                            payloadType: "sensor.bme690",
+                            payloadType,
                             serverRecvMs
-                        }), "sensor.bme690");
+                        }), payloadType);
+                        if (usedFallbackDeviceId) {
+                            await recordEvent(dbRun, {
+                                event_type: "system",
+                                event_name: "system_log_created",
+                                device_id: deviceId,
+                                severity: "warning",
+                                message: "legacy /sensor upload missing device_id; using unknown_device",
+                                payload: {
+                                    payload_type: payloadType,
+                                    route: "/sensor"
+                                },
+                                source: "legacy_sensor",
+                                server_recv_ms: serverRecvMs
+                            });
+                        }
                     } catch (error) {
-                        logger.warn(`[sensor] legacy status refresh failed device_id=${timing.device_id || "-"} message=${JSON.stringify(error?.message || "-")}`);
+                        logger.warn(`[sensor] legacy status refresh failed device_id=${deviceId || "-"} message=${JSON.stringify(error?.message || "-")}`);
                     }
                 }
 
                 logger.log(
-                    `[sensor] upload device_id=${timing.device_id || "-"} server_recv_ms=${timing.server_recv_ms} upload_delay_ms=${timing.upload_delay_ms ?? "null"}`
+                    `[sensor] upload device_id=${deviceId || "-"} server_recv_ms=${timing.server_recv_ms} payload_type=${payloadType} upload_delay_ms=${timing.upload_delay_ms ?? "null"}`
                 );
 
                 res.json({
                     ok: true,
                     success: true,
                     id: this.lastID,
+                    payload_type: payloadType,
+                    raw_payload: rawPayload,
+                    payload: JSON.parse(payloadJson),
                     ...timing
                 });
             }

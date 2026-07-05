@@ -45,6 +45,14 @@ const {
 
 const SERVER_START_TIMEOUT_MS = 15000;
 const SERVER_STOP_TIMEOUT_MS = 5000;
+const SMOKE_GATEWAY_ID = "sensair_s3_gateway_01";
+const VERIFY_GATEWAY_ID = "verify-s3";
+const SMOKE_GATEWAY_HEADERS = {
+    "X-Gateway-Id": SMOKE_GATEWAY_ID
+};
+const VERIFY_GATEWAY_HEADERS = {
+    "X-Gateway-Id": VERIFY_GATEWAY_ID
+};
 const USER_DATA_DELETE_TOKEN = "smoke-user-data-token";
 const USER_DATA_HEADERS = {
     "X-Admin-Token": USER_DATA_DELETE_TOKEN
@@ -237,9 +245,13 @@ async function request(baseUrl, method, pathname, body, headers = {}) {
         headers: body
             ? {
                 "Content-Type": "application/json",
+                ...SMOKE_GATEWAY_HEADERS,
                 ...headers
             }
-            : headers,
+            : {
+                ...SMOKE_GATEWAY_HEADERS,
+                ...headers
+            },
         body: body ? JSON.stringify(body) : undefined
     });
     const contentType = response.headers.get("content-type") || "";
@@ -259,7 +271,10 @@ async function request(baseUrl, method, pathname, body, headers = {}) {
 async function requestRaw(baseUrl, method, pathname, body, headers = {}) {
     const response = await fetch(`${baseUrl}${pathname}`, {
         method,
-        headers,
+        headers: {
+            ...SMOKE_GATEWAY_HEADERS,
+            ...headers
+        },
         body
     });
     const contentType = response.headers.get("content-type") || "";
@@ -510,7 +525,11 @@ async function assertUniqueIndexes(dbPath) {
         ["emergency_events", ["event_id"]],
         ["csi_behavior_events", ["event_id"]],
         ["lcd_status", ["device_id"]],
-        ["data_deletion_runs", ["run_id"]]
+        ["data_deletion_runs", ["run_id"]],
+        ["event_logs", ["event_id"]],
+        ["smart_home_devices", ["device_id"]],
+        ["smart_home_commands", ["command_id"]],
+        ["natural_language_commands", ["command_id"]]
     ];
 
     for (const [tableName, columns] of expectations) {
@@ -759,6 +778,8 @@ async function run() {
             LLM_BASE_URL: mockLlm.baseUrl,
             LLM_CHAT_PATH: "/v1/chat/completions",
             USER_DATA_DELETE_TOKEN,
+            GATEWAY_AUTH_TOKEN: "",
+            GATEWAY_AUTH_TOKENS: "",
             VOLC_GATEWAY_API_KEY: ""
         },
         stdio: ["ignore", "pipe", "pipe"]
@@ -865,7 +886,7 @@ async function run() {
             }
         });
         assert.equal(result.response.status, 200);
-        assert.equal(result.body.status, "completed");
+        assert.equal(result.body.status, "succeeded");
 
         result = await request(baseUrl, "POST", "/api/llm/structured", {
             text: "目标为空白时回退到请求设备",
@@ -889,7 +910,7 @@ async function run() {
             }
         });
         assert.equal(result.response.status, 200);
-        assert.equal(result.body.status, "completed");
+        assert.equal(result.body.status, "succeeded");
 
         result = await request(baseUrl, "POST", "/api/llm/structured", {
             text: "目标设备过长时拒绝结构化命令",
@@ -947,7 +968,7 @@ async function run() {
             }
         });
         assert.equal(result.response.status, 200);
-        assert.equal(result.body.status, "completed");
+        assert.equal(result.body.status, "succeeded");
 
         result = await request(baseUrl, "POST", "/api/llm/text", {
             text: "   "
@@ -1121,7 +1142,7 @@ async function run() {
             }
         });
         assert.equal(result.response.status, 200);
-        assert.equal(result.body.status, "completed");
+        assert.equal(result.body.status, "succeeded");
 
         result = await request(baseUrl, "POST", `/api/commands/${commandId}/ack`, {
             status: "completed",
@@ -1130,9 +1151,10 @@ async function run() {
                 duplicate: true
             }
         });
-        assert.equal(result.response.status, 404);
-        assert.equal(result.body.ok, false);
-        assert.equal(result.body.code, "COMMAND_ACK_NOT_ACCEPTED");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.idempotent, true);
+        assert.equal(result.body.status, "succeeded");
         assert.equal(result.body.command_id, commandId);
 
         result = await request(baseUrl, "POST", "/api/conversation/turns", {
@@ -2795,6 +2817,11 @@ async function run() {
         assert.equal(result.body.data.payload_type, "gateway.dashboard_snapshot");
         assert.equal(result.body.data.gateway_id, "sensair_s3_gateway_01");
         assert.equal(result.body.data.device_count, 1);
+        const persistedSnapshotRows = await dbAll(dbPath, "SELECT payload_json FROM dashboard_snapshots WHERE snapshot_id=? LIMIT 1", [result.body.data.snapshot_id]);
+        assert.equal(persistedSnapshotRows.length, 1);
+        const persistedSnapshot = JSON.parse(persistedSnapshotRows[0].payload_json);
+        assert.equal(persistedSnapshot.mock_persistence, "stripped");
+        assert.deepEqual(persistedSnapshot.devices[0].appliances, {});
 
         const dashboardEndpoints = [
             `/api/dashboard/v1/overview?${dashboardDeviceQuery}`,
@@ -2910,7 +2937,8 @@ async function run() {
         assert.equal(result.response.status, 200);
         assert.equal(result.body.ok, true);
         assert.equal(hasOwn(result.body, "status"), true);
-        assert.equal(hasOwn(result.body, "data"), false);
+        assertDashboardEnvelope(result.body, true);
+        assert.ok(Array.isArray(result.body.data.devices));
 
         result = await request(baseUrl, "GET", "/api/not-found-for-smoke");
         assert.equal(result.response.status, 404);
@@ -2927,6 +2955,151 @@ async function run() {
         assert.match(result.response.headers.get("content-type") || "", /text\/html/);
         assert.ok(Buffer.isBuffer(result.body));
         assert.ok(result.body.length > 0);
+
+        result = await request(baseUrl, "GET", "/api/smart-home/v1/status");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.configured, false);
+        assert.equal(result.body.data.available, false);
+        assert.equal(result.body.data.provider, "none");
+        assert.deepEqual(result.body.data.devices, []);
+
+        result = await request(baseUrl, "POST", "/api/logs/v1/system", {
+            level: "info",
+            source: "server",
+            message: "manual system log test",
+            payload: {
+                from: "smoke"
+            }
+        });
+        assert.equal(result.response.status, 201);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.log.message, "manual system log test");
+
+        result = await request(baseUrl, "GET", "/api/logs/v1/system?limit=10");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.ok(result.body.data.logs.some(log => log.message === "manual system log test"));
+
+        result = await request(baseUrl, "POST", "/api/logs/v1/alarms", {
+            level: "warning",
+            source: "device",
+            device_id: "verify-c5",
+            room_id: "bedroom",
+            room_name: "卧室",
+            title: "测试报警",
+            message: "curl alarm test",
+            payload: {
+                from: "smoke"
+            }
+        });
+        assert.equal(result.response.status, 201);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.alarm.title, "测试报警");
+        assert.equal(result.body.data.alarm.acknowledged, false);
+
+        result = await request(baseUrl, "GET", "/api/logs/v1/alarms?limit=10");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.ok(result.body.data.alarms.some(alarm => alarm.message === "curl alarm test"));
+
+        result = await request(baseUrl, "POST", "/api/smart-home/v1/state", {
+            provider: "s3_gateway",
+            gateway_id: "verify-s3",
+            devices: [{
+                id: "ac_living_room",
+                type: "air_conditioner",
+                name: "客厅空调",
+                room_id: "living_room",
+                room_name: "客厅",
+                online: true,
+                state: {
+                    power: "off",
+                    temperature: 26
+                }
+            }]
+        }, VERIFY_GATEWAY_HEADERS);
+        assert.equal(result.response.status, 202);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.provider, "s3_gateway");
+        assert.equal(result.body.data.devices.length, 1);
+
+        result = await request(baseUrl, "GET", "/api/smart-home/v1/status");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.configured, true);
+        assert.equal(result.body.data.available, true);
+        assert.equal(result.body.data.provider, "s3_gateway");
+        assert.equal(result.body.data.devices[0].id, "ac_living_room");
+        assert.equal(result.body.data.devices[0].state.power, "off");
+
+        result = await request(baseUrl, "POST", "/api/smart-home/v1/control", {
+            target_id: "ac_living_room",
+            room_id: "living_room",
+            room_name: "客厅",
+            action: "set_power",
+            params: {
+                power: "on"
+            },
+            source: "dashboard",
+            requested_by: "user"
+        });
+        assert.equal(result.response.status, 202);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.command.status, "queued");
+        assert.match(result.body.data.message, /waiting for gateway pull/);
+        const smartHomeCommandId = result.body.data.command.command_id;
+
+        result = await request(baseUrl, "GET", "/api/smart-home/v1/commands?limit=10");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.ok(result.body.data.commands.some(command => command.command_id === smartHomeCommandId));
+
+        result = await request(baseUrl, "GET", "/api/smart-home/v1/commands/pending?gateway_id=verify-s3&limit=10", null, VERIFY_GATEWAY_HEADERS);
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.commands.length, 1);
+        assert.equal(result.body.data.commands[0].command_id, smartHomeCommandId);
+        assert.equal(result.body.data.commands[0].status, "dispatched");
+
+        result = await request(baseUrl, "POST", `/api/smart-home/v1/commands/${smartHomeCommandId}/ack`, {
+            status: "succeeded",
+            result: {
+                applied: true
+            },
+            executed_at_ms: Date.now()
+        }, VERIFY_GATEWAY_HEADERS);
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.command.status, "succeeded");
+
+        result = await request(baseUrl, "POST", "/api/commands/v1/natural-language", {
+            text: "把客厅空调打开到 26 度",
+            source: "dashboard",
+            room_id: "living_room",
+            device_id: "verify-s3"
+        });
+        assert.equal(result.response.status, 202);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.command.type, "natural_language");
+        assert.equal(result.body.data.command.status, "queued");
+        assert.equal(result.body.data.command.parsed_intent, null);
+        const naturalLanguageCommandId = result.body.data.command.command_id;
+
+        result = await request(baseUrl, "GET", "/api/commands/v1/recent?limit=10");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.ok(result.body.data.commands.some(command => command.command_id === naturalLanguageCommandId));
+
+        result = await request(baseUrl, "POST", "/api/logs/v1/cleanup", {
+            types: ["system", "alarm", "command"],
+            older_than_ms: 604800000,
+            dry_run: true
+        });
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.dry_run, true);
+        assert.equal(typeof result.body.data.deleted.system, "number");
 
         result = await request(baseUrl, "GET", "/api/voice/prompt/config");
         assert.equal(result.response.status, 200);

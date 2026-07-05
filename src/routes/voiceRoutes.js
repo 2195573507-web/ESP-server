@@ -48,6 +48,9 @@ const {
     refreshDeviceActivity
 } = require("../services/deviceStatusService");
 const {
+    recordEvent
+} = require("../services/eventLogService");
+const {
     readVoiceTurnConfig,
     readVoiceTurnMaxBytes
 } = require("../voice/turnConfig");
@@ -72,6 +75,30 @@ async function logVoiceTurnRecord(dbRun, record, logger = console) {
         logger.error(
             `[voice-turn] log_failed request_id=${normalizeLogPreview(record.requestId, 80) || "-"} status=${record.status || "-"} code=${record.errorCode || "-"} message=${JSON.stringify(error?.message || "-")}`
         );
+    }
+
+    try {
+        await recordEvent(dbRun, {
+            event_type: "voice",
+            event_name: "voice_event_created",
+            device_id: record.deviceId || "",
+            severity: record.status === "success" ? "info" : "warning",
+            message: record.status || "voice turn",
+            payload: {
+                request_id: record.requestId || "",
+                status: record.status || "",
+                status_code: record.statusCode || null,
+                error_code: record.errorCode || "",
+                input_bytes: record.inputBytes || 0,
+                response_bytes: record.responseBytes || 0,
+                total_ms: record.totalMs || 0,
+                mode: record.mode || ""
+            },
+            source: "voice_turn",
+            server_recv_ms: Date.now()
+        });
+    } catch (_) {
+        // Voice turn persistence remains authoritative; event logs are best-effort.
     }
 }
 

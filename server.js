@@ -19,8 +19,20 @@ const {
     ensureDeviceStatusTables
 } = require("./src/db/deviceStatus");
 const {
+    ensureGatewayAuthTables
+} = require("./src/db/gatewayAuth");
+const {
+    ensureDashboardSnapshotTables
+} = require("./src/db/dashboardSnapshots");
+const {
+    ensureEventLogTables
+} = require("./src/db/eventLogs");
+const {
     ensureCommandTables
 } = require("./src/db/commands");
+const {
+    ensureSmartHomeTables
+} = require("./src/db/smartHome");
 const {
     ensureAgentStateTables
 } = require("./src/db/agentState");
@@ -42,6 +54,12 @@ const {
 const {
     createDashboardRouter
 } = require("./src/routes/dashboardRoutes");
+const {
+    createEventRouter
+} = require("./src/routes/eventRoutes");
+const {
+    createSmartHomeRouter
+} = require("./src/routes/smartHomeRoutes");
 const {
     createAgentStateRouter
 } = require("./src/routes/agentStateRoutes");
@@ -67,6 +85,9 @@ const {
     createVoiceBodyParserErrorHandler,
     createVoiceRouter
 } = require("./src/routes/voiceRoutes");
+const {
+    recordEvent
+} = require("./src/services/eventLogService");
 
 const app = express();
 
@@ -103,7 +124,9 @@ app.use(createLlmTextRouter({ dbRun, dbAll }));
 app.use(createStructuredLlmRouter({ dbRun, dbAll }));
 app.use(createCommandRouter({ dbRun, dbAll }));
 app.use(createDeviceRouter({ dbRun, dbAll }));
-app.use("/api/dashboard/v1", createDashboardRouter({ dbAll }));
+app.use("/api/dashboard/v1", createDashboardRouter({ dbRun, dbAll }));
+app.use(createSmartHomeRouter({ dbRun, dbAll }));
+app.use(createEventRouter({ dbRun, dbAll }));
 app.use(createMemoryRouter({ dbRun, dbAll }));
 app.use(createAgentStateRouter({ dbRun, dbAll }));
 app.use(createUserDataRouter({ dbRun, dbAll }));
@@ -200,11 +223,39 @@ async function startServer() {
     await ensureRecordTables(dbRun, dbAll);
     await ensureSensorTimingColumns(dbRun, dbAll);
     await ensureDeviceStatusTables(dbRun, dbAll);
+    await ensureGatewayAuthTables(dbRun, dbAll);
+    await ensureDashboardSnapshotTables(dbRun, dbAll);
+    await ensureEventLogTables(dbRun, dbAll);
     await ensureVoiceTurnsTable(dbRun, dbAll);
     await ensureCommandTables(dbRun, dbAll);
+    await ensureSmartHomeTables(dbRun, dbAll);
     await ensureMemoryTables(dbRun, dbAll);
     await ensureAgentStateTables(dbRun, dbAll);
     await ensureUserDataDeletionTables(dbRun, dbAll);
+    await recordEvent(dbRun, {
+        event_type: "system",
+        event_name: "system_log_created",
+        severity: "info",
+        message: "server started and database migrations ensured",
+        payload: {
+            event: "server_start",
+            migrations: [
+                "records",
+                "sensor_timing",
+                "device_status",
+                "dashboard_snapshots",
+                "event_logs",
+                "voice_turns",
+                "commands",
+                "smart_home",
+                "memory",
+                "agent_state",
+                "user_data_deletion"
+            ]
+        },
+        source: "server_startup",
+        server_recv_ms: Date.now()
+    });
 
     httpServer = app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);

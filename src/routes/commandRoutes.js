@@ -17,6 +17,18 @@ const {
 const {
     refreshDeviceActivity
 } = require("../services/deviceStatusService");
+const {
+    requireBoundDevice,
+    requireGatewayAuth
+} = require("../services/gatewayAuthService");
+const {
+    createNaturalLanguageCommand,
+    listNaturalLanguageCommands
+} = require("../services/naturalLanguageCommandService");
+const {
+    apiEnvelope,
+    apiError
+} = require("../utils/apiEnvelope");
 
 function readRouteDeviceId(value) {
     return typeof value === "string" ? value.trim() : "";
@@ -64,6 +76,11 @@ function createCommandRouter(options) {
     const dbRun = options.dbRun;
     const dbAll = options.dbAll;
     const logger = options.logger || console;
+    const gatewayContext = {
+        dbRun,
+        dbAll
+    };
+    const gatewayOnly = requireGatewayAuth(gatewayContext);
 
     async function refreshCommandStatus(req, payloadType, fallbackDeviceId) {
         const metadata = readDeviceMetadata({
@@ -104,7 +121,15 @@ function createCommandRouter(options) {
         });
     });
 
-    router.post("/api/devices/capabilities", async (req, res) => {
+    router.post("/api/devices/capabilities", gatewayOnly, async (req, res) => {
+        const boundDevice = await requireBoundDevice(req, res, gatewayContext, {
+            source: "command.capabilities",
+            deviceId: req.body?.device_id,
+            allowNewBinding: true
+        });
+        if (!boundDevice.ok) {
+            return boundDevice.response;
+        }
         const result = await upsertDeviceCapabilities(dbRun, req.body);
         if (!result.ok) {
             return res.status(400).json(result);
@@ -149,13 +174,22 @@ function createCommandRouter(options) {
         });
     });
 
-    router.get("/api/commands/pending", async (req, res) => {
+    router.get("/api/commands/pending", gatewayOnly, async (req, res) => {
         const deviceId = validateRouteDeviceId(res, req.query.device_id);
         if (!deviceId) {
             return;
         }
 
-        const commands = await listPendingCommands(dbRun, dbAll, deviceId, req.query.limit);
+        const boundDevice = await requireBoundDevice(req, res, gatewayContext, {
+            source: "command.poll",
+            deviceId
+        });
+        if (!boundDevice.ok) {
+            return boundDevice.response;
+        }
+        const commands = await listPendingCommands(dbRun, dbAll, deviceId, req.query.limit, {
+            gatewayId: boundDevice.gateway_id
+        });
         await refreshCommandStatus(req, "command.poll", deviceId);
         return res.json({
             ok: true,
@@ -164,11 +198,21 @@ function createCommandRouter(options) {
         });
     });
 
-    router.post("/api/commands/:command_id/ack", async (req, res) => {
+    router.post("/api/commands/:command_id/ack", gatewayOnly, async (req, res) => {
         const commandDeviceId = await readCommandDeviceId(req.params.command_id);
-        const result = await ackCommand(dbRun, req.params.command_id, req.body);
+        const boundDevice = await requireBoundDevice(req, res, gatewayContext, {
+            source: "command.ack",
+            deviceId: commandDeviceId || req.body?.device_id
+        });
+        if (!boundDevice.ok) {
+            return boundDevice.response;
+        }
+        const result = await ackCommand(dbRun, req.params.command_id, req.body, dbAll, {
+            gatewayId: boundDevice.gateway_id,
+            deviceId: boundDevice.device_id
+        });
         if (!result.ok) {
-            if (result.code === "COMMAND_ACK_STATUS_INVALID") {
+            if (result.code === "COMMAND_ACK_STATUS_INVALID" || result.code === "COMMAND_ACK_OWNERSHIP_MISMATCH") {
                 return res.status(400).json(result);
             }
 
@@ -194,6 +238,36 @@ function createCommandRouter(options) {
             ok: true,
             commands: history
         });
+    });
+
+    router.post("/api/commands/v1/natural-language", async (req, res) => {
+        try {
+            const result = await createNaturalLanguageCommand(dbRun, req.body);
+            if (!result.ok) {
+                return res.status(400).json(apiError(result.code, result.error));
+            }
+
+            return res.status(202).json(apiEnvelope({
+                command: result.command
+            }));
+        } catch (error) {
+            logger.error(`[commands] natural-language failed ${error?.message || error}`);
+            return res.status(500).json(apiError("NATURAL_LANGUAGE_COMMAND_FAILED", "natural language command failed"));
+        }
+    });
+
+    router.get("/api/commands/v1/recent", async (req, res) => {
+        try {
+            const commands = await listNaturalLanguageCommands(dbAll, {
+                limit: req.query.limit
+            });
+            return res.json(apiEnvelope({
+                commands
+            }));
+        } catch (error) {
+            logger.error(`[commands] recent v1 failed ${error?.message || error}`);
+            return res.status(500).json(apiError("COMMAND_RECENT_READ_FAILED", "recent commands read failed"));
+        }
     });
 
     return router;

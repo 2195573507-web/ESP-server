@@ -11,8 +11,12 @@ const {
 const {
     runUpdateThenInsert
 } = require("../db/upsert");
+const {
+    recordEvent
+} = require("../services/eventLogService");
 
 const DEFAULT_COMMAND_DISPATCH_TIMEOUT_MS = 60000;
+const TERMINAL_COMMAND_STATUSES = new Set(["succeeded", "failed", "expired", "rejected", "completed", "success"]);
 const COMMAND_PROTOCOL_VERSION_MAX_LENGTH = 40;
 
 function nowIso() {
@@ -45,6 +49,25 @@ function parseJsonObject(value, fallback = {}) {
     } catch (_) {
         return fallback;
     }
+}
+
+function normalizeCommandStatus(status) {
+    const text = typeof status === "string" ? status.trim().toLowerCase() : "";
+    if (text === "completed" || text === "success") {
+        return "succeeded";
+    }
+    return text;
+}
+
+function normalizeAckStatus(status) {
+    const normalized = normalizeCommandStatus(status);
+    return ["succeeded", "failed", "expired", "rejected"].includes(normalized)
+        ? normalized
+        : "";
+}
+
+function mapStatusForClient(status) {
+    return normalizeCommandStatus(status) || status || "";
 }
 
 function normalizeCapabilityCommands(values) {
@@ -235,6 +258,28 @@ async function enqueueCommand(dbRun, dbAll, input, options = {}) {
         ]
     );
 
+    try {
+        await recordEvent(dbRun, {
+            event_type: "command",
+            event_name: "command_created",
+            device_id: command.target_device_id,
+            severity: "info",
+            message: command.name,
+            payload: {
+                command_id: commandId,
+                name: command.name,
+                payload: command.payload,
+                status: "queued",
+                source: options.source || "api",
+                requested_by: options.requestedBy || ""
+            },
+            source: options.source || "api",
+            server_recv_ms: Date.now()
+        });
+    } catch (_) {
+        // Event logging is best-effort; command queuing remains the source of truth.
+    }
+
     return {
         ok: true,
         command: {
@@ -254,25 +299,32 @@ function mapCommandRow(row) {
         device_id: row.device_id,
         name: row.name,
         payload: parseJsonObject(row.payload_json),
-        status: row.status,
         source: row.source || "",
         requested_by: row.requested_by || "",
+        gateway_id: row.gateway_id || "",
         error_code: row.error_code || "",
         error_message: row.error_message || "",
+        status: mapStatusForClient(row.status),
         result: parseJsonObject(row.result_json, null),
         created_at: row.created_at,
         updated_at: row.updated_at,
         dispatched_at: row.dispatched_at,
-        completed_at: row.completed_at
+        dispatch_count: Number(row.dispatch_count) || 0,
+        acknowledged_at: row.acknowledged_at,
+        completed_at: row.completed_at,
+        expires_at: row.expires_at,
+        reject_reason: row.reject_reason || ""
     };
 }
 
-async function listPendingCommands(dbRun, dbAll, deviceId, limit = 10) {
+async function listPendingCommands(dbRun, dbAll, deviceId, limit = 10, options = {}) {
     const safeLimit = Math.min(Math.max(Number.parseInt(limit, 10) || 10, 1), 50);
     const redispatchBefore = new Date(Date.now() - readCommandDispatchTimeoutMs()).toISOString();
+    const gatewayId = typeof options.gatewayId === "string" ? options.gatewayId.trim() : "";
     const rows = await dbAll(
         `SELECT * FROM command_queue
         WHERE device_id=?
+          AND (?='' OR gateway_id IS NULL OR gateway_id='' OR gateway_id=?)
           AND deleted_at IS NULL
           AND (
               status='queued'
@@ -282,7 +334,7 @@ async function listPendingCommands(dbRun, dbAll, deviceId, limit = 10) {
               )
           )
         ORDER BY id ASC LIMIT ?`,
-        [deviceId, redispatchBefore, safeLimit]
+        [deviceId, gatewayId, gatewayId, redispatchBefore, safeLimit]
     );
 
     const dispatchedAt = rows.length > 0 ? nowIso() : "";
@@ -290,8 +342,13 @@ async function listPendingCommands(dbRun, dbAll, deviceId, limit = 10) {
     for (const row of rows) {
         const result = await dbRun(
             `UPDATE command_queue
-            SET status='dispatched', dispatched_at=?, updated_at=?
+            SET status='dispatched',
+                gateway_id=CASE WHEN gateway_id IS NULL OR gateway_id='' THEN ? ELSE gateway_id END,
+                dispatched_at=?,
+                dispatch_count=COALESCE(dispatch_count, 0) + 1,
+                updated_at=?
             WHERE command_id=?
+              AND (?='' OR gateway_id IS NULL OR gateway_id='' OR gateway_id=?)
               AND deleted_at IS NULL
               AND (
                   status='queued'
@@ -300,7 +357,7 @@ async function listPendingCommands(dbRun, dbAll, deviceId, limit = 10) {
                       AND COALESCE(dispatched_at, updated_at, created_at) <= ?
                   )
               )`,
-            [dispatchedAt, dispatchedAt, row.command_id, redispatchBefore]
+            [gatewayId, dispatchedAt, dispatchedAt, row.command_id, gatewayId, gatewayId, redispatchBefore]
         );
 
         if (result.changes > 0) {
@@ -311,18 +368,20 @@ async function listPendingCommands(dbRun, dbAll, deviceId, limit = 10) {
     return claimedRows.map(row => ({
         ...mapCommandRow(row),
         status: "dispatched",
+        gateway_id: row.gateway_id || gatewayId,
         dispatched_at: dispatchedAt,
-        updated_at: dispatchedAt
+        updated_at: dispatchedAt,
+        dispatch_count: (Number(row.dispatch_count) || 0) + 1
     }));
 }
 
-async function ackCommand(dbRun, commandId, input) {
-    const status = typeof input?.status === "string" ? input.status.trim() : "";
-    if (status !== "completed" && status !== "failed") {
+async function ackCommand(dbRun, commandId, input, dbAll = null, options = {}) {
+    const status = normalizeAckStatus(input?.status);
+    if (!status) {
         return {
             ok: false,
             code: "COMMAND_ACK_STATUS_INVALID",
-            error: "status must be completed or failed"
+            error: "status must be succeeded, failed, expired, or rejected"
         };
     }
 
@@ -331,24 +390,103 @@ async function ackCommand(dbRun, commandId, input) {
         ? JSON.stringify(input.result)
         : null;
     const errorMessage = typeof input?.error_message === "string" ? input.error_message.slice(0, 500) : "";
-    const errorCode = status === "failed"
+    const errorCode = status === "failed" || status === "expired" || status === "rejected"
         ? (typeof input?.error_code === "string" && input.error_code.trim() ? input.error_code.trim().slice(0, 80) : "COMMAND_FAILED")
         : "";
+    const gatewayId = typeof options.gatewayId === "string" ? options.gatewayId.trim() : "";
+    const deviceId = typeof options.deviceId === "string" ? options.deviceId.trim() : "";
+    let existingCommand = null;
+    if (typeof dbAll === "function") {
+        const rows = await dbAll(
+            "SELECT * FROM command_queue WHERE command_id=? AND deleted_at IS NULL LIMIT 1",
+            [commandId]
+        );
+        existingCommand = rows[0] || null;
+    }
+    if (typeof dbAll === "function" && !existingCommand) {
+        return {
+            ok: false,
+            code: "COMMAND_ACK_NOT_ACCEPTED",
+            error: "command not found",
+            status,
+            command_id: commandId,
+            server_time_ms: Date.now()
+        };
+    }
+    if (existingCommand && deviceId && existingCommand.device_id !== deviceId) {
+        return {
+            ok: false,
+            code: "COMMAND_ACK_OWNERSHIP_MISMATCH",
+            error: "command does not belong to device"
+        };
+    }
+    if (existingCommand && gatewayId && existingCommand.gateway_id && existingCommand.gateway_id !== gatewayId) {
+        return {
+            ok: false,
+            code: "COMMAND_ACK_OWNERSHIP_MISMATCH",
+            error: "command does not belong to gateway"
+        };
+    }
+    if (existingCommand && TERMINAL_COMMAND_STATUSES.has(normalizeCommandStatus(existingCommand.status))) {
+        return {
+            ok: true,
+            idempotent: true,
+            status: mapStatusForClient(existingCommand.status),
+            command_id: commandId,
+            server_time_ms: Date.now()
+        };
+    }
 
     const result = await dbRun(
         `UPDATE command_queue
-        SET status=?, result_json=?, error_code=?, error_message=?, completed_at=?, updated_at=?
-        WHERE command_id=? AND deleted_at IS NULL AND status IN ('queued','dispatched')`,
+        SET status=?,
+            gateway_id=CASE WHEN gateway_id IS NULL OR gateway_id='' THEN ? ELSE gateway_id END,
+            result_json=?,
+            error_code=?,
+            error_message=?,
+            acknowledged_at=?,
+            completed_at=?,
+            updated_at=?
+        WHERE command_id=?
+          AND deleted_at IS NULL
+          AND status IN ('queued','dispatched','acknowledged')`,
         [
             status,
+            gatewayId,
             resultJson,
             errorCode,
             errorMessage,
             timestamp,
             timestamp,
+            timestamp,
             commandId
         ]
     );
+
+    if (result.changes > 0) {
+        try {
+            await recordEvent(dbRun, {
+                event_type: "command",
+                event_name: "command_acknowledged",
+                device_id: existingCommand?.device_id || "",
+                severity: status === "failed" ? "warning" : "info",
+                message: existingCommand?.name || `command ${status}`,
+                payload: {
+                    command_id: commandId,
+                    name: existingCommand?.name || "",
+                    status,
+                    gateway_id: gatewayId || existingCommand?.gateway_id || "",
+                    result: parseJsonObject(resultJson, null),
+                    error_code: errorCode,
+                    error_message: errorMessage
+                },
+                source: "command_ack",
+                server_recv_ms: Date.now()
+            });
+        } catch (_) {
+            // Event logging is best-effort; ACK status has already been persisted.
+        }
+    }
 
     return {
         ok: result.changes > 0,

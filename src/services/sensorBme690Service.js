@@ -7,6 +7,9 @@ const {
 const {
     refreshDeviceActivity
 } = require("./deviceStatusService");
+const {
+    recordEvent
+} = require("./eventLogService");
 
 const SENSOR_ID_MAX_LENGTH = 80;
 const AIR_QUALITY_LEVELS = new Set(["excellent", "good", "moderate", "poor", "bad", "unknown"]);
@@ -186,9 +189,14 @@ async function ingestBme690(dbRun, dbAll, body, options = {}) {
         body,
         headers: options.headers,
         query: options.query,
+        deviceId: options.trustedDeviceId,
         payloadType: "sensor.bme690",
         serverRecvMs
     });
+    metadata.gateway_id = trimText(options.trustedGatewayId, 128);
+    if (options.trustedDeviceId) {
+        metadata.device_id = trimText(options.trustedDeviceId, 128);
+    }
 
     if (!validation.ok) {
         return {
@@ -246,6 +254,18 @@ async function ingestBme690(dbRun, dbAll, body, options = {}) {
     );
 
     await refreshDeviceActivity(dbRun, dbAll, metadata, "sensor.bme690");
+    if (body.alarm || body.payload?.alarm || body.payload?.alarm_type) {
+        await recordEvent(dbRun, {
+            event_type: "alarm",
+            event_name: "alarm_created",
+            device_id: metadata.device_id,
+            severity: "warning",
+            message: trimText(body.payload?.alarm_type || body.alarm_type || "sensor alarm", 200),
+            payload: body.payload?.alarm || body.alarm || body.payload || {},
+            source: "device_ingest",
+            server_recv_ms: metadata.server_recv_ms
+        });
+    }
 
     return {
         ok: true,

@@ -10,6 +10,9 @@ const {
 const {
     recordCsiMotion
 } = require("./dashboardService");
+const {
+    recordEvent
+} = require("./eventLogService");
 
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
 const CSI_OCCUPANCY_STATES = new Set(["unknown", "vacant", "occupied"]);
@@ -112,9 +115,14 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
         body,
         headers: options.headers,
         query: options.query,
+        deviceId: options.trustedDeviceId,
         payloadType: CSI_MOTION_PAYLOAD_TYPE,
         serverRecvMs
     });
+    metadata.gateway_id = trimText(options.trustedGatewayId, 128);
+    if (options.trustedDeviceId) {
+        metadata.device_id = trimText(options.trustedDeviceId, 128);
+    }
     const validation = validateCsiMotionEnvelope(body, serverRecvMs);
     if (!validation.ok) {
         return {
@@ -134,6 +142,19 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
         occupancy: validation.csi.occupancy
     }, {
         serverRecvMs
+    });
+    await recordEvent(dbRun, {
+        event_type: "csi",
+        event_name: "system_log_created",
+        device_id: metadata.device_id,
+        severity: "info",
+        message: `csi motion ${validation.csi.occupancy.state}`,
+        payload: {
+            room_id: validation.csi.room_id,
+            occupancy: validation.csi.occupancy
+        },
+        source: "device_ingest",
+        server_recv_ms: metadata.server_recv_ms
     });
 
     return {

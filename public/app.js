@@ -197,6 +197,14 @@ function hasData(value) {
     return isPlainObject(value) && Object.keys(value).length > 0;
 }
 
+function unwrapDashboardV1Data(value, key) {
+    if (isPlainObject(value) && value.ok === true && isPlainObject(value.data)) {
+        return key ? value.data[key] : value.data;
+    }
+
+    return value;
+}
+
 function formatTime(timestamp = Date.now()) {
     const date = parseTimestamp(timestamp) || new Date();
     return date.toLocaleTimeString("zh-CN", {
@@ -319,7 +327,7 @@ function normalizeHistoryPoint(point) {
     };
 }
 
-// 曲线时间范围：将 /sensor/latest 的最新真实数据作为当前点，不新增接口也不修改数据来源。
+// 曲线时间范围：将 dashboard v1 最新传感器数据作为当前点，不新增接口也不修改数据来源。
 function getLatestSensorChartPoint() {
     const sensor = dashboardState.sensor;
     if (!sensor || sensor.source !== "real" || !sensor.timestamp) return null;
@@ -494,8 +502,12 @@ function readEndpointFallback(error, mockData, label) {
 
 async function fetchLatestSensor() {
     try {
-        const response = await fetch("/sensor/latest", { cache: "no-store" });
-        return readEndpointResponse(response, mockSensorData, "Sensor");
+        const response = await fetch("/api/dashboard/v1/sensors/latest", { cache: "no-store" });
+        const result = await readEndpointResponse(response, mockSensorData, "Sensor");
+        return {
+            ...result,
+            data: unwrapDashboardV1Data(result.data, "sensor")
+        };
     } catch (error) {
         return readEndpointFallback(error, mockSensorData, "Sensor");
     }
@@ -503,8 +515,12 @@ async function fetchLatestSensor() {
 
 async function fetchLatestASR() {
     try {
-        const response = await fetch("/asr/latest", { cache: "no-store" });
-        return readEndpointResponse(response, mockASRData, "ASR");
+        const response = await fetch("/api/dashboard/v1/asr/latest", { cache: "no-store" });
+        const result = await readEndpointResponse(response, mockASRData, "ASR");
+        return {
+            ...result,
+            data: unwrapDashboardV1Data(result.data, "asr")
+        };
     } catch (error) {
         return readEndpointFallback(error, mockASRData, "ASR");
     }
@@ -512,8 +528,12 @@ async function fetchLatestASR() {
 
 async function fetchLatestLLM() {
     try {
-        const response = await fetch("/llm/latest", { cache: "no-store" });
-        return readEndpointResponse(response, mockLLMData, "LLM");
+        const response = await fetch("/api/dashboard/v1/llm/latest", { cache: "no-store" });
+        const result = await readEndpointResponse(response, mockLLMData, "LLM");
+        return {
+            ...result,
+            data: unwrapDashboardV1Data(result.data, "llm")
+        };
     } catch (error) {
         return readEndpointFallback(error, mockLLMData, "LLM");
     }
@@ -1784,7 +1804,7 @@ function getDeviceOperationMethod() {
 async function handleFetchCurrentData(button) {
     const logId = addOperationLog({
         type: "获取当前数据",
-        content: "调用现有 /sensor/latest 接口读取最新传感器数据。",
+        content: "调用现有 /api/dashboard/v1/sensors/latest 接口读取最新传感器数据。",
         status: "pending",
         result: "请求中..."
     });

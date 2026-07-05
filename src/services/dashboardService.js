@@ -2,13 +2,23 @@ const {
     getTimeSyncStatus
 } = require("../../server-time-sync/timeSync");
 const {
+    readDeviceStatuses,
     readDeviceStatus,
-    readModuleStatuses
+    readModuleStatuses,
+    refreshDeviceActivity
 } = require("./deviceStatusService");
 const {
+    readDeviceMetadata,
     toIntegerOrNull,
     trimText
 } = require("./deviceMetadata");
+const {
+    makeSnapshotId
+} = require("../db/dashboardSnapshots");
+const {
+    listEvents,
+    recordEvent
+} = require("./eventLogService");
 
 const DASHBOARD_HISTORY_DEFAULT_LIMIT = 50;
 const DASHBOARD_HISTORY_MAX_LIMIT = 500;
@@ -177,12 +187,26 @@ function normalizeSnapshotGateway(gateway, serverRecvMs) {
         gateway_id: trimText(source.gateway_id || "sensair_s3_gateway_01", 128),
         online: booleanValue(source.online, true),
         softap_ready: booleanValue(source.softap_ready, false),
+        softap_enabled: booleanValue(source.softap_enabled ?? source.softap_ready, false),
         sta_connected: booleanValue(source.sta_connected, false),
         server_available: booleanValue(source.server_available, false),
+        server_connected: booleanValue(source.server_connected ?? source.server_available, false),
         voice_busy: booleanValue(source.voice_busy, false),
+        free_heap: integerOrNull(source.free_heap),
+        psram_heap: integerOrNull(source.psram_heap),
         last_error: trimText(source.last_error, 128),
         timestamp: integerOrNull(source.timestamp) || serverRecvMs
     };
+}
+
+function applyTrustedGatewayId(snapshot, trustedGatewayId) {
+    const gatewayId = trimText(trustedGatewayId, 128);
+    if (!gatewayId || !snapshot?.gateway) {
+        return snapshot;
+    }
+
+    snapshot.gateway.gateway_id = gatewayId;
+    return snapshot;
 }
 
 function normalizeSnapshotSensors(sensors) {
@@ -258,7 +282,9 @@ function normalizeSnapshotDevice(device, serverRecvMs) {
     return {
         device_id: deviceId,
         local_id: integerOrNull(device.local_id),
+        device_type: trimText(device.device_type, 40) || "C5",
         name: trimText(device.name || device.alias, 128),
+        room_id: trimText(device.room_id, 128),
         room_name: trimText(device.room_name || device.room_id || "unassigned", 128),
         online: booleanValue(device.online, false),
         wifi_rssi: integerOrNull(device.wifi_rssi),
@@ -442,6 +468,33 @@ function cloneJson(value) {
     return JSON.parse(JSON.stringify(value));
 }
 
+function stripMockAppliancesForStorage(snapshot) {
+    const stored = cloneJson(snapshot);
+    for (const device of stored.devices || []) {
+        if (!isPlainObject(device.appliances)) {
+            continue;
+        }
+
+        const realAppliances = {};
+        for (const [name, appliance] of Object.entries(device.appliances)) {
+            if (!isPlainObject(appliance)) {
+                continue;
+            }
+
+            const source = trimText(appliance.source, 40).toLowerCase();
+            if (appliance.mock === true || source === "mock") {
+                continue;
+            }
+
+            realAppliances[name] = appliance;
+        }
+        device.appliances = realAppliances;
+    }
+
+    stored.mock_persistence = "stripped";
+    return stored;
+}
+
 function shouldApplyCsiMotion(existingOccupancy, nextOccupancy) {
     const existingUpdatedAt = integerOrNull(existingOccupancy?.updated_at) || 0;
     const nextUpdatedAt = integerOrNull(nextOccupancy?.updated_at) || 0;
@@ -508,6 +561,64 @@ function filterSnapshotForQuery(snapshot, query = {}) {
     return cloned;
 }
 
+function snapshotRowToPayload(row) {
+    if (!row) {
+        return null;
+    }
+
+    return parseJsonObject(row.payload_json, null);
+}
+
+async function restoreLatestDashboardSnapshot(dbAll) {
+    if (typeof dbAll !== "function") {
+        return null;
+    }
+
+    const rows = await dbAll(
+        `SELECT * FROM dashboard_snapshots
+        ORDER BY server_recv_ms DESC, id DESC
+        LIMIT 1`
+    );
+    const payload = snapshotRowToPayload(rows[0]);
+    if (payload) {
+        latestDashboardSnapshot = payload;
+    }
+
+    return latestDashboardSnapshot ? cloneJson(latestDashboardSnapshot) : null;
+}
+
+async function readLatestDashboardSnapshot(dbAll) {
+    if (latestDashboardSnapshot) {
+        return cloneJson(latestDashboardSnapshot);
+    }
+
+    return restoreLatestDashboardSnapshot(dbAll);
+}
+
+async function readDashboardSnapshotHistory(dbAll, query = {}) {
+    const limitResult = readDashboardLimit(query.limit);
+    if (!limitResult.ok) {
+        return limitResult;
+    }
+
+    const rows = await dbAll(
+        `SELECT snapshot_id,gateway_id,server_recv_ms,payload_json,schema_version,created_at
+        FROM dashboard_snapshots
+        ORDER BY server_recv_ms DESC, id DESC
+        LIMIT ?`,
+        [limitResult.limit]
+    );
+
+    return rows.map(row => ({
+        snapshot_id: row.snapshot_id,
+        gateway_id: row.gateway_id,
+        server_recv_ms: integerOrNull(row.server_recv_ms),
+        schema_version: integerOrNull(row.schema_version),
+        payload: snapshotRowToPayload(row),
+        created_at: row.created_at || ""
+    }));
+}
+
 function recordCsiMotion(record, options = {}) {
     const serverRecvMs = Number.isFinite(options.serverRecvMs) ? options.serverRecvMs : Date.now();
     const deviceId = normalizeDashboardDeviceId(record?.device_id);
@@ -546,15 +657,114 @@ async function ingestDashboardSnapshot(body, options = {}) {
         };
     }
 
-    latestDashboardSnapshot = validation.snapshot;
+    latestDashboardSnapshot = applyTrustedGatewayId(validation.snapshot, options.trustedGatewayId);
+    const dbRun = options.dbRun;
+    const dbAll = options.dbAll;
+    const gatewayId = latestDashboardSnapshot.gateway.gateway_id;
+    const snapshotId = makeSnapshotId(gatewayId, serverRecvMs);
+
+    if (typeof dbRun === "function") {
+        await dbRun(
+            `INSERT INTO dashboard_snapshots
+            (snapshot_id,gateway_id,server_recv_ms,payload_json,schema_version,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?)`,
+            [
+                snapshotId,
+                gatewayId,
+                serverRecvMs,
+                JSON.stringify(stripMockAppliancesForStorage(latestDashboardSnapshot)),
+                Number(body.schema_version) || 2,
+                new Date(serverRecvMs).toISOString(),
+                new Date(serverRecvMs).toISOString()
+            ]
+        );
+
+        const gatewayMetadata = readDeviceMetadata({
+            body: {
+                device_id: gatewayId,
+                device_type: "S3",
+                room_id: body.gateway?.room_id || body.room_id,
+                room_name: body.gateway?.room_name || body.room_name,
+                payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
+                esp_time_ms: body.gateway?.timestamp || body.timestamp,
+                esp_uptime_ms: body.gateway?.esp_uptime_ms
+            },
+            headers: options.headers,
+            payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
+            serverRecvMs
+        });
+        await refreshDeviceActivity(dbRun, dbAll, gatewayMetadata, DASHBOARD_SNAPSHOT_PAYLOAD_TYPE);
+
+        for (const device of latestDashboardSnapshot.devices) {
+            const metadata = readDeviceMetadata({
+                body: {
+                    device_id: device.device_id,
+                    device_type: device.device_type || "C5",
+                    room_id: device.room_id,
+                    room_name: device.room_name,
+                    payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
+                    timestamp: device.timestamp
+                },
+                headers: options.headers,
+                payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
+                serverRecvMs
+            });
+            await refreshDeviceActivity(dbRun, dbAll, metadata, DASHBOARD_SNAPSHOT_PAYLOAD_TYPE);
+        }
+
+        await recordEvent(dbRun, {
+            event_type: "system",
+            event_name: "dashboard_snapshot_updated",
+            device_id: gatewayId,
+            severity: "info",
+            message: "dashboard snapshot updated",
+            payload: {
+                snapshot_id: snapshotId,
+                gateway_id: gatewayId,
+                device_count: latestDashboardSnapshot.devices.length,
+                history_count: latestDashboardSnapshot.history.length
+            },
+            source: "dashboard_snapshot",
+            server_recv_ms: serverRecvMs
+        });
+
+        for (const voiceEvent of latestDashboardSnapshot.recent_voice_events || []) {
+            await recordEvent(dbRun, {
+                event_type: "voice",
+                event_name: "voice_event_created",
+                device_id: voiceEvent.device_id,
+                severity: "info",
+                message: voiceEvent.event || "voice event",
+                payload: voiceEvent,
+                source: "dashboard_snapshot",
+                server_recv_ms: serverRecvMs
+            });
+        }
+
+        for (const commandEvent of latestDashboardSnapshot.recent_commands || []) {
+            await recordEvent(dbRun, {
+                event_type: "command",
+                event_name: "command_created",
+                device_id: commandEvent.device_id,
+                severity: "info",
+                message: commandEvent.status || "command event",
+                payload: commandEvent,
+                source: "dashboard_snapshot",
+                server_recv_ms: serverRecvMs
+            });
+        }
+    }
+
     return {
         ok: true,
         status: 202,
         data: {
+            snapshot_id: snapshotId,
             payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
             gateway_id: latestDashboardSnapshot.gateway.gateway_id,
             device_count: latestDashboardSnapshot.devices.length,
             history_count: latestDashboardSnapshot.history.length,
+            bound_device_ids: latestDashboardSnapshot.devices.map(device => device.device_id).filter(Boolean),
             received_at_ms: latestDashboardSnapshot.received_at_ms
         }
     };
@@ -609,6 +819,170 @@ function mapDashboardModuleStatus(moduleStatus) {
         avg_upload_delay_ms: moduleStatus?.avg_upload_delay_ms ?? null,
         delay_sample_count: moduleStatus?.delay_sample_count ?? 0
     };
+}
+
+function lastVoiceEventMs(snapshot) {
+    const events = Array.isArray(snapshot?.recent_voice_events) ? snapshot.recent_voice_events : [];
+    let latest = null;
+    for (const event of events) {
+        const timestamp = integerOrNull(event.timestamp);
+        if (timestamp !== null && (latest === null || timestamp > latest)) {
+            latest = timestamp;
+        }
+    }
+    return latest;
+}
+
+function latestHistoryMs(snapshot) {
+    const history = Array.isArray(snapshot?.history) ? snapshot.history : [];
+    let latest = null;
+    for (const item of history) {
+        const timestamp = integerOrNull(item.timestamp);
+        if (timestamp !== null && (latest === null || timestamp > latest)) {
+            latest = timestamp;
+        }
+    }
+    return latest;
+}
+
+function moduleOnline(modules, moduleType) {
+    return modules.some(module => module.module_type === moduleType && module.online);
+}
+
+function moduleStatusText(online) {
+    return online ? "online" : "offline";
+}
+
+function buildModuleSummary(snapshot, modules) {
+    const gateway = snapshot.gateway || {};
+    const wifiOnline = Boolean(gateway.sta_connected || gateway.softap_enabled || gateway.softap_ready);
+    const voiceOnline = moduleOnline(modules, "voice.turn") || moduleOnline(modules, "voice.prompt") || Boolean(lastVoiceEventMs(snapshot));
+    const bmeOnline = moduleOnline(modules, "sensor.bme690") ||
+        (Array.isArray(snapshot.devices) && snapshot.devices.some(device => Boolean(device.sensors)));
+    const csiOnline = moduleOnline(modules, "csi.motion") ||
+        (Array.isArray(snapshot.devices) && snapshot.devices.some(device => Boolean(device.occupancy?.available)));
+    const serverOnline = gateway.server_connected !== undefined
+        ? Boolean(gateway.server_connected)
+        : Boolean(gateway.server_available ?? true);
+
+    return {
+        wifi: {
+            online: wifiOnline,
+            status: moduleStatusText(wifiOnline)
+        },
+        voice: {
+            online: voiceOnline,
+            busy: Boolean(gateway.voice_busy),
+            last_event_ms: lastVoiceEventMs(snapshot)
+        },
+        bme: {
+            online: bmeOnline
+        },
+        csi: {
+            online: csiOnline,
+            last_result_ms: latestHistoryMs(snapshot)
+        },
+        server: {
+            online: serverOnline
+        }
+    };
+}
+
+function adaptGatewayForOverview(snapshot, statuses) {
+    const gateway = snapshot.gateway || {};
+    const gatewayStatus = statuses.find(status => status.device_id === gateway.gateway_id);
+    const lastSeen = gatewayStatus?.last_seen_ms ?? integerOrNull(gateway.timestamp) ?? snapshot.received_at_ms ?? null;
+    return {
+        ...gateway,
+        gateway_id: gateway.gateway_id || "sensair_s3_gateway_01",
+        online: Boolean(gatewayStatus?.online ?? gateway.online),
+        lastSeen,
+        sta_connected: Boolean(gateway.sta_connected),
+        softap_enabled: Boolean(gateway.softap_enabled ?? gateway.softap_ready),
+        server_connected: Boolean(gateway.server_connected ?? gateway.server_available),
+        free_heap: integerOrNull(gateway.free_heap),
+        psram_heap: integerOrNull(gateway.psram_heap),
+        last_error: gateway.last_error || ""
+    };
+}
+
+function adaptDeviceForOverview(device, statuses, modules) {
+    const status = statuses.find(item => item.device_id === device.device_id);
+    const sensors = device.sensors || {};
+    const csiModule = modules.find(module => module.device_id === device.device_id && module.module_type === "csi.motion");
+    const voiceModule = modules.find(module => module.device_id === device.device_id && (module.module_type === "voice.turn" || module.module_type === "voice.prompt"));
+    const lastSeen = status?.last_seen_ms ?? integerOrNull(device.timestamp);
+
+    return {
+        ...device,
+        device_id: device.device_id,
+        device_type: status?.device_type || device.device_type || "C5",
+        room_id: status?.room_id || device.room_id || "",
+        room_name: status?.room_name || device.room_name || "",
+        online: Boolean(status?.online ?? device.online),
+        lastSeen,
+        last_seen_ms: lastSeen,
+        air_quality_score: integerOrNull(sensors.air_quality_score),
+        air_quality_level: sensors.air_quality_level || "unknown",
+        temperature_c: numberValueOrNull(sensors.temperature ?? sensors.temperature_c),
+        humidity_percent: numberValueOrNull(sensors.humidity ?? sensors.humidity_percent),
+        pressure_hpa: numberValueOrNull(sensors.pressure ?? sensors.pressure_hpa),
+        voice: {
+            online: Boolean(voiceModule?.online),
+            last_event_ms: voiceModule?.last_seen_ms ?? null
+        },
+        csi: {
+            online: Boolean(csiModule?.online ?? device.occupancy?.available),
+            last_result_ms: csiModule?.last_seen_ms ?? integerOrNull(device.occupancy?.updated_at),
+            occupancy: device.occupancy || null
+        }
+    };
+}
+
+async function attachUnifiedOverview(dbAll, snapshot, query = {}) {
+    const [statuses, modules, alarms, recentCommands, recentVoiceEvents, systemLogs] = await Promise.all([
+        readDeviceStatuses(dbAll),
+        readModuleStatuses(dbAll),
+        listEvents(dbAll, {
+            event_type: "alarm",
+            limit: 50
+        }),
+        listEvents(dbAll, {
+            event_type: "command",
+            limit: 50
+        }),
+        listEvents(dbAll, {
+            event_type: "voice",
+            limit: 50
+        }),
+        listEvents(dbAll, {
+            event_types: ["system", "device", "csi"],
+            limit: 50
+        })
+    ]);
+    const deviceId = normalizeDashboardDeviceId(query.device_id);
+    const filteredSnapshot = filterSnapshotForQuery(snapshot, query);
+
+    filteredSnapshot.gateway = adaptGatewayForOverview(filteredSnapshot, statuses);
+    filteredSnapshot.modules = buildModuleSummary(filteredSnapshot, modules);
+    filteredSnapshot.devices = filteredSnapshot.devices.map(device => adaptDeviceForOverview(device, statuses, modules));
+    filteredSnapshot.alarms = alarms;
+    filteredSnapshot.recent_commands = recentCommands.length > 0
+        ? recentCommands
+        : (filteredSnapshot.recent_commands || []);
+    filteredSnapshot.recent_voice_events = recentVoiceEvents.length > 0
+        ? recentVoiceEvents
+        : (filteredSnapshot.recent_voice_events || []);
+    filteredSnapshot.system_logs = systemLogs;
+
+    if (deviceId) {
+        filteredSnapshot.recent_commands = filteredSnapshot.recent_commands.filter(item => !item.device_id || item.device_id === deviceId);
+        filteredSnapshot.recent_voice_events = filteredSnapshot.recent_voice_events.filter(item => !item.device_id || item.device_id === deviceId);
+        filteredSnapshot.system_logs = filteredSnapshot.system_logs.filter(item => !item.device_id || item.device_id === deviceId);
+        filteredSnapshot.alarms = filteredSnapshot.alarms.filter(item => !item.device_id || item.device_id === deviceId);
+    }
+
+    return filteredSnapshot;
 }
 
 function pickSensorDelay(row, deviceStatus, moduleStatus) {
@@ -797,8 +1171,9 @@ async function readDashboardModulesStatus(dbAll, query = {}) {
 }
 
 async function readDashboardOverview(dbAll, query = {}) {
-    if (latestDashboardSnapshot) {
-        return filterSnapshotForQuery(latestDashboardSnapshot, query);
+    const restoredSnapshot = await readLatestDashboardSnapshot(dbAll);
+    if (restoredSnapshot) {
+        return attachUnifiedOverview(dbAll, restoredSnapshot, query);
     }
 
     const [
@@ -845,9 +1220,13 @@ async function readDashboardOverview(dbAll, query = {}) {
             gateway_id: "sensair_s3_gateway_01",
             online: false,
             softap_ready: false,
+            softap_enabled: false,
             sta_connected: false,
             server_available: true,
+            server_connected: true,
             voice_busy: false,
+            free_heap: null,
+            psram_heap: null,
             last_error: latestDashboardSnapshot ? "" : "no_gateway_snapshot",
             timestamp: Date.now()
         },
@@ -868,7 +1247,7 @@ async function readDashboardOverview(dbAll, query = {}) {
         recent_commands: []
     };
     mergeCsiMotionIntoSnapshot(snapshot, normalizeDashboardDeviceId(query.device_id));
-    return filterSnapshotForQuery(snapshot, query);
+    return attachUnifiedOverview(dbAll, snapshot, query);
 }
 
 module.exports = {
@@ -880,9 +1259,11 @@ module.exports = {
     mapDashboardSensor,
     normalizeSnapshotOccupancy,
     recordCsiMotion,
+    readDashboardSnapshotHistory,
     readDashboardAsrLatest,
     readDashboardDeviceStatus,
     readDashboardLimit,
+    readLatestDashboardSnapshot,
     readDashboardLlmLatest,
     readDashboardModulesStatus,
     readDashboardOverview,

@@ -347,10 +347,6 @@ svg {
     background: transparent;
 }
 
-.search input::placeholder {
-    color: #7184a9;
-}
-
 .top-status {
     display: flex;
     grid-column: 3;
@@ -570,6 +566,12 @@ svg {
     background: rgba(239, 51, 64, 0.13);
 }
 
+.state-unknown,
+.level-unknown {
+    color: var(--text-muted);
+    background: rgba(148, 163, 184, 0.14);
+}
+
 .metric-change {
     display: flex;
     align-items: center;
@@ -600,6 +602,15 @@ svg {
     z-index: 1;
     width: 100%;
     height: 58px;
+}
+
+.sparkline-empty {
+    display: grid;
+    place-items: center;
+    height: 58px;
+    color: var(--text-muted);
+    font-size: 13px;
+    font-weight: 700;
 }
 
 .dashboard-page[hidden] {
@@ -684,6 +695,7 @@ svg {
 .s3-status-tile {
     position: relative;
     display: grid;
+    align-content: space-between;
     gap: 8px;
     min-height: 92px;
     padding: 14px;
@@ -822,12 +834,15 @@ svg {
 
 .s3-sensor-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+    align-items: stretch;
     gap: 10px;
 }
 
 .s3-sensor-metric {
     display: grid;
+    align-content: space-between;
     gap: 8px;
+    min-height: 76px;
     padding: 13px;
 }
 
@@ -1109,6 +1124,10 @@ svg {
     background: var(--green);
 }
 
+.legend-dot.orange {
+    background: var(--orange);
+}
+
 .legend-dot.purple {
     background: var(--purple);
 }
@@ -1274,6 +1293,12 @@ tbody tr:last-child td {
     color: var(--green);
 }
 
+.table-empty {
+    color: var(--text-muted);
+    text-align: center;
+    font-weight: 700;
+}
+
 .system-log-list {
     display: grid;
     gap: 19px;
@@ -1310,6 +1335,15 @@ tbody tr:last-child td {
     white-space: normal;
     word-break: normal;
     overflow-wrap: break-word;
+}
+
+.system-log.empty {
+    display: block;
+    padding: 12px;
+    border: 1px dashed var(--border-color);
+    border-radius: 8px;
+    color: var(--text-muted);
+    text-align: center;
 }
 
 body.log-modal-open {
@@ -1642,7 +1676,7 @@ body.log-modal-open {
 }
 
 .operation-log-panel {
-    /* 命令控制：本区域只记录当前页面前端操作，不写入服务器日志。 */
+    /* 命令控制：本区域只显示后端返回的真实命令历史。 */
     margin-top: 16px;
     padding-top: 14px;
     border-top: 1px solid var(--border-color);
@@ -1965,7 +1999,6 @@ td,
 .nav-icon,
 .top-status small,
 .search,
-.search input::placeholder,
 .metric-change,
 .link-button,
 .system-log time,
@@ -2139,10 +2172,6 @@ body[data-theme="light"] .search {
 
 body[data-theme="light"] .search input {
     color: #12213f;
-}
-
-body[data-theme="light"] .search input::placeholder {
-    color: #7385a3;
 }
 
 body[data-theme="light"] .top-status strong {
@@ -2415,7 +2444,6 @@ body[data-theme="light"] .secondary-action {
 body[data-theme="light"] .nav-icon,
 body[data-theme="light"] .top-status small,
 body[data-theme="light"] .search,
-body[data-theme="light"] .search input::placeholder,
 body[data-theme="light"] .metric-change,
 body[data-theme="light"] .link-button,
 body[data-theme="light"] .system-log time,

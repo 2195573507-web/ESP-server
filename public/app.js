@@ -10,126 +10,72 @@ const metricDefinitions = {
         unit: "°C",
         accent: "#2874ff",
         icon: "thermometer",
-        mockValue: 25.6,
-        trend: [21, 22, 23, 20, 20, 22, 24, 25, 23, 22, 25, 24, 26, 25, 28, 26, 24]
+        historyField: "temperature"
     },
     humidity: {
         name: "湿度",
         unit: "%",
         accent: "#10b981",
         icon: "drop",
-        mockValue: 58.3,
-        trend: [55, 59, 53, 49, 46, 50, 54, 58, 52, 53, 48, 51, 55, 49, 52, 62, 57]
+        historyField: "humidity"
     },
     air: {
         name: "空气质量",
         unit: "",
         accent: "#8a35ea",
         icon: "cloud",
-        mockValue: 132,
-        trend: [92, 105, 88, 99, 94, 104, 128, 111, 104, 119, 101, 126, 116, 146, 132, 119]
+        historyField: "air_quality_score"
     },
     esp: {
         name: "ESP 状态",
         unit: "",
         accent: "#f97316",
         icon: "chip",
-        mockValue: "在线",
-        latency: 32,
-        trend: [26, 25, 26, 31, 35, 36, 35, 31, 29, 34, 32, 37, 35, 39, 36, 35, 31]
+        historyField: null
     }
 };
 
-const mockSensorData = {
-    temperature: 25.6,
-    humidity: 58.3,
-    aqi: 132,
-    timestamp: Date.now()
+const DEVICE_IDS = {
+    c51: "C51",
+    c52: "C52"
 };
+const LOADING_TEXT = "Loading...";
+const EMPTY_TEXT = "暂无数据";
+const NO_DATA_TEXT = "未连接";
+const ERROR_TEXT = "接口请求失败";
+const UNKNOWN_TEXT = "未知";
+const OFFLINE_TEXT = "离线";
+const DISCONNECTED_TEXT = "未连接";
 
-const mockASRData = {
-    timestamp: Date.now(),
-    text: "暂无真实 ASR 数据，等待设备上传"
-};
-
-const mockLLMData = {
-    timestamp: Date.now(),
-    response: "暂无真实 LLM 数据，等待服务返回"
-};
-
-// mockHistoryData: 当前后端没有历史曲线接口，主图暂时使用前端 mock 数据。
-const mockHistoryData = [
-    { time: "12:00", temperature: 26, humidity: 58, air: 10 },
-    { time: "14:00", temperature: 28, humidity: 62, air: 14 },
-    { time: "16:00", temperature: 29, humidity: 70, air: 18 },
-    { time: "18:00", temperature: 24, humidity: 66, air: 18 },
-    { time: "20:00", temperature: 27, humidity: 56, air: 13 },
-    { time: "22:00", temperature: 28, humidity: 60, air: 14 },
-    { time: "00:00", temperature: 30, humidity: 72, air: 18 },
-    { time: "02:00", temperature: 29, humidity: 74, air: 19 },
-    { time: "04:00", temperature: 32, humidity: 66, air: 21 },
-    { time: "06:00", temperature: 34, humidity: 70, air: 18 },
-    { time: "08:00", temperature: 31, humidity: 76, air: 13 },
-    { time: "10:00", temperature: 25, humidity: 68, air: 15 },
-    { time: "12:00", temperature: 28, humidity: 69, air: 18 }
-];
-
-// mockAlertLogs: 当前后端没有报警日志接口，报警日志表格暂时使用前端 mock 数据。
-const mockAlertLogs = [
-    { time: "13:58:21", type: "空气质量异常", content: "AQI 132，超过阈值 (100)", level: "warning", status: "未处理" },
-    { time: "13:55:10", type: "湿度偏高", content: "湿度 78%，超过阈值 (75%)", level: "warning", status: "未处理" },
-    { time: "13:50:02", type: "ESP 离线", content: "超过 10 秒未收到心跳", level: "danger", status: "已恢复" },
-    { time: "13:45:30", type: "温度偏高", content: "温度 36.2°C，超过阈值 (35°C)", level: "warning", status: "已恢复" }
-];
-
-const mockSystemLogs = [
-    { time: "13:58:24", text: "系统运行正常，等待最新设备数据", color: "#2874ff", source: "mock" },
-    { time: "13:58:20", text: "数据上传通道已就绪", color: "#10b981", source: "mock" },
-    { time: "13:58:10", text: "设备连接状态监测中", color: "#7c3aed", source: "mock" }
-];
-
-const SMART_HOME_UNAVAILABLE_MESSAGE = "当前服务暂未提供智能家居状态接口。";
-const SMART_HOME_DEVICES = [
-    { id: "air_conditioner", name: "空调", icon: "air-conditioner" },
-    { id: "fan", name: "风扇", icon: "fan" },
-    { id: "door", name: "门", icon: "door" },
-    { id: "light", name: "灯", icon: "light" },
-    { id: "air_purifier", name: "空气净化器", icon: "air-purifier" },
-    { id: "humidifier", name: "加湿器", icon: "humidifier" }
-];
-
-// 智能家居控制：集中维护前端设备配置；当前没有真实接口时全部置为 disabled。
-function createSmartHomeDeviceState() {
-    return SMART_HOME_DEVICES.map(device => ({
-        ...device,
-        status: null,
-        disabled: true,
-        loading: false,
-        unavailableReason: SMART_HOME_UNAVAILABLE_MESSAGE
-    }));
-}
+const SMART_HOME_UNAVAILABLE_MESSAGE = "智能家居状态未接入。";
+const FEATURE_IN_PROGRESS_MESSAGE = "功能开发中";
 
 let dashboardState = {
-    sensor: mockSensorData,
-    asr: mockASRData,
-    llm: mockLLMData,
-    metrics: {},
-    history: mockHistoryData,
-    alertLogs: mockAlertLogs,
-    systemLogs: mockSystemLogs,
+    sensor: null,
+    deviceStatus: null,
+    asr: null,
+    llm: null,
+    metrics: createEmptyMetrics(),
+    history: [],
+    alertLogs: [],
+    systemLogs: [],
     commandLogs: [],
     operationLogs: [],
-    smartHomeDevices: createSmartHomeDeviceState(),
+    smartHomeDevices: null,
     sources: {
-        sensor: "mock",
-        asr: "mock",
-        llm: "mock"
+        sensor: "idle",
+        deviceStatus: "idle",
+        asr: "idle",
+        llm: "idle",
+        history: "idle",
+        alerts: "idle",
+        logs: "idle",
+        commands: "idle"
     }
 };
 
 let lastSourceSignature = "";
 const THEME_STORAGE_KEY = "dashboardTheme";
-const ESP_ONLINE_THRESHOLD_MS = 10000;
 const DASHBOARD_REFRESH_INTERVAL_MS = 3000;
 const ESP_DELAY_REFRESH_INTERVAL_MS = 1000;
 const CHART_RANGE_OPTIONS = [12, 24, 36, 48];
@@ -143,14 +89,13 @@ let espDelayRefreshTimer = null;
 let selectedChartRangeHours = DEFAULT_CHART_RANGE_HOURS;
 let activeLogModalType = null;
 let pendingConfirmAction = null;
-let pendingSmartHomeAction = null;
 let activeDashboardPage = "c51";
 let s3DashboardRendered = false;
 
 // 主题功能：读取 CSS 主题变量，Canvas 图表调用它来适配黑色/白色背景。
-function readThemeColor(name, fallback) {
+function readThemeColor(name, defaultColor) {
     const value = getComputedStyle(document.body).getPropertyValue(name).trim();
-    return value || fallback;
+    return value || defaultColor;
 }
 
 // 主题功能：更新黑白切换按钮文字；dark 显示“白色模式”，light 显示“黑色模式”。
@@ -197,8 +142,68 @@ function hasData(value) {
     return isPlainObject(value) && Object.keys(value).length > 0;
 }
 
-function formatTime(timestamp = Date.now()) {
-    const date = parseTimestamp(timestamp) || new Date();
+function createEmptyMetric(label, unit = "") {
+    return {
+        value: null,
+        display: NO_DATA_TEXT,
+        level: "unknown",
+        label,
+        unit,
+        source: "empty"
+    };
+}
+
+function createEmptyMetrics(status = UNKNOWN_TEXT, note = EMPTY_TEXT) {
+    const esp = {
+        value: status,
+        latency: null,
+        level: "unknown",
+        note,
+        source: "empty"
+    };
+    return {
+        temperature: createEmptyMetric("温度", "°C"),
+        humidity: createEmptyMetric("湿度", "%"),
+        air: createEmptyMetric("空气质量", ""),
+        esp,
+        overall: "unknown"
+    };
+}
+
+function getActiveDeviceId() {
+    return DEVICE_IDS[activeDashboardPage] || DEVICE_IDS.c51;
+}
+
+function buildUrl(path, params = {}) {
+    const url = new URL(path, window.location.origin);
+    Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined && value !== null && value !== "") {
+            url.searchParams.set(key, value);
+        }
+    });
+    return `${url.pathname}${url.search}`;
+}
+
+function unwrapEnvelope(payload) {
+    if (payload && typeof payload === "object" && "data" in payload && "ok" in payload) {
+        return payload.data;
+    }
+    return payload;
+}
+
+function readListPayload(payload, keys = []) {
+    const data = unwrapEnvelope(payload);
+    if (Array.isArray(data)) return data;
+    if (!isPlainObject(data)) return [];
+    for (const key of keys) {
+        if (Array.isArray(data[key])) return data[key];
+    }
+    return [];
+}
+
+function formatTime(timestamp) {
+    const date = parseTimestamp(timestamp);
+    if (!date) return EMPTY_TEXT;
     return date.toLocaleTimeString("zh-CN", {
         hour12: false,
         hour: "2-digit",
@@ -210,7 +215,7 @@ function formatTime(timestamp = Date.now()) {
 // 曲线时间范围：格式化横轴标签，36/48 小时时显示日期，避免跨天数据看不清。
 function formatChartTime(timestamp) {
     const date = parseTimestamp(timestamp);
-    if (!date) return "--";
+    if (!date) return EMPTY_TEXT;
 
     const options = selectedChartRangeHours > 24
         ? { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }
@@ -252,6 +257,27 @@ function toNumber(value) {
     return Number.isFinite(numeric) ? numeric : null;
 }
 
+function sourceLabel(source) {
+    if (source === "real") return "来源：后端真实数据";
+    if (source === "loading") return LOADING_TEXT;
+    if (source === "error") return ERROR_TEXT;
+    if (source === "not-integrated") return "未接入";
+    return DISCONNECTED_TEXT;
+}
+
+function getHistoryValues(field) {
+    if (!field) return [];
+    return (dashboardState.history || [])
+        .map(point => normalizeHistoryPoint(point))
+        .filter(Boolean)
+        .map(point => toNumber(point[field]))
+        .filter(value => value !== null);
+}
+
+function hasHistoryValues(field) {
+    return getHistoryValues(field).length > 0;
+}
+
 // 日志弹窗：所有日志内容写入 HTML 前先转义，防止日志文本破坏页面结构。
 function escapeHtml(value) {
     return String(value ?? "")
@@ -265,7 +291,7 @@ function escapeHtml(value) {
 function formatNumber(value, digits = 1) {
     const numeric = toNumber(value);
     if (numeric === null) {
-        return "--";
+        return NO_DATA_TEXT;
     }
     return Number(numeric.toFixed(digits)).toString();
 }
@@ -298,15 +324,11 @@ function normalizeHistoryPoint(point) {
 
     const temperature = toNumber(pickFirst(point, ["temperature", "temp"]));
     const humidity = toNumber(pickFirst(point, ["humidity"]));
+    const pressure = toNumber(pickFirst(point, ["pressure"]));
     const airQualityObject = isPlainObject(point.air_quality) ? point.air_quality : {};
-    const air = toNumber(pickFirst(point, [
-        "air_quality_score",
-        "aqi",
-        "air_quality",
-        "air"
-    ])) ?? toNumber(pickFirst(airQualityObject, ["air_quality_score", "score", "aqi"]));
+    const airScore = toNumber(point.air_quality_score) ?? toNumber(airQualityObject.air_quality_score);
 
-    if (temperature === null && humidity === null && air === null) {
+    if (temperature === null && humidity === null && pressure === null && airScore === null) {
         return null;
     }
 
@@ -315,11 +337,12 @@ function normalizeHistoryPoint(point) {
         time: formatChartTime(timestamp),
         temperature,
         humidity,
-        air
+        pressure,
+        air: airScore,
+        air_quality_score: airScore
     };
 }
 
-// 曲线时间范围：将 /sensor/latest 的最新真实数据作为当前点，不新增接口也不修改数据来源。
 function getLatestSensorChartPoint() {
     const sensor = dashboardState.sensor;
     if (!sensor || sensor.source !== "real" || !sensor.timestamp) return null;
@@ -329,7 +352,9 @@ function getLatestSensorChartPoint() {
         time: formatChartTime(sensor.timestamp),
         temperature: toNumber(sensor.temperature),
         humidity: toNumber(sensor.humidity),
-        air: toNumber(sensor.airValue)
+        pressure: toNumber(sensor.pressure),
+        air: toNumber(sensor.airQualityScore),
+        air_quality_score: toNumber(sensor.airQualityScore)
     };
 }
 
@@ -438,7 +463,7 @@ function initChartRangeSelector() {
 function formatDelayText(prefix, delayMs, options = {}) {
     const numeric = toNumber(delayMs);
     if (numeric === null) {
-        return `${prefix} --`;
+        return `${prefix} ${NO_DATA_TEXT}`;
     }
 
     const decimalSeconds = options.decimalSeconds !== false;
@@ -466,83 +491,126 @@ function getSensorDelayMs(sensor) {
     return Math.max(0, Date.now() - sensor.timestamp.getTime());
 }
 
-function cloneMockData(mockData) {
-    return {
-        ...mockData,
-        timestamp: Date.now()
-    };
-}
-
-async function readEndpointResponse(response, mockData, label) {
+async function fetchJson(path, options = {}) {
+    const response = await fetch(path, { cache: "no-store", ...options });
     if (!response.ok) {
         throw new Error(`${response.url} ${response.status}`);
     }
-
-    const data = await response.json();
-    if (hasData(data)) {
-        return { data, source: "real" };
-    }
-
-    console.warn(`[Dashboard] ${label}: mock fallback because API returned empty data`);
-    return { data: cloneMockData(mockData), source: "mock" };
+    return response.json();
 }
 
-function readEndpointFallback(error, mockData, label) {
-    console.warn(`[Dashboard] ${label}: mock fallback`, error.message);
-    return { data: cloneMockData(mockData), source: "mock" };
-}
-
-async function fetchLatestSensor() {
+async function readEndpoint(path, label, options = {}) {
     try {
-        const response = await fetch("/sensor/latest", { cache: "no-store" });
-        return readEndpointResponse(response, mockSensorData, "Sensor");
+        const raw = await fetchJson(path, options);
+        const data = unwrapEnvelope(raw);
+        const empty = data === null ||
+            data === undefined ||
+            (Array.isArray(data) && data.length === 0) ||
+            (isPlainObject(data) && Object.keys(data).length === 0);
+        return {
+            ok: true,
+            data,
+            source: empty ? "empty" : "real",
+            empty,
+            error: null
+        };
     } catch (error) {
-        return readEndpointFallback(error, mockSensorData, "Sensor");
+        console.warn(`[Dashboard] ${label}: request failed`, error.message);
+        return {
+            ok: false,
+            data: null,
+            source: "error",
+            empty: true,
+            error
+        };
     }
+}
+
+async function fetchLatestSensor(deviceId = getActiveDeviceId()) {
+    return readEndpoint(
+        buildUrl("/api/dashboard/v1/sensors/latest", { device_id: deviceId }),
+        `Sensor ${deviceId}`
+    );
+}
+
+async function fetchDeviceStatus(deviceId = getActiveDeviceId()) {
+    return readEndpoint(
+        buildUrl("/api/dashboard/v1/device/status", { device_id: deviceId }),
+        `Device status ${deviceId}`
+    );
 }
 
 async function fetchLatestASR() {
-    try {
-        const response = await fetch("/asr/latest", { cache: "no-store" });
-        return readEndpointResponse(response, mockASRData, "ASR");
-    } catch (error) {
-        return readEndpointFallback(error, mockASRData, "ASR");
-    }
+    return readEndpoint("/api/dashboard/v1/asr/latest", "ASR");
 }
 
 async function fetchLatestLLM() {
-    try {
-        const response = await fetch("/llm/latest", { cache: "no-store" });
-        return readEndpointResponse(response, mockLLMData, "LLM");
-    } catch (error) {
-        return readEndpointFallback(error, mockLLMData, "LLM");
-    }
+    return readEndpoint("/api/dashboard/v1/llm/latest", "LLM");
 }
 
-async function fetchHistoryData() {
-    // 当前后端没有历史数据接口，保留 mockHistoryData 作为曲线占位。
-    return mockHistoryData;
+async function fetchHistoryData(deviceId = getActiveDeviceId()) {
+    const result = await readEndpoint(
+        buildUrl("/api/dashboard/v1/sensors/history", {
+            device_id: deviceId,
+            limit: 500
+        }),
+        `History ${deviceId}`
+    );
+    return {
+        ...result,
+        data: Array.isArray(result.data) ? result.data : []
+    };
 }
 
-async function fetchAlertLogs() {
-    // 当前后端没有报警日志接口，保留 mockAlertLogs 作为表格占位。
-    return mockAlertLogs;
+async function fetchAlertLogs(deviceId = getActiveDeviceId()) {
+    const result = await readEndpoint(
+        buildUrl("/api/emergency/events", {
+            device_id: deviceId,
+            limit: 20
+        }),
+        `Emergency events ${deviceId}`
+    );
+    return {
+        ...result,
+        data: readListPayload(result.data, ["events"])
+    };
 }
 
 async function fetchSystemLogs() {
-    return mockSystemLogs;
+    return {
+        ok: true,
+        data: null,
+        source: "not-integrated",
+        empty: true,
+        error: null
+    };
+}
+
+async function fetchCommandLogs(deviceId = getActiveDeviceId()) {
+    const result = await readEndpoint(
+        buildUrl("/api/commands/history", {
+            device_id: deviceId,
+            limit: 20
+        }),
+        `Commands ${deviceId}`
+    );
+    return {
+        ...result,
+        data: readListPayload(result.data, ["commands"])
+    };
 }
 
 function normalizeSensor(rawSensor, source) {
-    const temperature = toNumber(pickFirst(rawSensor, ["temperature", "temp"]));
-    const humidity = toNumber(pickFirst(rawSensor, ["humidity"]));
-    const pressure = toNumber(pickFirst(rawSensor, ["pressure"]));
-    const airQualityObject = isPlainObject(rawSensor?.air_quality) ? rawSensor.air_quality : {};
-    const aqi = toNumber(pickFirst(rawSensor, [
-        "air_quality_score",
-        "aqi",
-        "air_quality"
-    ])) ?? toNumber(pickFirst(airQualityObject, ["air_quality_score", "score", "aqi"]));
+    const sensor = isPlainObject(rawSensor) ? rawSensor : {};
+    const temperature = toNumber(pickFirst(sensor, ["temperature", "temp"]));
+    const humidity = toNumber(pickFirst(sensor, ["humidity"]));
+    const pressure = toNumber(pickFirst(sensor, ["pressure"]));
+    const airQualityObject = isPlainObject(sensor.air_quality) ? sensor.air_quality : {};
+    const airQualityScore = toNumber(sensor.air_quality_score) ?? toNumber(airQualityObject.air_quality_score);
+    const airQualityLevel = pickFirst(sensor, [
+        "air_quality_level",
+        "air_quality_label"
+    ]) ?? pickFirst(airQualityObject, ["air_quality_level", "level", "label"]);
     const timestampValue = pickFirst(rawSensor, [
         "timestamp",
         "created_at",
@@ -559,33 +627,60 @@ function normalizeSensor(rawSensor, source) {
     ]);
     const timestamp = parseTimestamp(timestampValue);
 
-    let airValue = aqi;
-    let airMode = "aqi";
-    let airLabel = "空气质量";
-    let airUnit = "AQI";
+    return {
+        raw: sensor,
+        source,
+        device_id: sensor.device_id || getActiveDeviceId(),
+        temperature,
+        humidity,
+        pressure,
+        airQualityScore,
+        airQualityLevel: airQualityLevel ? String(airQualityLevel) : "",
+        online: typeof sensor.online === "boolean" ? sensor.online : null,
+        lastSeenMs: toNumber(pickFirst(sensor, ["last_seen_ms", "lastSeenMs"])),
+        lastSeenAgeMs: toNumber(pickFirst(sensor, ["last_seen_age_ms", "lastSeenAgeMs"])),
+        latestUploadDelayMs: toNumber(pickFirst(sensor, ["latest_upload_delay_ms", "upload_delay_ms"])),
+        timestamp,
+        hasTimestamp: Boolean(timestamp)
+    };
+}
 
-    if (airValue === null) {
-        airValue = metricDefinitions.air.mockValue;
-        airMode = "mock-aqi";
-    }
+function normalizeDeviceStatus(rawStatus, source) {
+    const status = isPlainObject(rawStatus) ? rawStatus : {};
+    const online = typeof status.online === "boolean"
+        ? status.online
+        : (typeof status.device_online === "boolean" ? status.device_online : null);
+    const lastSeenMs = toNumber(pickFirst(status, ["last_seen_ms", "lastSeenMs"]));
+    const lastSeenAgeMs = toNumber(pickFirst(status, ["last_seen_age_ms", "lastSeenAgeMs"]));
+    const latestUploadDelayMs = toNumber(pickFirst(status, ["latest_upload_delay_ms", "upload_delay_ms"]));
 
     return {
-        raw: rawSensor,
+        raw: status,
         source,
-        temperature: temperature ?? metricDefinitions.temperature.mockValue,
-        humidity: humidity ?? metricDefinitions.humidity.mockValue,
-        pressure,
-        airValue,
-        airMode,
-        airLabel,
-        airUnit,
-        timestamp,
-        hasTimestamp: Boolean(timestamp),
-        usedMockFields: {
-            temperature: temperature === null,
-            humidity: humidity === null,
-            air: aqi === null
-        }
+        device_id: status.device_id || getActiveDeviceId(),
+        online,
+        lastSeenMs,
+        lastSeenAgeMs,
+        latestUploadDelayMs,
+        lastSeenIso: status.last_seen_iso || "",
+        timeSynced: typeof status.time_synced === "boolean" ? status.time_synced : null
+    };
+}
+
+function normalizeAlertLog(event) {
+    const payload = isPlainObject(event?.payload) ? event.payload : {};
+    const severity = String(event?.severity || "").toLowerCase();
+    const status = String(event?.status || "");
+    const level = severity === "critical"
+        ? "danger"
+        : (severity === "warning" ? "warning" : "normal");
+
+    return {
+        type: event?.event_type || payload.type || "报警",
+        time: formatTime(event?.created_at || event?.updated_at),
+        content: payload.summary || payload.message || event?.local_action || event?.event_id || "",
+        status: status === "resolved" ? "已恢复" : (status || "未处理"),
+        level
     };
 }
 
@@ -607,23 +702,36 @@ function getAirLevel(value) {
     return "normal";
 }
 
-function getEspStatus(sensor) {
-    const ageMs = getSensorDelayMs(sensor);
-    if (ageMs === null) {
+function getEspStatus(deviceStatus) {
+    if (!deviceStatus) {
         return {
-            value: "--",
+            value: UNKNOWN_TEXT,
             latency: null,
-            level: "warning",
-            note: "延迟 --"
+            level: "unknown",
+            note: EMPTY_TEXT
         };
     }
 
-    const isOnline = ageMs <= ESP_ONLINE_THRESHOLD_MS;
+    if (typeof deviceStatus.online !== "boolean") {
+        return {
+            value: UNKNOWN_TEXT,
+            latency: deviceStatus.latestUploadDelayMs ?? null,
+            level: "unknown",
+            note: "状态未知"
+        };
+    }
+
+    const ageMs = deviceStatus.lastSeenAgeMs ?? deviceStatus.latestUploadDelayMs;
+    const note = deviceStatus.online
+        ? (ageMs === null ? "在线" : formatDelayText("延迟", ageMs))
+        : (ageMs === null ? OFFLINE_TEXT : formatDelayText(OFFLINE_TEXT, ageMs, { decimalSeconds: false }));
+
     return {
-        value: isOnline ? "在线" : "离线",
+        value: deviceStatus.online ? "在线" : OFFLINE_TEXT,
         latency: ageMs,
-        level: isOnline ? "normal" : "danger",
-        note: isOnline ? formatDelayText("延迟", ageMs) : formatDelayText("离线", ageMs, { decimalSeconds: false })
+        level: deviceStatus.online ? "normal" : "danger",
+        note,
+        source: deviceStatus.source
     };
 }
 
@@ -631,42 +739,122 @@ function getOverallLevel(metrics) {
     const levels = [metrics.temperature.level, metrics.humidity.level, metrics.air.level, metrics.esp.level];
     if (levels.includes("danger")) return "danger";
     if (levels.includes("warning")) return "warning";
+    if (levels.includes("unknown")) return "unknown";
     return "normal";
 }
 
-function buildMetrics(sensor) {
-    const esp = getEspStatus(sensor);
+function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
+    if (!sensor) {
+        const metrics = createEmptyMetrics(UNKNOWN_TEXT, DISCONNECTED_TEXT);
+        metrics.esp = getEspStatus(deviceStatus);
+        metrics.overall = getOverallLevel(metrics);
+        return metrics;
+    }
+    const esp = getEspStatus(deviceStatus);
+    const temperatureLevel = sensor.temperature === null ? "unknown" : getTemperatureLevel(sensor.temperature);
+    const humidityLevel = sensor.humidity === null ? "unknown" : getHumidityLevel(sensor.humidity);
+    const airLevel = sensor.airQualityScore === null ? "unknown" : "normal";
+    const airDisplay = sensor.airQualityScore === null
+        ? DISCONNECTED_TEXT
+        : `${formatNumber(sensor.airQualityScore, 0)} 分${sensor.airQualityLevel ? ` · ${sensor.airQualityLevel}` : ""}`;
 
     return {
         temperature: {
             value: sensor.temperature,
             display: formatNumber(sensor.temperature),
-            level: getTemperatureLevel(sensor.temperature),
-            source: sensor.usedMockFields.temperature ? "mock" : sensor.source
+            level: temperatureLevel,
+            source: sensor.temperature === null ? "empty" : sensor.source,
+            label: "温度",
+            unit: "°C"
         },
         humidity: {
             value: sensor.humidity,
             display: formatNumber(sensor.humidity),
-            level: getHumidityLevel(sensor.humidity),
-            source: sensor.usedMockFields.humidity ? "mock" : sensor.source
+            level: humidityLevel,
+            source: sensor.humidity === null ? "empty" : sensor.source,
+            label: "湿度",
+            unit: "%"
         },
         air: {
-            value: sensor.airValue,
-            display: formatNumber(sensor.airValue, 0),
-            level: getAirLevel(sensor.airValue, sensor.airMode),
-            mode: sensor.airMode,
-            label: sensor.airLabel,
-            unit: sensor.airUnit,
-            source: sensor.usedMockFields.air ? "mock" : sensor.source
+            value: sensor.airQualityScore,
+            display: airDisplay,
+            level: airLevel,
+            label: "空气质量",
+            unit: "",
+            source: sensor.airQualityScore === null ? "empty" : sensor.source
         },
         esp,
         overall: getOverallLevel({
-            temperature: { level: getTemperatureLevel(sensor.temperature) },
-            humidity: { level: getHumidityLevel(sensor.humidity) },
-            air: { level: getAirLevel(sensor.airValue, sensor.airMode) },
+            temperature: { level: temperatureLevel },
+            humidity: { level: humidityLevel },
+            air: { level: airLevel },
             esp
         })
     };
+}
+
+function metricDisplay(metric) {
+    if (!metric) {
+        return NO_DATA_TEXT;
+    }
+    if (metric.source === "loading") {
+        return LOADING_TEXT;
+    }
+    if (metric.source === "error") {
+        return ERROR_TEXT;
+    }
+    if (metric.value === null || metric.value === undefined) {
+        return DISCONNECTED_TEXT;
+    }
+    return `${metric.display}${metric.unit ? ` ${metric.unit}` : ""}`;
+}
+
+function createLoadingMetrics() {
+    const metrics = createEmptyMetrics(UNKNOWN_TEXT, LOADING_TEXT);
+    Object.values(metrics).forEach(metric => {
+        if (metric && typeof metric === "object") {
+            metric.display = LOADING_TEXT;
+            metric.source = "loading";
+        }
+    });
+    metrics.esp.value = UNKNOWN_TEXT;
+    metrics.esp.note = LOADING_TEXT;
+    metrics.overall = "unknown";
+    return metrics;
+}
+
+function setDashboardLoadingState(deviceId) {
+    dashboardState.sensor = null;
+    dashboardState.deviceStatus = null;
+    dashboardState.asr = null;
+    dashboardState.llm = null;
+    dashboardState.metrics = createLoadingMetrics();
+    dashboardState.history = [];
+    dashboardState.alertLogs = [];
+    dashboardState.systemLogs = [];
+    dashboardState.operationLogs = [];
+    dashboardState.sources = {
+        sensor: "loading",
+        deviceStatus: "loading",
+        asr: "loading",
+        llm: "loading",
+        history: "loading",
+        alerts: "loading",
+        logs: "loading",
+        commands: "loading"
+    };
+    renderMetricCards();
+    renderMainChart();
+    renderAlertSummary();
+    renderAlertLogs();
+    renderSystemLogs();
+    renderOperationLogs();
+    renderStatusHeader();
+    renderSourceDebug();
+    const deviceNameElement = document.querySelector("[data-active-device-name]");
+    if (deviceNameElement) {
+        deviceNameElement.textContent = deviceId || UNKNOWN_TEXT;
+    }
 }
 
 function iconSvg(name) {
@@ -719,7 +907,7 @@ function setStateBadge(selector, levelKey) {
     const element = document.querySelector(selector);
     if (!element) return;
 
-    const level = LEVELS[levelKey] || LEVELS.normal;
+    const level = LEVELS[levelKey] || { label: UNKNOWN_TEXT, className: "unknown" };
     element.textContent = level.label;
     element.className = `state-badge state-${level.className}`;
 }
@@ -740,18 +928,54 @@ function setMetricChange(selector, text, levelKey = "normal") {
     element.className = `metric-change ${levelKey === "normal" ? "" : levelKey}`;
 }
 
+function setStatusDot(element, level) {
+    if (!element) return;
+    element.className = `status-dot ${level === "normal" ? "online" : ""}`;
+}
+
+function renderDeviceChrome() {
+    const metrics = dashboardState.metrics || createEmptyMetrics();
+    const deviceId = getActiveDeviceId();
+    const statusText = metrics.esp?.value || UNKNOWN_TEXT;
+    const statusLevel = metrics.esp?.level || "unknown";
+    const label = `设备${statusText}`;
+
+    document.querySelectorAll("[data-active-device-name]").forEach(element => {
+        element.textContent = deviceId;
+    });
+    document.querySelectorAll("[data-device-status-text]").forEach(element => {
+        element.textContent = statusText;
+    });
+    document.querySelectorAll("[data-top-status-label]").forEach(element => {
+        element.textContent = label;
+    });
+    document.querySelectorAll("[data-sidebar-status-label]").forEach(element => {
+        element.textContent = label;
+    });
+    document.querySelectorAll("[data-top-status-dot], [data-sidebar-status-dot], [data-device-status-dot]").forEach(element => {
+        setStatusDot(element, statusLevel);
+    });
+}
+
 function renderMetricCards() {
     Object.entries(metricDefinitions).forEach(([key, definition]) => {
         const icon = document.querySelector(`[data-metric-icon="${key}"]`);
         const sparkline = document.querySelector(`[data-sparkline="${key}"]`);
         if (icon) icon.innerHTML = iconSvg(definition.icon);
-        if (sparkline) sparkline.innerHTML = createSparkline(definition.trend, definition.accent);
+        if (sparkline) {
+            const values = getHistoryValues(definition.historyField);
+            sparkline.innerHTML = values.length > 1
+                ? createSparkline(values, definition.accent)
+                : '<span class="sparkline-empty">暂无数据</span>';
+        }
     });
 
     const metrics = dashboardState.metrics;
-    setText("#temperatureValue", metrics.temperature.display);
-    setText("#humidityValue", metrics.humidity.display);
-    setText("#airQualityValue", metrics.air.display);
+    setText("#temperatureValue", metrics.temperature.display || NO_DATA_TEXT);
+    setText("#humidityValue", metrics.humidity.display || NO_DATA_TEXT);
+    setText("#airQualityValue", metrics.air.display || NO_DATA_TEXT);
+    setText('[data-field="temperatureUnit"]', metrics.temperature.value === null || metrics.temperature.source === "loading" || metrics.temperature.source === "error" ? "" : metrics.temperature.unit);
+    setText('[data-field="humidityUnit"]', metrics.humidity.value === null || metrics.humidity.source === "loading" || metrics.humidity.source === "error" ? "" : metrics.humidity.unit);
     setText("#airQualityLabel", metrics.air.label);
     setText("#airQualityUnit", metrics.air.unit);
     setText("#espStatusValue", metrics.esp.value);
@@ -761,23 +985,25 @@ function renderMetricCards() {
     clearStateBadge('[data-field="airStatus"]');
     setStateBadge('[data-field="espStatusBadge"]', metrics.esp.level);
 
-    setMetricChange('[data-field="temperatureChange"]', `来源：${metrics.temperature.source}`, metrics.temperature.level);
-    setMetricChange('[data-field="humidityChange"]', `来源：${metrics.humidity.source}`, metrics.humidity.level);
-    setMetricChange('[data-field="airChange"]', `来源：${metrics.air.source}`, "normal");
+    setMetricChange('[data-field="temperatureChange"]', sourceLabel(metrics.temperature.source), metrics.temperature.level);
+    setMetricChange('[data-field="humidityChange"]', sourceLabel(metrics.humidity.source), metrics.humidity.level);
+    setMetricChange('[data-field="airChange"]', sourceLabel(metrics.air.source), metrics.air.level);
     setMetricChange('[data-field="espLatency"]', metrics.esp.note, metrics.esp.level);
+    renderDeviceChrome();
 }
 
-// ESP 延迟显示：每秒用最新 sensor.timestamp 重新计算数据新鲜度，不新增接口请求。
+// ESP 延迟显示：设备在线状态只来自 device/status，这里只刷新已获取的状态展示。
 function refreshEspDelayDisplay() {
-    if (!dashboardState.sensor) return;
+    if (!dashboardState.deviceStatus) return;
     if (!dashboardState.metrics.temperature || !dashboardState.metrics.humidity || !dashboardState.metrics.air) return;
 
-    dashboardState.metrics.esp = getEspStatus(dashboardState.sensor);
+    dashboardState.metrics.esp = getEspStatus(dashboardState.deviceStatus);
     dashboardState.metrics.overall = getOverallLevel(dashboardState.metrics);
 
     setText("#espStatusValue", dashboardState.metrics.esp.value);
     setStateBadge('[data-field="espStatusBadge"]', dashboardState.metrics.esp.level);
     setMetricChange('[data-field="espLatency"]', dashboardState.metrics.esp.note, dashboardState.metrics.esp.level);
+    renderDeviceChrome();
 }
 
 function renderMainChart() {
@@ -795,17 +1021,41 @@ function renderMainChart() {
     const padding = { top: 22, right: 26, bottom: 42, left: 52 };
     const width = rect.width - padding.left - padding.right;
     const height = rect.height - padding.top - padding.bottom;
-    const yMax = 100;
     const data = getFilteredChartData();
-    // 主题功能：Canvas 不能自动继承 CSS 颜色，所以每次绘图时读取当前黑白主题变量。
     const chartColors = {
         grid: readThemeColor("--chart-grid", "#dfe7f3"),
         label: readThemeColor("--chart-label", "#33537f"),
         axisLabel: readThemeColor("--chart-axis-label", "#1f3b68"),
         temperature: readThemeColor("--chart-temperature", "#2266f3"),
         humidity: readThemeColor("--chart-humidity", "#10b981"),
+        pressure: readThemeColor("--orange", "#f97316"),
         air: readThemeColor("--chart-air", "#7c3aed")
     };
+    const chartFields = [
+        { field: "temperature", color: chartColors.temperature },
+        { field: "humidity", color: chartColors.humidity },
+        { field: "pressure", color: chartColors.pressure }
+    ];
+    if (hasHistoryValues("air")) {
+        chartFields.push({ field: "air", color: chartColors.air });
+    }
+    const allValues = data.flatMap(point => chartFields
+        .map(item => toNumber(point[item.field]))
+        .filter(value => value !== null));
+    if (data.length === 0 || allValues.length === 0) {
+        context.fillStyle = chartColors.axisLabel;
+        context.font = "15px Avenir Next, PingFang SC, sans-serif";
+        context.textAlign = "center";
+        context.fillText("暂无数据", rect.width / 2, padding.top + height / 2);
+        context.textAlign = "left";
+        return;
+    }
+
+    const rawMin = Math.min(...allValues);
+    const rawMax = Math.max(...allValues);
+    const valueRange = rawMax - rawMin || 1;
+    const yMin = Math.max(0, rawMin - valueRange * 0.08);
+    const yMax = rawMax + valueRange * 0.08;
 
     context.strokeStyle = chartColors.grid;
     context.lineWidth = 1;
@@ -813,29 +1063,21 @@ function renderMainChart() {
     context.font = "13px Avenir Next, PingFang SC, sans-serif";
     context.fillStyle = chartColors.label;
 
-    [0, 25, 50, 75, 100].forEach(value => {
-        const y = padding.top + height - (value / yMax) * height;
+    [0, 0.25, 0.5, 0.75, 1].forEach(ratioValue => {
+        const value = yMin + (yMax - yMin) * ratioValue;
+        const y = padding.top + height - ratioValue * height;
         context.beginPath();
         context.moveTo(padding.left, y);
         context.lineTo(padding.left + width, y);
         context.stroke();
-        context.fillText(String(value), 18, y + 4);
+        context.fillText(formatNumber(value, value >= 1000 ? 0 : 1), 18, y + 4);
     });
 
     context.setLineDash([]);
-    if (data.length === 0) {
-        context.fillStyle = chartColors.axisLabel;
-        context.font = "15px Avenir Next, PingFang SC, sans-serif";
-        context.textAlign = "center";
-        context.fillText("暂无真实时间戳数据", rect.width / 2, padding.top + height / 2);
-        context.textAlign = "left";
-        return;
-    }
-
     const xFor = index => data.length === 1
         ? padding.left + width / 2
         : padding.left + (index / (data.length - 1)) * width;
-    const yFor = value => padding.top + height - (Math.max(0, Math.min(yMax, value)) / yMax) * height;
+    const yFor = value => padding.top + height - ((Math.max(yMin, Math.min(yMax, value)) - yMin) / (yMax - yMin)) * height;
 
     const drawLine = (field, color) => {
         const drawablePoints = data
@@ -869,9 +1111,7 @@ function renderMainChart() {
         });
     };
 
-    drawLine("temperature", chartColors.temperature);
-    drawLine("humidity", chartColors.humidity);
-    drawLine("air", chartColors.air);
+    chartFields.forEach(item => drawLine(item.field, item.color));
 
     context.fillStyle = chartColors.axisLabel;
     data.forEach((point, index) => {
@@ -881,63 +1121,16 @@ function renderMainChart() {
     });
 }
 
-function buildDynamicAlertLogs(metrics) {
-    const alerts = [];
-    const now = formatTime();
-
-    if (metrics.temperature.level !== "normal") {
-        alerts.push({
-            time: now,
-            type: "温度异常",
-            content: `温度 ${metrics.temperature.display}°C，状态 ${LEVELS[metrics.temperature.level].label}`,
-            level: metrics.temperature.level,
-            status: "未处理"
-        });
-    }
-
-    if (metrics.humidity.level !== "normal") {
-        alerts.push({
-            time: now,
-            type: "湿度异常",
-            content: `湿度 ${metrics.humidity.display}%，状态 ${LEVELS[metrics.humidity.level].label}`,
-            level: metrics.humidity.level,
-            status: "未处理"
-        });
-    }
-
-    if (metrics.air.level !== "normal") {
-        alerts.push({
-            time: now,
-            type: "空气质量异常",
-            content: `${metrics.air.label} ${metrics.air.display}${metrics.air.unit || ""}，状态 ${LEVELS[metrics.air.level].label}`,
-            level: metrics.air.level,
-            status: "未处理"
-        });
-    }
-
-    if (metrics.esp.level !== "normal") {
-        alerts.push({
-            time: now,
-            type: "ESP 异常",
-            content: `ESP 状态 ${metrics.esp.value}，${metrics.esp.note}`,
-            level: metrics.esp.level,
-            status: "未处理"
-        });
-    }
-
-    return alerts;
-}
-
 function renderAlertSummary() {
     const container = document.querySelector("[data-alert-summary]");
     if (!container) return;
 
     const rows = [
-        { label: "温度", value: `${dashboardState.metrics.temperature.display}°C`, key: "temperature", icon: "thermometer" },
-        { label: "湿度", value: `${dashboardState.metrics.humidity.display}%`, key: "humidity", icon: "drop" },
+        { label: "温度", value: metricDisplay(dashboardState.metrics.temperature), key: "temperature", icon: "thermometer" },
+        { label: "湿度", value: metricDisplay(dashboardState.metrics.humidity), key: "humidity", icon: "drop" },
         {
             label: dashboardState.metrics.air.label,
-            value: `${dashboardState.metrics.air.display}${dashboardState.metrics.air.unit ? ` ${dashboardState.metrics.air.unit}` : dashboardState.metrics.air.mode === "aqi" || dashboardState.metrics.air.mode === "mock-aqi" ? " (AQI)" : ""}`,
+            value: metricDisplay(dashboardState.metrics.air),
             key: "air",
             icon: "cloud"
         },
@@ -946,7 +1139,7 @@ function renderAlertSummary() {
 
     container.innerHTML = rows.map(row => {
         const metric = dashboardState.metrics[row.key];
-        const level = LEVELS[metric.level];
+        const level = LEVELS[metric.level] || { label: UNKNOWN_TEXT, className: "warning" };
         const definition = metricDefinitions[row.key];
 
         return `
@@ -964,12 +1157,26 @@ function renderAlertLogs() {
     const body = document.querySelector("[data-alert-logs]");
     if (!body) return;
 
+    if (dashboardState.sources.alerts === "loading") {
+        body.innerHTML = '<tr><td colspan="5" class="table-empty">Loading...</td></tr>';
+        return;
+    }
+    if (dashboardState.sources.alerts === "error") {
+        body.innerHTML = `<tr><td colspan="5" class="table-empty">${ERROR_TEXT}</td></tr>`;
+        return;
+    }
+
     const previewLogs = dashboardState.alertLogs.slice(0, ALERT_LOG_PREVIEW_LIMIT);
+    if (previewLogs.length === 0) {
+        body.innerHTML = '<tr><td colspan="5" class="table-empty">暂无报警记录</td></tr>';
+        return;
+    }
+
     body.innerHTML = previewLogs.map(log => {
         const type = String(log.type || "报警");
-        const time = log.time || "--";
+        const time = log.time || EMPTY_TEXT;
         const content = log.content || "";
-        const status = log.status || "--";
+        const status = log.status || UNKNOWN_TEXT;
         const level = LEVELS[log.level] || LEVELS.normal;
         const accent = log.level === "danger" ? "#ef3340" : log.level === "warning" ? "#f97316" : "#10b981";
         const statusClass = status === "已恢复" ? "recovered" : "pending";
@@ -986,128 +1193,25 @@ function renderAlertLogs() {
     }).join("");
 }
 
-function formatCommandCandidate(commandValue) {
-    if (commandValue === undefined || commandValue === null || commandValue === "") {
-        return "--";
-    }
-
-    if (Array.isArray(commandValue)) {
-        const commands = commandValue.map(item => {
-            if (isPlainObject(item)) {
-                return pickFirst(item, ["command", "name", "command_name", "commandName", "command_id", "commandId"]) || JSON.stringify(item);
-            }
-            return String(item);
-        }).filter(Boolean);
-        return commands.length ? commands.join(", ") : "--";
-    }
-
-    if (isPlainObject(commandValue)) {
-        return pickFirst(commandValue, ["command", "name", "command_name", "commandName", "command_id", "commandId"]) || JSON.stringify(commandValue);
-    }
-
-    return String(commandValue);
-}
-
-function formatLatestCommand(...records) {
-    const commandKeys = [
-        "command",
-        "last_command",
-        "lastCommand",
-        "command_name",
-        "commandName",
-        "last_command_id",
-        "lastCommandId"
-    ];
-    const commandListKeys = ["commands", "recent_commands", "command_queue", "commandQueue"];
-
-    for (const record of records) {
-        if (!isPlainObject(record)) continue;
-
-        const candidates = [
-            pickFirst(record, commandKeys),
-            pickFirst(record, commandListKeys)
-        ];
-
-        if (isPlainObject(record.structured)) {
-            candidates.push(pickFirst(record.structured, commandKeys));
-            candidates.push(pickFirst(record.structured, commandListKeys));
-        }
-
-        if (isPlainObject(record.command)) {
-            candidates.push(record.command);
-        }
-
-        for (const candidate of candidates) {
-            const formatted = formatCommandCandidate(candidate);
-            if (formatted !== "--") {
-                return formatted;
-            }
-        }
-    }
-
-    return "--";
-}
-
-function formatLatestAirQuality(rawSensor, metrics) {
-    const airQualityObject = isPlainObject(rawSensor?.air_quality) ? rawSensor.air_quality : {};
-    const score = toNumber(pickFirst(rawSensor || {}, [
-        "air_quality",
-        "air_quality_score",
-        "aqi",
-        "air"
-    ])) ?? toNumber(pickFirst(airQualityObject, ["air_quality_score", "score", "aqi"]));
-    const level = pickFirst(rawSensor || {}, [
-        "air_quality_level",
-        "air_quality_label"
-    ]) ?? pickFirst(airQualityObject, ["air_quality_level", "level", "label"]);
-
-    if (score !== null && level) {
-        return `${formatNumber(score, 0)} (${level})`;
-    }
-    if (score !== null) {
-        return formatNumber(score, 0);
-    }
-    if (level) {
-        return String(level);
-    }
-    if (metrics?.air && metrics.air.display !== "--") {
-        return metrics.air.display;
-    }
-    return "--";
-}
-
-function buildSystemLogs(sensor, asr, llm, sources) {
-    const logs = [];
-    const sensorTime = sensor.timestamp ? formatTime(sensor.timestamp) : formatTime();
-    const commandText = formatLatestCommand(sensor.raw, asr, llm);
-    const airQualityText = formatLatestAirQuality(sensor.raw, dashboardState.metrics);
-
-    logs.push({
-        time: sensorTime,
-        text: `传感器数据更新：温度 ${dashboardState.metrics.temperature.display}°C，湿度 ${dashboardState.metrics.humidity.display}%，Air Quality: ${airQualityText}`,
-        color: "#10b981",
-        source: sources.sensor
-    });
-
-    logs.push({
-        time: sensorTime,
-        text: `Command: ${commandText}`,
-        color: "#2874ff",
-        source: sources.sensor
-    });
-
-    if (logs.length === 1 && sources.asr === "mock" && sources.llm === "mock") {
-        logs.push(...mockSystemLogs);
-    }
-
-    return [...dashboardState.commandLogs, ...logs].slice(0, 8);
-}
-
 function renderSystemLogs() {
     const container = document.getElementById("latestLogList");
     if (!container) return;
 
+    if (dashboardState.sources.logs === "loading") {
+        container.innerHTML = '<div class="system-log empty">Loading...</div>';
+        return;
+    }
+    if (dashboardState.sources.logs === "error") {
+        container.innerHTML = `<div class="system-log empty">${ERROR_TEXT}</div>`;
+        return;
+    }
+
     const previewLogs = dashboardState.systemLogs.slice(0, SYSTEM_LOG_PREVIEW_LIMIT);
+    if (previewLogs.length === 0) {
+        container.innerHTML = '<div class="system-log empty">未接入</div>';
+        return;
+    }
+
     container.innerHTML = previewLogs.map(log => `
         <div class="system-log">
             <i style="--accent:${log.color}"></i>
@@ -1118,52 +1222,31 @@ function renderSystemLogs() {
 }
 
 const OPERATION_STATUS_LABELS = {
+    queued: "已排队",
+    dispatched: "已下发",
+    completed: "已完成",
     pending: "请求中",
     success: "成功",
     failed: "失败",
     unavailable: "不可用"
 };
 
-// 命令控制：操作记录只保存在当前页面内存中，不写入 localStorage、数据库或服务器日志。
-function addOperationLog(entry) {
-    const log = {
-        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        time: formatTime(),
-        type: entry.type || "操作",
-        content: entry.content || "",
-        status: entry.status || "pending",
-        result: entry.result || ""
-    };
-
-    dashboardState.operationLogs.unshift(log);
-    renderOperationLogs();
-    renderActiveLogModal();
-    return log.id;
-}
-
-// 命令控制：更新请求中的操作记录，真实请求完成后写入成功或失败结果。
-function updateOperationLog(id, changes) {
-    const target = dashboardState.operationLogs.find(log => log.id === id);
-    if (!target) return;
-
-    Object.assign(target, changes);
-    renderOperationLogs();
-    renderActiveLogModal();
-}
-
 function renderOperationLogItem(log) {
-    const status = log.status || "pending";
-    const statusLabel = OPERATION_STATUS_LABELS[status] || status;
+    const status = log.status || "unknown";
+    const statusLabel = OPERATION_STATUS_LABELS[status] || UNKNOWN_TEXT;
+    const title = log.name || log.command || log.command_id || "命令记录";
+    const content = log.device_id ? `设备：${log.device_id}` : "";
+    const result = log.error_message || (log.result ? JSON.stringify(log.result) : "");
 
     return `
         <article class="operation-log-item">
             <div class="operation-log-meta">
-                <time>${escapeHtml(log.time || "--")}</time>
+                <time>${escapeHtml(log.created_at || log.updated_at || log.time || EMPTY_TEXT)}</time>
                 <span class="operation-status ${escapeHtml(status)}">${escapeHtml(statusLabel)}</span>
             </div>
-            <strong class="operation-log-title">${escapeHtml(log.type || "操作")}</strong>
-            ${log.content ? `<div class="operation-log-content">${escapeHtml(log.content)}</div>` : ""}
-            ${log.result ? `<div class="operation-log-result">${escapeHtml(log.result)}</div>` : ""}
+            <strong class="operation-log-title">${escapeHtml(title)}</strong>
+            ${content ? `<div class="operation-log-content">${escapeHtml(content)}</div>` : ""}
+            ${result ? `<div class="operation-log-result">${escapeHtml(result)}</div>` : ""}
         </article>
     `;
 }
@@ -1172,19 +1255,27 @@ function renderOperationLogs() {
     const container = document.querySelector("[data-operation-log-list]");
     if (!container) return;
 
+    if (dashboardState.sources.commands === "loading") {
+        container.innerHTML = '<div class="operation-log-item empty">Loading...</div>';
+        return;
+    }
+    if (dashboardState.sources.commands === "error") {
+        container.innerHTML = `<div class="operation-log-item empty">${ERROR_TEXT}</div>`;
+        return;
+    }
+
     const previewLogs = dashboardState.operationLogs.slice(0, OPERATION_LOG_PREVIEW_LIMIT);
     if (previewLogs.length === 0) {
-        container.innerHTML = '<div class="operation-log-item empty">暂无页面操作记录</div>';
+        container.innerHTML = '<div class="operation-log-item empty">暂无命令记录</div>';
         return;
     }
 
     container.innerHTML = previewLogs.map(renderOperationLogItem).join("");
 }
 
-// 命令控制：弹窗中展示全部前端临时操作记录，服务器记录不会被改动。
 function renderOperationLogModal(logs) {
     if (!logs.length) {
-        return '<div class="log-empty">暂无页面操作记录</div>';
+        return '<div class="log-empty">暂无命令记录</div>';
     }
 
     return `
@@ -1197,16 +1288,16 @@ function renderOperationLogModal(logs) {
 // 日志弹窗：渲染报警日志完整列表，数据只来自 dashboardState.alertLogs。
 function renderAlertLogModal(logs) {
     if (!logs.length) {
-        return '<div class="log-empty">暂无报警日志</div>';
+        return '<div class="log-empty">暂无报警记录</div>';
     }
 
     return `
         <div class="modal-alert-list">
             ${logs.map(log => {
                 const type = String(log.type || "报警");
-                const time = log.time || "--";
+                const time = log.time || EMPTY_TEXT;
                 const content = log.content || "";
-                const status = log.status || "--";
+                const status = log.status || UNKNOWN_TEXT;
                 const level = LEVELS[log.level] || LEVELS.normal;
                 const statusClass = status === "已恢复" ? "recovered" : "pending";
 
@@ -1227,15 +1318,15 @@ function renderAlertLogModal(logs) {
 // 日志弹窗：渲染最新日志完整列表，保持“时间 + 来源 + 内容”横向阅读方式。
 function renderSystemLogModal(logs) {
     if (!logs.length) {
-        return '<div class="log-empty">暂无最新日志</div>';
+        return '<div class="log-empty">未接入</div>';
     }
 
     return `
         <div class="modal-system-log-list">
             ${logs.map(log => `
                 <article class="modal-system-log">
-                    <time>${escapeHtml(log.time || "--")}</time>
-                    <span class="modal-source-badge">${escapeHtml(log.source || "local")}</span>
+                    <time>${escapeHtml(log.time || EMPTY_TEXT)}</time>
+                    <span class="modal-source-badge">${escapeHtml(log.source || UNKNOWN_TEXT)}</span>
                     <span class="modal-system-content">${escapeHtml(log.text || "")}</span>
                 </article>
             `).join("")}
@@ -1327,15 +1418,21 @@ function initLogModals() {
 }
 
 function renderStatusHeader() {
-    const now = formatTime();
-    const dynamicAlerts = buildDynamicAlertLogs(dashboardState.metrics);
-    const activeAlerts = dynamicAlerts.filter(log => log.level !== "normal" && log.status !== "已恢复");
-    const newestAlert = activeAlerts[0] || dashboardState.alertLogs.find(log => log.level !== "normal");
+    const activeAlerts = dashboardState.alertLogs.filter(log => log.level !== "normal" && log.status !== "已恢复");
+    const newestAlert = activeAlerts[0] || null;
     const overallLevel = dashboardState.metrics.overall;
-    const level = LEVELS[overallLevel];
+    const level = LEVELS[overallLevel] || { label: UNKNOWN_TEXT, className: "warning" };
+    const sensorSource = dashboardState.sources.sensor;
+    const updatedText = dashboardState.sensor?.hasTimestamp
+        ? formatTime(dashboardState.sensor.timestamp)
+        : sensorSource === "loading"
+            ? LOADING_TEXT
+            : sensorSource === "error"
+                ? ERROR_TEXT
+                : EMPTY_TEXT;
 
     document.querySelectorAll("[data-last-updated]").forEach(element => {
-        element.textContent = now;
+        element.textContent = updatedText;
     });
 
     setText("[data-alert-badge]", activeAlerts.length);
@@ -1345,7 +1442,13 @@ function renderStatusHeader() {
 
     const stateElement = document.querySelector("[data-current-state]");
     if (stateElement) {
-        stateElement.style.color = overallLevel === "danger" ? "#ef3340" : overallLevel === "warning" ? "#f97316" : "#10b981";
+        stateElement.style.color = overallLevel === "danger"
+            ? "#ef3340"
+            : overallLevel === "warning"
+                ? "#f97316"
+                : overallLevel === "normal"
+                    ? "#10b981"
+                    : "#94a3b8";
     }
 
     const alertPanel = document.getElementById("alertPanel");
@@ -1356,7 +1459,7 @@ function renderStatusHeader() {
     if (newestAlert) {
         setText("[data-latest-alert] span", `最近报警：${newestAlert.time.slice(0, 5)} ${newestAlert.content}`);
     } else {
-        setText("[data-latest-alert] span", "最近报警：暂无异常");
+        setText("[data-latest-alert] span", "最近报警：暂无数据");
     }
 }
 
@@ -1388,30 +1491,6 @@ function showDashboardToast(message, status = "success") {
     }, 3600);
 }
 
-// 智能家居控制：当前前端没有发现读取家居设备状态的真实接口方法，因此返回 null。
-function getSmartHomeStatusMethod() {
-    return null;
-}
-
-// 智能家居控制：当前前端没有发现切换家居设备开关的真实接口方法，因此返回 null。
-function getSmartHomeToggleMethod() {
-    return null;
-}
-
-function parseSmartHomeStatus(value) {
-    if (typeof value === "boolean") return value;
-    if (typeof value === "number") {
-        if (value === 1) return true;
-        if (value === 0) return false;
-    }
-    if (typeof value === "string") {
-        const normalized = value.trim().toLowerCase();
-        if (["on", "open", "opened", "true", "1", "开", "开启", "已开启"].includes(normalized)) return true;
-        if (["off", "closed", "close", "false", "0", "关", "关闭", "已关闭"].includes(normalized)) return false;
-    }
-    return null;
-}
-
 function getSmartHomeDeviceStatusText(device) {
     if (device.loading) return "提交中";
     if (device.disabled) return "未连接";
@@ -1428,8 +1507,12 @@ function renderSmartHomeControls() {
     const devices = Array.isArray(dashboardState.smartHomeDevices) ? dashboardState.smartHomeDevices : [];
     const hasEnabledDevice = devices.some(device => !device.disabled);
     if (note) {
-        note.hidden = hasEnabledDevice;
+        note.hidden = false;
         note.textContent = SMART_HOME_UNAVAILABLE_MESSAGE;
+    }
+    if (!devices.length) {
+        list.innerHTML = '<div class="system-log empty">未接入</div>';
+        return;
     }
 
     list.innerHTML = devices.map(device => {
@@ -1456,146 +1539,30 @@ function renderSmartHomeControls() {
     }).join("");
 }
 
-function setSmartHomeDeviceLoading(deviceId, loading) {
-    dashboardState.smartHomeDevices = dashboardState.smartHomeDevices.map(device => (
-        device.id === deviceId ? { ...device, loading } : device
-    ));
-    renderSmartHomeControls();
-}
-
 function closeSmartHomeConfirmModal() {
     const overlay = document.querySelector("[data-smart-home-confirm-modal]");
     if (!overlay) return;
 
     overlay.hidden = true;
-    pendingSmartHomeAction = null;
     document.body.classList.remove("log-modal-open");
-}
-
-function openSmartHomeConfirmModal(device, nextStatus) {
-    const overlay = document.querySelector("[data-smart-home-confirm-modal]");
-    const title = document.querySelector("[data-smart-home-confirm-title]");
-    const message = document.querySelector("[data-smart-home-confirm-message]");
-    const submit = document.querySelector("[data-smart-home-confirm-submit]");
-    if (!overlay || !title || !message || !submit) return;
-
-    const isOpening = nextStatus === true;
-    pendingSmartHomeAction = { deviceId: device.id, nextStatus };
-    title.textContent = isOpening ? "确认开启设备？" : "确认关闭设备？";
-    message.textContent = `确定要${isOpening ? "开启" : "关闭"}“${device.name}”吗？`;
-    submit.textContent = isOpening ? "确认开启" : "确认关闭";
-    submit.classList.toggle("danger-action", !isOpening);
-    overlay.hidden = false;
-    document.body.classList.add("log-modal-open");
-}
-
-async function handleSmartHomeToggleConfirm() {
-    const action = pendingSmartHomeAction;
-    if (!action) return;
-
-    const device = dashboardState.smartHomeDevices.find(item => item.id === action.deviceId);
-    if (!device) {
-        closeSmartHomeConfirmModal();
-        return;
-    }
-
-    const toggleMethod = getSmartHomeToggleMethod();
-    const targetText = action.nextStatus ? "开启" : "关闭";
-    if (!toggleMethod) {
-        addOperationLog({
-            type: "智能家居控制",
-            content: `尝试${targetText}${device.name}。`,
-            status: "unavailable",
-            result: SMART_HOME_UNAVAILABLE_MESSAGE
-        });
-        showDashboardToast(SMART_HOME_UNAVAILABLE_MESSAGE, "unavailable");
-        closeSmartHomeConfirmModal();
-        return;
-    }
-
-    const submit = document.querySelector("[data-smart-home-confirm-submit]");
-    const logId = addOperationLog({
-        type: "智能家居控制",
-        content: `已发送请求：${targetText}${device.name}`,
-        status: "pending",
-        result: "请求中..."
-    });
-
-    if (submit) submit.disabled = true;
-    setSmartHomeDeviceLoading(device.id, true);
-
-    try {
-        const result = await toggleMethod(device.id, action.nextStatus);
-        dashboardState.smartHomeDevices = dashboardState.smartHomeDevices.map(item => (
-            item.id === device.id ? { ...item, status: action.nextStatus, disabled: false, loading: false } : item
-        ));
-        renderSmartHomeControls();
-        updateOperationLog(logId, {
-            status: "success",
-            result: typeof result === "string" ? result : `${device.name}已${action.nextStatus ? "开启" : "关闭"}`
-        });
-        showDashboardToast(`${device.name}已${action.nextStatus ? "开启" : "关闭"}`, "success");
-        closeSmartHomeConfirmModal();
-    } catch (error) {
-        setSmartHomeDeviceLoading(device.id, false);
-        const message = `${device.name}${targetText}失败：${error.message}`;
-        updateOperationLog(logId, { status: "failed", result: message });
-        showDashboardToast(message, "failed");
-    } finally {
-        if (submit) submit.disabled = false;
-    }
 }
 
 function handleSmartHomeOptionClick(event) {
     const button = event.target.closest("[data-smart-home-action]");
-    if (!button || button.disabled) return;
-
-    const row = button.closest("[data-smart-home-device]");
-    if (!row) return;
-
-    const device = dashboardState.smartHomeDevices.find(item => item.id === row.dataset.smartHomeDevice);
-    if (!device || device.disabled || device.loading) return;
-
-    const nextStatus = button.dataset.smartHomeAction === "on";
-    if (device.status === nextStatus) return;
-
-    openSmartHomeConfirmModal(device, nextStatus);
+    if (button && !button.disabled) {
+        showDashboardToast(FEATURE_IN_PROGRESS_MESSAGE, "unavailable");
+    }
 }
 
 async function loadSmartHomeStatuses() {
-    const statusMethod = getSmartHomeStatusMethod();
-    if (!statusMethod) {
-        dashboardState.smartHomeDevices = createSmartHomeDeviceState();
-        renderSmartHomeControls();
-        return;
-    }
-
-    try {
-        const statusResult = await statusMethod();
-        dashboardState.smartHomeDevices = SMART_HOME_DEVICES.map(device => {
-            const rawStatus = isPlainObject(statusResult) ? statusResult[device.id] : undefined;
-            const parsedStatus = parseSmartHomeStatus(rawStatus);
-            return {
-                ...device,
-                status: parsedStatus,
-                disabled: parsedStatus === null,
-                loading: false,
-                unavailableReason: parsedStatus === null ? SMART_HOME_UNAVAILABLE_MESSAGE : ""
-            };
-        });
-        renderSmartHomeControls();
-    } catch (error) {
-        dashboardState.smartHomeDevices = createSmartHomeDeviceState();
-        renderSmartHomeControls();
-        showDashboardToast(`智能家居状态读取失败：${error.message}`, "failed");
-    }
+    dashboardState.smartHomeDevices = null;
+    renderSmartHomeControls();
 }
 
 // 智能家居控制：绑定卡片按钮和确认弹窗，只复用现有前端方法，不新增 API 地址。
 function initSmartHomeControls() {
     const list = document.querySelector("[data-smart-home-list]");
     const overlay = document.querySelector("[data-smart-home-confirm-modal]");
-    const submit = document.querySelector("[data-smart-home-confirm-submit]");
 
     renderSmartHomeControls();
 
@@ -1613,10 +1580,6 @@ function initSmartHomeControls() {
                 closeSmartHomeConfirmModal();
             }
         });
-    }
-
-    if (submit) {
-        submit.addEventListener("click", handleSmartHomeToggleConfirm);
     }
 
     document.addEventListener("keydown", event => {
@@ -1648,16 +1611,17 @@ function getCommandButton(action) {
     return document.querySelector(`[data-command-action="${action}"]`);
 }
 
-function buildSensorSnapshotText(rawSensor, sensor) {
+function buildSensorSnapshotText(rawSensor, sensor, deviceStatus = dashboardState.deviceStatus) {
     const parts = [];
     const temperature = toNumber(pickFirst(rawSensor, ["temperature", "temp"]));
     const humidity = toNumber(pickFirst(rawSensor, ["humidity"]));
-    const airQualityObject = isPlainObject(rawSensor?.air_quality) ? rawSensor.air_quality : {};
-    const aqi = toNumber(pickFirst(rawSensor, [
-        "air_quality_score",
-        "aqi",
-        "air_quality"
-    ])) ?? toNumber(pickFirst(airQualityObject, ["air_quality_score", "score", "aqi"]));
+    const pressure = toNumber(pickFirst(rawSensor, ["pressure"]));
+    const airQualityObject = isPlainObject(rawSensor.air_quality) ? rawSensor.air_quality : {};
+    const airQualityScore = toNumber(rawSensor.air_quality_score) ?? toNumber(airQualityObject.air_quality_score);
+    const airQualityLevel = pickFirst(rawSensor, [
+        "air_quality_level",
+        "air_quality_label"
+    ]) ?? pickFirst(airQualityObject, ["air_quality_level", "level", "label"]);
 
     if (temperature !== null) {
         parts.push(`温度 ${formatNumber(temperature)}°C`);
@@ -1665,15 +1629,18 @@ function buildSensorSnapshotText(rawSensor, sensor) {
     if (humidity !== null) {
         parts.push(`湿度 ${formatNumber(humidity)}%`);
     }
-    if (aqi !== null) {
-        parts.push(`空气质量 ${formatNumber(aqi, 0)} AQI`);
+    if (pressure !== null) {
+        parts.push(`气压 ${formatNumber(pressure)} hPa`);
+    }
+    if (airQualityScore !== null) {
+        parts.push(`空气质量 ${formatNumber(airQualityScore, 0)} 分${airQualityLevel ? ` · ${airQualityLevel}` : ""}`);
     }
     if (sensor && sensor.hasTimestamp) {
         parts.push(`时间 ${formatTime(sensor.timestamp)}`);
     }
 
-    const esp = sensor ? getEspStatus(sensor) : null;
-    if (esp && esp.value !== "--") {
+    const esp = getEspStatus(deviceStatus);
+    if (esp && esp.value) {
         parts.push(`ESP 状态：${esp.value}`);
     }
 
@@ -1736,30 +1703,50 @@ function openCommandConfirmModal(config) {
 }
 
 async function updateDashboard() {
-    const [sensorResult, asrResult, llmResult, history, mockLogs] = await Promise.all([
-        fetchLatestSensor(),
+    const deviceId = getActiveDeviceId();
+    setDashboardLoadingState(deviceId);
+
+    const [sensorResult, deviceStatusResult, asrResult, llmResult, historyResult, alertResult, systemResult, commandResult] = await Promise.all([
+        fetchLatestSensor(deviceId),
+        fetchDeviceStatus(deviceId),
         fetchLatestASR(),
         fetchLatestLLM(),
-        fetchHistoryData(),
-        fetchAlertLogs()
+        fetchHistoryData(deviceId),
+        fetchAlertLogs(deviceId),
+        fetchSystemLogs(deviceId),
+        fetchCommandLogs(deviceId)
     ]);
 
-    const sensor = normalizeSensor(sensorResult.data, sensorResult.source);
+    if (activeDashboardPage === "s3" || getActiveDeviceId() !== deviceId) {
+        return;
+    }
+
+    const sensor = sensorResult.ok && !sensorResult.empty
+        ? normalizeSensor(sensorResult.data, sensorResult.source)
+        : null;
+    const deviceStatus = deviceStatusResult.ok && !deviceStatusResult.empty
+        ? normalizeDeviceStatus(deviceStatusResult.data, deviceStatusResult.source)
+        : null;
 
     dashboardState.sensor = sensor;
-    dashboardState.asr = asrResult.data;
-    dashboardState.llm = llmResult.data;
+    dashboardState.deviceStatus = deviceStatus;
+    dashboardState.asr = asrResult.ok && !asrResult.empty ? asrResult.data : null;
+    dashboardState.llm = llmResult.ok && !llmResult.empty ? llmResult.data : null;
     dashboardState.sources = {
         sensor: sensorResult.source,
+        deviceStatus: deviceStatusResult.source,
         asr: asrResult.source,
-        llm: llmResult.source
+        llm: llmResult.source,
+        history: historyResult.source,
+        alerts: alertResult.source,
+        logs: systemResult.source,
+        commands: commandResult.source
     };
-    dashboardState.metrics = buildMetrics(sensor);
-    dashboardState.history = history;
-
-    const dynamicAlerts = buildDynamicAlertLogs(dashboardState.metrics);
-    dashboardState.alertLogs = dynamicAlerts.length > 0 ? [...dynamicAlerts, ...mockLogs].slice(0, 6) : mockLogs;
-    dashboardState.systemLogs = buildSystemLogs(sensor, asrResult.data, llmResult.data, dashboardState.sources);
+    dashboardState.metrics = buildMetrics(sensor, deviceStatus);
+    dashboardState.history = Array.isArray(historyResult.data) ? historyResult.data : [];
+    dashboardState.alertLogs = Array.isArray(alertResult.data) ? alertResult.data.map(normalizeAlertLog) : [];
+    dashboardState.systemLogs = Array.isArray(systemResult.data) ? systemResult.data : [];
+    dashboardState.operationLogs = Array.isArray(commandResult.data) ? commandResult.data : [];
 
     renderMetricCards();
     renderMainChart();
@@ -1771,56 +1758,47 @@ async function updateDashboard() {
     renderSourceDebug();
 }
 
-// 命令控制：当前前端没有可提交自然语言请求的 POST/WebSocket 方法，所以自定义请求只提示未配置。
-function getNaturalLanguageSubmitMethod() {
-    return null;
-}
-
-// 命令控制：当前前端未发现重启、校准、服务器日志清理等设备操作请求方法。
-function getDeviceOperationMethod() {
-    return null;
-}
-
 async function handleFetchCurrentData(button) {
-    const logId = addOperationLog({
-        type: "获取当前数据",
-        content: "调用现有 /sensor/latest 接口读取最新传感器数据。",
-        status: "pending",
-        result: "请求中..."
-    });
-
     setCommandButtonLoading(button, true, "获取中...");
+    const deviceId = getActiveDeviceId();
 
     try {
-        const sensorResult = await fetchLatestSensor();
-        if (sensorResult.source !== "real") {
-            const message = "最新传感器接口不可用或返回空数据，未使用模拟数据更新快照。";
-            updateOperationLog(logId, { status: "failed", result: message });
+        const [sensorResult, deviceStatusResult] = await Promise.all([
+            fetchLatestSensor(deviceId),
+            fetchDeviceStatus(deviceId)
+        ]);
+        if (!sensorResult.ok || sensorResult.empty) {
+            const message = sensorResult.ok ? EMPTY_TEXT : ERROR_TEXT;
             showDashboardToast(message, "failed");
+            await updateDashboard();
+            return;
+        }
+
+        if (activeDashboardPage === "s3" || getActiveDeviceId() !== deviceId) {
             return;
         }
 
         const sensor = normalizeSensor(sensorResult.data, sensorResult.source);
+        const deviceStatus = deviceStatusResult.ok && !deviceStatusResult.empty
+            ? normalizeDeviceStatus(deviceStatusResult.data, deviceStatusResult.source)
+            : dashboardState.deviceStatus;
         dashboardState.sensor = sensor;
+        dashboardState.deviceStatus = deviceStatus;
         dashboardState.sources.sensor = sensorResult.source;
-        dashboardState.metrics = buildMetrics(sensor);
-        dashboardState.systemLogs = buildSystemLogs(sensor, dashboardState.asr, dashboardState.llm, dashboardState.sources);
+        dashboardState.sources.deviceStatus = deviceStatusResult.source;
+        dashboardState.metrics = buildMetrics(sensor, deviceStatus);
 
-        const snapshot = buildSensorSnapshotText(sensorResult.data, sensor);
+        const snapshot = buildSensorSnapshotText(sensorResult.data, sensor, deviceStatus);
         renderMetricCards();
         renderMainChart();
         renderAlertSummary();
-        renderAlertLogs();
-        renderSystemLogs();
         renderStatusHeader();
         renderSourceDebug();
         renderActiveLogModal();
 
-        updateOperationLog(logId, { status: "success", result: snapshot });
-        showDashboardToast("已获取当前数据。", "success");
+        showDashboardToast(snapshot, "success");
     } catch (error) {
         const message = `获取当前数据失败：${error.message}`;
-        updateOperationLog(logId, { status: "failed", result: message });
         showDashboardToast(message, "failed");
     } finally {
         setCommandButtonLoading(button, false);
@@ -1828,13 +1806,7 @@ async function handleFetchCurrentData(button) {
 }
 
 function handleUnavailableOperation(type, content) {
-    addOperationLog({
-        type,
-        content,
-        status: "unavailable",
-        result: "当前服务暂未配置"
-    });
-    showDashboardToast("当前服务暂未配置", "unavailable");
+    showDashboardToast(FEATURE_IN_PROGRESS_MESSAGE, "unavailable");
 }
 
 async function handleCustomCommandSubmit(event) {
@@ -1860,42 +1832,9 @@ async function handleCustomCommandSubmit(event) {
     submit.disabled = true;
     submit.textContent = "提交中...";
 
-    const submitMethod = getNaturalLanguageSubmitMethod();
-    if (!submitMethod) {
-        addOperationLog({
-            type: "自定义请求",
-            content,
-            status: "unavailable",
-            result: "当前服务暂未配置"
-        });
-        showDashboardToast("当前服务暂未配置", "unavailable");
-        submit.disabled = false;
-        submit.textContent = "提交";
-        return;
-    }
-
-    const logId = addOperationLog({
-        type: "自定义请求",
-        content,
-        status: "pending",
-        result: "请求中..."
-    });
-
-    try {
-        const result = await submitMethod(content);
-        updateOperationLog(logId, {
-            status: "success",
-            result: typeof result === "string" ? result : JSON.stringify(result)
-        });
-        closeCustomCommandModal();
-        showDashboardToast("自定义请求已返回。", "success");
-    } catch (error) {
-        updateOperationLog(logId, { status: "failed", result: error.message });
-        showDashboardToast(`自定义请求失败：${error.message}`, "failed");
-    } finally {
-        submit.disabled = false;
-        submit.textContent = "提交";
-    }
+    showDashboardToast(FEATURE_IN_PROGRESS_MESSAGE, "unavailable");
+    submit.disabled = false;
+    submit.textContent = "提交";
 }
 
 function handleConfirmedUnavailableAction(action) {
@@ -1912,22 +1851,11 @@ function handleConfirmedUnavailableAction(action) {
 
     if (!config) return;
 
-    const method = getDeviceOperationMethod(action);
-    if (!method) {
-        handleUnavailableOperation(config.type, config.content);
-        return;
-    }
+    handleUnavailableOperation(config.type, config.content);
 }
 
 function handleClearLogs() {
-    dashboardState.operationLogs = [];
-    addOperationLog({
-        type: "清理日志",
-        content: "清理本页面临时操作记录。",
-        status: "success",
-        result: "仅清理了本页面临时记录，服务器记录未变更"
-    });
-    showDashboardToast("仅清理了本页面临时记录，服务器记录未变更", "success");
+    showDashboardToast(FEATURE_IN_PROGRESS_MESSAGE, "unavailable");
 }
 
 function handleCommandAction(action, button) {
@@ -1967,7 +1895,7 @@ function handleCommandAction(action, button) {
         openCommandConfirmModal({
             action,
             title: "确认清理日志？",
-            message: "当前后端未提供服务器日志清理接口；确认后仅清理本页面临时操作记录。",
+            message: "日志清理功能开发中，当前不会删除任何真实日志。",
             submitText: "确认清理",
             danger: true
         });
@@ -1982,7 +1910,7 @@ function bindCommandButtons() {
     });
 }
 
-// 命令控制：绑定自定义请求弹窗、确认弹窗和本页面临时操作记录。
+// 命令控制：绑定自定义请求弹窗、确认弹窗和真实命令历史。
 function initCommandControls() {
     const customOverlay = document.querySelector("[data-custom-command-modal]");
     const confirmOverlay = document.querySelector("[data-command-confirm-modal]");
@@ -2140,7 +2068,7 @@ function setDashboardPage(page, options = {}) {
 
     if (nextPage === "s3") {
         cleanupDashboardTimers();
-        renderS3DashboardIfNeeded();
+        renderS3DashboardIfNeeded(true);
         return;
     }
 

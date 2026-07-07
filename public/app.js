@@ -19,6 +19,13 @@ const metricDefinitions = {
         icon: "drop",
         historyField: "humidity"
     },
+    pressure: {
+        name: "气压",
+        unit: "hPa",
+        accent: "#f97316",
+        icon: "chip",
+        historyField: "pressure"
+    },
     air: {
         name: "空气质量",
         unit: "",
@@ -47,8 +54,17 @@ const UNKNOWN_TEXT = "未知";
 const OFFLINE_TEXT = "离线";
 const DISCONNECTED_TEXT = "未连接";
 
-const SMART_HOME_UNAVAILABLE_MESSAGE = "智能家居状态未接入。";
+const SMART_HOME_UNAVAILABLE_MESSAGE = "暂无智能家居状态。";
 const FEATURE_IN_PROGRESS_MESSAGE = "功能开发中";
+const SMART_HOME_DEVICE_DEFINITIONS = {
+    air_conditioner: { name: "空调", icon: "air-conditioner" },
+    fan: { name: "风扇", icon: "fan" },
+    light: { name: "灯", icon: "light" },
+    tv: { name: "TV", icon: "tv" },
+    curtain: { name: "窗帘", icon: "curtain" },
+    humidifier: { name: "加湿器", icon: "humidifier" },
+    air_purifier: { name: "空气净化器", icon: "air-purifier" }
+};
 
 let dashboardState = {
     sensor: null,
@@ -70,13 +86,15 @@ let dashboardState = {
         history: "idle",
         alerts: "idle",
         logs: "idle",
-        commands: "idle"
+        commands: "idle",
+        smartHome: "idle"
     }
 };
 
 let lastSourceSignature = "";
 const THEME_STORAGE_KEY = "dashboardTheme";
 const DASHBOARD_REFRESH_INTERVAL_MS = 3000;
+const S3_DASHBOARD_REFRESH_INTERVAL_MS = 3000;
 const ESP_DELAY_REFRESH_INTERVAL_MS = 1000;
 const CHART_RANGE_OPTIONS = [12, 24, 36, 48];
 const DEFAULT_CHART_RANGE_HOURS = 24;
@@ -84,13 +102,27 @@ const ALERT_LOG_PREVIEW_LIMIT = 4;
 const SYSTEM_LOG_PREVIEW_LIMIT = 4;
 const OPERATION_LOG_PREVIEW_LIMIT = 5;
 const CUSTOM_COMMAND_MAX_LENGTH = 500;
+const REALTIME_CLOCK_INTERVAL_MS = 1000;
+const LIVE_WAITING_MS = 10000;
+const LIVE_OFFLINE_MS = 30000;
+const VALUE_FLASH_MS = 500;
 let dashboardRefreshTimer = null;
 let espDelayRefreshTimer = null;
+let s3DashboardRefreshTimer = null;
+let realtimeClockTimer = null;
 let selectedChartRangeHours = DEFAULT_CHART_RANGE_HOURS;
 let activeLogModalType = null;
 let pendingConfirmAction = null;
 let activeDashboardPage = "c51";
 let s3DashboardRendered = false;
+const realtimeState = {
+    lastSuccessAt: null,
+    lastSyncAt: null,
+    lastApiLatencyMs: null,
+    lastApiOk: null,
+    lastDataStreamAt: null,
+    lastPayload: null
+};
 
 // 主题功能：读取 CSS 主题变量，Canvas 图表调用它来适配黑色/白色背景。
 function readThemeColor(name, defaultColor) {
@@ -164,6 +196,7 @@ function createEmptyMetrics(status = UNKNOWN_TEXT, note = EMPTY_TEXT) {
     return {
         temperature: createEmptyMetric("温度", "°C"),
         humidity: createEmptyMetric("湿度", "%"),
+        pressure: createEmptyMetric("气压", "hPa"),
         air: createEmptyMetric("空气质量", ""),
         esp,
         overall: "unknown"
@@ -172,6 +205,10 @@ function createEmptyMetrics(status = UNKNOWN_TEXT, note = EMPTY_TEXT) {
 
 function getActiveDeviceId() {
     return DEVICE_IDS[activeDashboardPage] || DEVICE_IDS.c51;
+}
+
+function normalizeDeviceId(value) {
+    return String(value || "").trim().toUpperCase();
 }
 
 function buildUrl(path, params = {}) {
@@ -211,6 +248,209 @@ function formatTime(timestamp) {
         second: "2-digit"
     });
 }
+
+function formatDateTime(timestamp) {
+    const date = parseTimestamp(timestamp);
+    if (!date) return EMPTY_TEXT;
+    return date.toLocaleString("zh-CN", {
+        hour12: false,
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+    });
+}
+
+function formatRelativeTime(timestamp) {
+    const date = parseTimestamp(timestamp);
+    if (!date) return EMPTY_TEXT;
+    const elapsedSeconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+    if (elapsedSeconds < 2) return "刚刚";
+    if (elapsedSeconds < 60) return `${elapsedSeconds} 秒前`;
+    const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+    if (elapsedMinutes < 60) return `${elapsedMinutes} 分钟前`;
+    const elapsedHours = Math.floor(elapsedMinutes / 60);
+    if (elapsedHours < 24) return `${elapsedHours} 小时前`;
+    return formatDateTime(date);
+}
+
+function getUpdateTimestamp(...candidates) {
+    for (const candidate of candidates) {
+        const date = parseTimestamp(candidate);
+        if (date) return date;
+    }
+    return null;
+}
+
+function normalizeRealtimeStatus(status) {
+    if (["normal", "success", "online", true].includes(status)) return "normal";
+    if (["warning", "waiting", "pending", null, undefined].includes(status)) return "warning";
+    if (["danger", "error", "offline", false].includes(status)) return "danger";
+    return "unknown";
+}
+
+function StatusBadge({ label, status = "unknown", detail = "", className = "" } = {}) {
+    const normalized = normalizeRealtimeStatus(status);
+    const tooltip = detail ? ` title="${escapeHtml(detail)}"` : "";
+    return `<span class="health-indicator health-${normalized} ${escapeHtml(className)}"${tooltip}><i aria-hidden="true"></i>${escapeHtml(label || UNKNOWN_TEXT)}</span>`;
+}
+
+function HealthIndicator(label, status, detail = "") {
+    return StatusBadge({ label, status, detail });
+}
+
+function UpdateTime(timestamp, source = "", api = "") {
+    const date = parseTimestamp(timestamp);
+    const detail = [
+        source ? `来源：${source}` : "",
+        date ? `更新时间：${formatTime(date)}` : "",
+        api ? `API：${api}` : ""
+    ].filter(Boolean).join("\n");
+    return `<span class="update-time" data-update-time="${date ? date.getTime() : ""}" title="${escapeHtml(detail)}">${date ? `${formatTime(date)} · ${formatRelativeTime(date)}` : EMPTY_TEXT}</span>`;
+}
+
+function TrendArrow(currentValue, previousValue, options = {}) {
+    const current = toNumber(currentValue);
+    const previous = toNumber(previousValue);
+    if (current === null || previous === null) {
+        return '<span class="trend-arrow trend-flat">--</span>';
+    }
+    const delta = current - previous;
+    const threshold = options.threshold ?? 0.01;
+    if (Math.abs(delta) <= threshold) {
+        return '<span class="trend-arrow trend-flat">持平</span>';
+    }
+    if (options.mode === "air") {
+        const improving = delta < 0;
+        return `<span class="trend-arrow ${improving ? "trend-down" : "trend-up"}">${improving ? "改善" : "恶化"}</span>`;
+    }
+    const unit = options.unit || "";
+    const digits = options.digits ?? 1;
+    const text = `${delta > 0 ? "↑" : "↓"}${formatNumber(Math.abs(delta), digits)}${unit}`;
+    return `<span class="trend-arrow ${delta > 0 ? "trend-up" : "trend-down"}">${escapeHtml(text)}</span>`;
+}
+
+function getAirQualityState(score) {
+    const value = toNumber(score);
+    if (value === null) {
+        return { label: UNKNOWN_TEXT, className: "unknown", status: "warning" };
+    }
+    if (value <= 50) return { label: "优秀", className: "excellent", status: "normal" };
+    if (value <= 100) return { label: "良好", className: "good", status: "info" };
+    if (value <= 150) return { label: "一般", className: "moderate", status: "warning" };
+    if (value <= 200) return { label: "较差", className: "poor", status: "warning" };
+    return { label: "危险", className: "hazard", status: "danger" };
+}
+
+function markRealtimeSuccess(payload = {}) {
+    const now = Date.now();
+    realtimeState.lastSuccessAt = now;
+    realtimeState.lastSyncAt = payload.syncAt || now;
+    realtimeState.lastApiLatencyMs = typeof payload.apiLatencyMs === "number" ? payload.apiLatencyMs : realtimeState.lastApiLatencyMs;
+    realtimeState.lastApiOk = payload.apiOk !== undefined ? payload.apiOk : true;
+    realtimeState.lastDataStreamAt = payload.dataAt || now;
+    realtimeState.lastPayload = payload;
+    renderLiveIndicator();
+    renderRealtimeClock();
+}
+
+function getLiveState() {
+    if (!realtimeState.lastSuccessAt) {
+        return { status: "danger", label: "OFFLINE", sublabel: "Offline" };
+    }
+    const elapsed = Date.now() - realtimeState.lastSuccessAt;
+    if (elapsed <= 5000) return { status: "normal", label: "LIVE", sublabel: "Receiving..." };
+    if (elapsed <= LIVE_OFFLINE_MS || elapsed <= LIVE_WAITING_MS) return { status: "warning", label: "WAITING", sublabel: "Waiting data" };
+    return { status: "danger", label: "OFFLINE", sublabel: "Offline" };
+}
+
+function renderLiveIndicator() {
+    const target = document.querySelector("[data-live-indicator]");
+    if (!target) return;
+    const state = getLiveState();
+    target.className = `live-indicator live-${state.status}`;
+    target.innerHTML = `<strong><i aria-hidden="true"></i>${escapeHtml(state.label)}</strong><span>${escapeHtml(state.sublabel)}</span>`;
+    target.title = realtimeState.lastSuccessAt
+        ? `最近成功接收：${formatTime(realtimeState.lastSuccessAt)}\n${formatRelativeTime(realtimeState.lastSuccessAt)}`
+        : "尚未收到实时数据";
+}
+
+function renderRealtimeClock() {
+    document.querySelectorAll("[data-update-time]").forEach(element => {
+        const timestamp = Number(element.dataset.updateTime);
+        if (Number.isFinite(timestamp) && timestamp > 0) {
+            element.textContent = `${formatTime(timestamp)} · ${formatRelativeTime(timestamp)}`;
+        }
+    });
+    document.querySelectorAll("[data-relative-time]").forEach(element => {
+        const timestamp = Number(element.dataset.relativeTime);
+        if (Number.isFinite(timestamp) && timestamp > 0) {
+            element.textContent = formatRelativeTime(timestamp);
+        }
+    });
+    renderLiveIndicator();
+}
+
+function startRealtimeClock() {
+    if (realtimeClockTimer) clearInterval(realtimeClockTimer);
+    realtimeClockTimer = setInterval(renderRealtimeClock, REALTIME_CLOCK_INTERVAL_MS);
+    renderRealtimeClock();
+}
+
+function animateNumericChange(selector, nextValue) {
+    const element = document.querySelector(selector);
+    if (!element) return;
+    const previous = toNumber(element.dataset.numericValue);
+    const next = toNumber(nextValue);
+    if (next === null) {
+        element.dataset.numericValue = "";
+        element.classList.remove("value-increase", "value-decrease");
+        return;
+    }
+    element.dataset.numericValue = String(next);
+    if (previous === null || previous === next) return;
+    element.classList.remove("value-increase", "value-decrease");
+    void element.offsetWidth;
+    element.classList.add(next > previous ? "value-increase" : "value-decrease");
+    window.setTimeout(() => {
+        element.classList.remove("value-increase", "value-decrease");
+    }, VALUE_FLASH_MS);
+}
+
+function EventTimeline(events = []) {
+    if (!events.length) {
+        return '<div class="system-log empty">暂无系统事件。</div>';
+    }
+    return `<div class="event-timeline">${events.slice(0, 20).map(event => `
+        <article class="event-item" title="${escapeHtml(event.detail || "")}">
+            <time>${escapeHtml(formatTime(event.timestamp || event.created_at || event.updated_at))}</time>
+            <span class="event-icon" aria-hidden="true">${escapeHtml(event.icon || "•")}</span>
+            <div>
+                <strong>${escapeHtml(event.type || UNKNOWN_TEXT)}</strong>
+                <p>${escapeHtml(event.description || EMPTY_TEXT)}</p>
+            </div>
+        </article>
+    `).join("")}</div>`;
+}
+
+window.DashboardRealtime = {
+    StatusBadge,
+    HealthIndicator,
+    UpdateTime,
+    TrendArrow,
+    EventTimeline,
+    formatTime,
+    formatDateTime,
+    formatRelativeTime,
+    parseTimestamp,
+    toNumber,
+    getAirQualityState,
+    markSuccess: markRealtimeSuccess,
+    renderClock: renderRealtimeClock,
+    getLiveState,
+    escapeHtml
+};
 
 // 曲线时间范围：格式化横轴标签，36/48 小时时显示日期，避免跨天数据看不清。
 function formatChartTime(timestamp) {
@@ -261,6 +501,7 @@ function sourceLabel(source) {
     if (source === "real") return "来源：后端真实数据";
     if (source === "loading") return LOADING_TEXT;
     if (source === "error") return ERROR_TEXT;
+    if (source === "empty") return EMPTY_TEXT;
     if (source === "not-integrated") return "未接入";
     return DISCONNECTED_TEXT;
 }
@@ -385,6 +626,16 @@ function getFilteredChartData() {
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
 }
 
+function getRecentTrendPoints() {
+    const points = getFilteredChartData()
+        .filter(point => point.timestamp)
+        .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+    return {
+        previous: points.length > 1 ? points[points.length - 2] : null,
+        current: points.length ? points[points.length - 1] : null
+    };
+}
+
 // 曲线时间范围：更新下拉按钮文字和选中态，供初始化和点击选项后调用。
 function updateChartRangeSelector() {
     const label = document.querySelector("[data-range-label]");
@@ -500,8 +751,9 @@ async function fetchJson(path, options = {}) {
 }
 
 async function readEndpoint(path, label, options = {}) {
+    const { silent = false, ...fetchOptions } = options;
     try {
-        const raw = await fetchJson(path, options);
+        const raw = await fetchJson(path, fetchOptions);
         const data = unwrapEnvelope(raw);
         const empty = data === null ||
             data === undefined ||
@@ -515,7 +767,9 @@ async function readEndpoint(path, label, options = {}) {
             error: null
         };
     } catch (error) {
-        console.warn(`[Dashboard] ${label}: request failed`, error.message);
+        if (!silent) {
+            console.warn(`[Dashboard] ${label}: request failed`, error.message);
+        }
         return {
             ok: false,
             data: null,
@@ -524,6 +778,29 @@ async function readEndpoint(path, label, options = {}) {
             error
         };
     }
+}
+
+async function readFirstAvailableEndpoint(candidates, label) {
+    let lastError = null;
+    for (const candidate of candidates) {
+        const result = await readEndpoint(candidate.path, `${label} ${candidate.path}`, { silent: true });
+        if (result.ok) {
+            return {
+                ...result,
+                endpoint: candidate.path
+            };
+        }
+        lastError = result.error;
+    }
+
+    return {
+        ok: false,
+        data: null,
+        source: "error",
+        empty: true,
+        error: lastError,
+        endpoint: candidates[0]?.path || ""
+    };
 }
 
 async function fetchLatestSensor(deviceId = getActiveDeviceId()) {
@@ -540,11 +817,13 @@ async function fetchDeviceStatus(deviceId = getActiveDeviceId()) {
     );
 }
 
-async function fetchLatestASR() {
+async function fetchLatestASR(deviceId = getActiveDeviceId()) {
+    void deviceId;
     return readEndpoint("/api/dashboard/v1/asr/latest", "ASR");
 }
 
-async function fetchLatestLLM() {
+async function fetchLatestLLM(deviceId = getActiveDeviceId()) {
+    void deviceId;
     return readEndpoint("/api/dashboard/v1/llm/latest", "LLM");
 }
 
@@ -563,26 +842,38 @@ async function fetchHistoryData(deviceId = getActiveDeviceId()) {
 }
 
 async function fetchAlertLogs(deviceId = getActiveDeviceId()) {
-    const result = await readEndpoint(
-        buildUrl("/api/emergency/events", {
-            device_id: deviceId,
-            limit: 20
-        }),
-        `Emergency events ${deviceId}`
-    );
+    const result = await readFirstAvailableEndpoint([
+        {
+            path: buildUrl("/api/logs/v1/alarms", {
+                device_id: deviceId,
+                limit: 20
+            })
+        },
+        {
+            path: buildUrl("/api/emergency/events", {
+                device_id: deviceId,
+                limit: 20
+            })
+        }
+    ], `Alarm logs ${deviceId}`);
     return {
         ...result,
-        data: readListPayload(result.data, ["events"])
+        data: readListPayload(result.data, ["alarms", "logs", "events"])
     };
 }
 
-async function fetchSystemLogs() {
+async function fetchSystemLogs(deviceId = getActiveDeviceId()) {
+    const result = await readEndpoint(
+        buildUrl("/api/logs/v1/system", {
+            device_id: deviceId,
+            limit: 20
+        }),
+        `System logs ${deviceId}`,
+        { silent: true }
+    );
     return {
-        ok: true,
-        data: null,
-        source: "not-integrated",
-        empty: true,
-        error: null
+        ...result,
+        data: readListPayload(result.data, ["logs", "system_logs", "events", "records"])
     };
 }
 
@@ -597,6 +888,25 @@ async function fetchCommandLogs(deviceId = getActiveDeviceId()) {
     return {
         ...result,
         data: readListPayload(result.data, ["commands"])
+    };
+}
+
+async function fetchSmartHomeStatuses(deviceId = getActiveDeviceId()) {
+    const result = await readFirstAvailableEndpoint([
+        {
+            path: buildUrl("/api/smart-home/v1/status", {
+                device_id: deviceId
+            })
+        },
+        {
+            path: buildUrl("/api/dashboard/v1/overview", {
+                device_id: deviceId
+            })
+        }
+    ], `Smart home ${deviceId}`);
+    return {
+        ...result,
+        data: normalizeSmartHomePayload(result.data, deviceId)
     };
 }
 
@@ -645,8 +955,25 @@ function normalizeSensor(rawSensor, source) {
     };
 }
 
+function hasDeviceStatusData(status) {
+    if (!isPlainObject(status)) return false;
+    return pickFirst(status, [
+        "last_seen_ms",
+        "lastSeenMs",
+        "last_seen_iso",
+        "lastSeenIso",
+        "latest_upload_delay_ms",
+        "upload_delay_ms",
+        "avg_upload_delay_ms",
+        "updated_at"
+    ]) !== undefined || Number(status.delay_sample_count) > 0;
+}
+
 function normalizeDeviceStatus(rawStatus, source) {
     const status = isPlainObject(rawStatus) ? rawStatus : {};
+    if (!hasDeviceStatusData(status)) {
+        return null;
+    }
     const online = typeof status.online === "boolean"
         ? status.online
         : (typeof status.device_online === "boolean" ? status.device_online : null);
@@ -667,6 +994,28 @@ function normalizeDeviceStatus(rawStatus, source) {
     };
 }
 
+function normalizeSystemLog(rawLog) {
+    const log = isPlainObject(rawLog) ? rawLog : {};
+    const payload = isPlainObject(log.payload) ? log.payload : {};
+    const level = String(log.level || log.severity || payload.level || payload.severity || "info").toLowerCase();
+    const color = level === "critical" || level === "error" || level === "danger"
+        ? "#ef3340"
+        : (level === "warning" || level === "warn" ? "#f97316" : "#10b981");
+    return {
+        time: formatTime(log.created_at || log.updated_at || log.timestamp || payload.timestamp),
+        source: log.source || log.module || log.event_type || payload.source || payload.module || "system",
+        text: log.message ||
+            log.content ||
+            log.text ||
+            payload.message ||
+            payload.summary ||
+            payload.description ||
+            log.event_id ||
+            EMPTY_TEXT,
+        color
+    };
+}
+
 function normalizeAlertLog(event) {
     const payload = isPlainObject(event?.payload) ? event.payload : {};
     const severity = String(event?.severity || "").toLowerCase();
@@ -682,6 +1031,78 @@ function normalizeAlertLog(event) {
         status: status === "resolved" ? "已恢复" : (status || "未处理"),
         level
     };
+}
+
+function normalizeSmartHomeStatusValue(appliance) {
+    const value = appliance?.state ?? appliance?.status ?? appliance?.on ?? appliance?.enabled ?? appliance?.power;
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "string") {
+        const text = value.trim().toLowerCase();
+        if (["on", "open", "opened", "enabled", "true", "1", "running"].includes(text)) return true;
+        if (["off", "closed", "disabled", "false", "0", "stopped"].includes(text)) return false;
+    }
+
+    const openPercent = toNumber(appliance?.open_percent);
+    if (openPercent !== null) return openPercent > 0;
+    return null;
+}
+
+function normalizeSmartHomeDevice(key, rawDevice) {
+    if (!isPlainObject(rawDevice)) return null;
+    if (rawDevice.mock === true || rawDevice.source === "mock") return null;
+
+    const definition = SMART_HOME_DEVICE_DEFINITIONS[key] || {
+        name: rawDevice.name || key,
+        icon: "chip"
+    };
+    const status = normalizeSmartHomeStatusValue(rawDevice);
+    const disabled = rawDevice.online === false || status === null;
+    return {
+        id: key,
+        name: rawDevice.name || definition.name,
+        icon: definition.icon,
+        status,
+        disabled,
+        loading: false
+    };
+}
+
+function smartHomeDevicesFromAppliances(appliances) {
+    if (!isPlainObject(appliances)) return [];
+    return Object.entries(appliances)
+        .map(([key, appliance]) => normalizeSmartHomeDevice(key, appliance))
+        .filter(Boolean);
+}
+
+function normalizeSmartHomePayload(payload, deviceId = getActiveDeviceId()) {
+    if (!payload) return [];
+    const data = unwrapEnvelope(payload);
+    if (Array.isArray(data)) {
+        return data
+            .map((device, index) => normalizeSmartHomeDevice(device.id || device.key || device.name || `device_${index}`, device))
+            .filter(Boolean);
+    }
+    if (!isPlainObject(data)) return [];
+
+    if (Array.isArray(data.devices)) {
+        const matchedDevice = data.devices.find(device => normalizeDeviceId(device?.device_id || device?.id) === normalizeDeviceId(deviceId)) ||
+            data.devices[0];
+        return smartHomeDevicesFromAppliances(matchedDevice?.appliances);
+    }
+
+    if (isPlainObject(data.appliances)) {
+        return smartHomeDevicesFromAppliances(data.appliances);
+    }
+
+    const list = readListPayload(data, ["appliances", "items", "statuses"]);
+    if (list.length) {
+        return list
+            .map((device, index) => normalizeSmartHomeDevice(device.id || device.key || device.type || device.name || `device_${index}`, device))
+            .filter(Boolean);
+    }
+
+    return smartHomeDevicesFromAppliances(data);
 }
 
 function getTemperatureLevel(value) {
@@ -736,7 +1157,7 @@ function getEspStatus(deviceStatus) {
 }
 
 function getOverallLevel(metrics) {
-    const levels = [metrics.temperature.level, metrics.humidity.level, metrics.air.level, metrics.esp.level];
+    const levels = [metrics.temperature.level, metrics.humidity.level, metrics.pressure.level, metrics.air.level, metrics.esp.level];
     if (levels.includes("danger")) return "danger";
     if (levels.includes("warning")) return "warning";
     if (levels.includes("unknown")) return "unknown";
@@ -753,6 +1174,7 @@ function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
     const esp = getEspStatus(deviceStatus);
     const temperatureLevel = sensor.temperature === null ? "unknown" : getTemperatureLevel(sensor.temperature);
     const humidityLevel = sensor.humidity === null ? "unknown" : getHumidityLevel(sensor.humidity);
+    const pressureLevel = sensor.pressure === null ? "unknown" : "normal";
     const airLevel = sensor.airQualityScore === null ? "unknown" : "normal";
     const airDisplay = sensor.airQualityScore === null
         ? DISCONNECTED_TEXT
@@ -775,6 +1197,14 @@ function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
             label: "湿度",
             unit: "%"
         },
+        pressure: {
+            value: sensor.pressure,
+            display: formatNumber(sensor.pressure),
+            level: pressureLevel,
+            source: sensor.pressure === null ? "empty" : sensor.source,
+            label: "气压",
+            unit: "hPa"
+        },
         air: {
             value: sensor.airQualityScore,
             display: airDisplay,
@@ -787,6 +1217,7 @@ function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
         overall: getOverallLevel({
             temperature: { level: temperatureLevel },
             humidity: { level: humidityLevel },
+            pressure: { level: pressureLevel },
             air: { level: airLevel },
             esp
         })
@@ -841,14 +1272,17 @@ function setDashboardLoadingState(deviceId) {
         history: "loading",
         alerts: "loading",
         logs: "loading",
-        commands: "loading"
+        commands: "loading",
+        smartHome: "loading"
     };
+    dashboardState.smartHomeDevices = [];
     renderMetricCards();
     renderMainChart();
     renderAlertSummary();
     renderAlertLogs();
     renderSystemLogs();
     renderOperationLogs();
+    renderSmartHomeControls();
     renderStatusHeader();
     renderSourceDebug();
     const deviceNameElement = document.querySelector("[data-active-device-name]");
@@ -869,7 +1303,9 @@ function iconSvg(name) {
         door: '<svg viewBox="0 0 24 24"><path d="M5 3h11a2 2 0 0 1 2 2v16h2v2H3v-2h2V3Zm2 18h9V5H7v16Zm10 0h1V5h-1v16Zm-4-9h2v2h-2v-2Z"/></svg>',
         light: '<svg viewBox="0 0 24 24"><path d="M12 2a7 7 0 0 1 4 12.7V17a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2v-2.3A7 7 0 0 1 12 2Zm0 2a5 5 0 0 0-3 9l1 .7V17h4v-3.3l1-.7A5 5 0 0 0 12 4Zm-2 17h4v2h-4v-2Z"/></svg>',
         "air-purifier": '<svg viewBox="0 0 24 24"><path d="M7 3h10a3 3 0 0 1 3 3v15H4V6a3 3 0 0 1 3-3Zm0 2a1 1 0 0 0-1 1v13h12V6a1 1 0 0 0-1-1H7Zm2 2h6v2H9V7Zm-1 5c2.2-1.5 4.2.8 6.4-.6.8-.5 1.6-.4 2.2.2l-1.2 1.6c-.4-.3-.8-.2-1.3.1-2.2 1.5-4.2-.8-6.4.6-.7.5-1.5.4-2.2-.2l1.2-1.6c.4.3.8.2 1.3-.1Zm0 4c2.2-1.5 4.2.8 6.4-.6.8-.5 1.6-.4 2.2.2l-1.2 1.6c-.4-.3-.8-.2-1.3.1-2.2 1.5-4.2-.8-6.4.6-.7.5-1.5.4-2.2-.2l1.2-1.6c.4.3.8.2 1.3-.1Z"/></svg>',
-        humidifier: '<svg viewBox="0 0 24 24"><path d="M7 8h10a3 3 0 0 1 3 3v10H4V11a3 3 0 0 1 3-3Zm0 2a1 1 0 0 0-1 1v8h12v-8a1 1 0 0 0-1-1H7Zm2 4h6v2H9v-2ZM9 2h2v2a2 2 0 0 1-2 2H8V4h1V2Zm5 0h2v2a2 2 0 0 1-2 2h-1V4h1V2Z"/></svg>'
+        humidifier: '<svg viewBox="0 0 24 24"><path d="M7 8h10a3 3 0 0 1 3 3v10H4V11a3 3 0 0 1 3-3Zm0 2a1 1 0 0 0-1 1v8h12v-8a1 1 0 0 0-1-1H7Zm2 4h6v2H9v-2ZM9 2h2v2a2 2 0 0 1-2 2H8V4h1V2Zm5 0h2v2a2 2 0 0 1-2 2h-1V4h1V2Z"/></svg>',
+        tv: '<svg viewBox="0 0 24 24"><path d="M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-7v2h4v2H7v-2h4v-2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm0 2v10h16V7H4Z"/></svg>',
+        curtain: '<svg viewBox="0 0 24 24"><path d="M3 3h18v2H3V3Zm2 4h6v14H5V7Zm8 0h6v14h-6V7Zm-6 2v10h2V9H7Zm8 0v10h2V9h-2Z"/></svg>'
     };
     return icons[name] || "";
 }
@@ -928,6 +1364,26 @@ function setMetricChange(selector, text, levelKey = "normal") {
     element.className = `metric-change ${levelKey === "normal" ? "" : levelKey}`;
 }
 
+function setElementTooltip(selector, title) {
+    const element = document.querySelector(selector);
+    if (element) {
+        element.title = title || "";
+    }
+}
+
+function renderCardUpdateMeta(cardSelector, html) {
+    const card = document.querySelector(cardSelector);
+    if (!card) return;
+    let meta = card.querySelector("[data-card-update-meta]");
+    if (!meta) {
+        meta = document.createElement("div");
+        meta.className = "card-update-meta";
+        meta.dataset.cardUpdateMeta = "";
+        card.appendChild(meta);
+    }
+    meta.innerHTML = html;
+}
+
 function setStatusDot(element, level) {
     if (!element) return;
     element.className = `status-dot ${level === "normal" ? "online" : ""}`;
@@ -958,6 +1414,9 @@ function renderDeviceChrome() {
 }
 
 function renderMetricCards() {
+    const trend = getRecentTrendPoints();
+    const updatedAt = dashboardState.sensor?.timestamp || dashboardState.deviceStatus?.lastSeenMs || null;
+    const deviceId = getActiveDeviceId();
     Object.entries(metricDefinitions).forEach(([key, definition]) => {
         const icon = document.querySelector(`[data-metric-icon="${key}"]`);
         const sparkline = document.querySelector(`[data-sparkline="${key}"]`);
@@ -971,6 +1430,7 @@ function renderMetricCards() {
     });
 
     const metrics = dashboardState.metrics;
+    const airQualityState = getAirQualityState(metrics.air.value);
     setText("#temperatureValue", metrics.temperature.display || NO_DATA_TEXT);
     setText("#humidityValue", metrics.humidity.display || NO_DATA_TEXT);
     setText("#airQualityValue", metrics.air.display || NO_DATA_TEXT);
@@ -987,8 +1447,28 @@ function renderMetricCards() {
 
     setMetricChange('[data-field="temperatureChange"]', sourceLabel(metrics.temperature.source), metrics.temperature.level);
     setMetricChange('[data-field="humidityChange"]', sourceLabel(metrics.humidity.source), metrics.humidity.level);
-    setMetricChange('[data-field="airChange"]', sourceLabel(metrics.air.source), metrics.air.level);
+    setMetricChange('[data-field="airChange"]', `${sourceLabel(metrics.air.source)} · ${airQualityState.label}`, metrics.air.level);
     setMetricChange('[data-field="espLatency"]', metrics.esp.note, metrics.esp.level);
+    animateNumericChange("#temperatureValue", metrics.temperature.value);
+    animateNumericChange("#humidityValue", metrics.humidity.value);
+    animateNumericChange("#airQualityValue", metrics.air.value);
+    const sensorTooltip = apiPath => [
+        `来源：ESP32 ${deviceId}`,
+        updatedAt ? `更新时间：${formatTime(updatedAt)}` : "",
+        `API：${apiPath}`
+    ].filter(Boolean).join("\n");
+    setElementTooltip('[data-metric-card="temperature"]', sensorTooltip("/api/dashboard/v1/sensors/latest"));
+    setElementTooltip('[data-metric-card="humidity"]', sensorTooltip("/api/dashboard/v1/sensors/latest"));
+    setElementTooltip('[data-metric-card="air"]', sensorTooltip("/api/dashboard/v1/sensors/latest"));
+    setElementTooltip('[data-metric-card="esp"]', [
+        `来源：ESP32 ${deviceId}`,
+        updatedAt ? `更新时间：${formatTime(updatedAt)}` : "",
+        "API：/api/dashboard/v1/device/status"
+    ].filter(Boolean).join("\n"));
+    renderCardUpdateMeta('[data-metric-card="temperature"]', `${UpdateTime(updatedAt, `ESP32 ${deviceId}`, "/api/dashboard/v1/sensors/latest")}${TrendArrow(trend.current?.temperature ?? metrics.temperature.value, trend.previous?.temperature, { unit: "℃", digits: 1 })}`);
+    renderCardUpdateMeta('[data-metric-card="humidity"]', `${UpdateTime(updatedAt, `ESP32 ${deviceId}`, "/api/dashboard/v1/sensors/latest")}${TrendArrow(trend.current?.humidity ?? metrics.humidity.value, trend.previous?.humidity, { unit: "%", digits: 1 })}`);
+    renderCardUpdateMeta('[data-metric-card="air"]', `${UpdateTime(updatedAt, `ESP32 ${deviceId}`, "/api/dashboard/v1/sensors/latest")}${TrendArrow(trend.current?.air ?? metrics.air.value, trend.previous?.air, { mode: "air" })}`);
+    renderCardUpdateMeta('[data-metric-card="esp"]', UpdateTime(updatedAt, `ESP32 ${deviceId}`, "/api/dashboard/v1/device/status"));
     renderDeviceChrome();
 }
 
@@ -1128,6 +1608,7 @@ function renderAlertSummary() {
     const rows = [
         { label: "温度", value: metricDisplay(dashboardState.metrics.temperature), key: "temperature", icon: "thermometer" },
         { label: "湿度", value: metricDisplay(dashboardState.metrics.humidity), key: "humidity", icon: "drop" },
+        { label: "气压", value: metricDisplay(dashboardState.metrics.pressure), key: "pressure", icon: "chip" },
         {
             label: dashboardState.metrics.air.label,
             value: metricDisplay(dashboardState.metrics.air),
@@ -1208,7 +1689,7 @@ function renderSystemLogs() {
 
     const previewLogs = dashboardState.systemLogs.slice(0, SYSTEM_LOG_PREVIEW_LIMIT);
     if (previewLogs.length === 0) {
-        container.innerHTML = '<div class="system-log empty">未接入</div>';
+        container.innerHTML = '<div class="system-log empty">暂无系统日志</div>';
         return;
     }
 
@@ -1216,7 +1697,7 @@ function renderSystemLogs() {
         <div class="system-log">
             <i style="--accent:${log.color}"></i>
             <time>${escapeHtml(log.time)}</time>
-            <span>${escapeHtml(log.text)}</span>
+            <span>${escapeHtml(log.source ? `${log.source}：${log.text}` : log.text)}</span>
         </div>
     `).join("");
 }
@@ -1318,7 +1799,7 @@ function renderAlertLogModal(logs) {
 // 日志弹窗：渲染最新日志完整列表，保持“时间 + 来源 + 内容”横向阅读方式。
 function renderSystemLogModal(logs) {
     if (!logs.length) {
-        return '<div class="log-empty">未接入</div>';
+        return '<div class="log-empty">暂无系统日志</div>';
     }
 
     return `
@@ -1432,7 +1913,17 @@ function renderStatusHeader() {
                 : EMPTY_TEXT;
 
     document.querySelectorAll("[data-last-updated]").forEach(element => {
-        element.textContent = updatedText;
+        const timestamp = dashboardState.sensor?.timestamp || dashboardState.deviceStatus?.lastSeenMs || null;
+        const date = parseTimestamp(timestamp);
+        if (date) {
+            element.dataset.relativeTime = String(date.getTime());
+            element.textContent = `${updatedText} · ${formatRelativeTime(date)}`;
+            element.title = `更新时间：${updatedText}`;
+        } else {
+            element.dataset.relativeTime = "";
+            element.textContent = updatedText;
+            element.title = "";
+        }
     });
 
     setText("[data-alert-badge]", activeAlerts.length);
@@ -1465,11 +1956,17 @@ function renderStatusHeader() {
 
 function renderSourceDebug() {
     const sources = dashboardState.sources;
+    const asrText = dashboardState.asr?.text
+        ? `real · ${String(dashboardState.asr.text).slice(0, 24)}`
+        : sources.asr;
+    const llmText = dashboardState.llm?.response
+        ? `real · ${String(dashboardState.llm.response).slice(0, 24)}`
+        : sources.llm;
     setText('[data-source="sensor"]', sources.sensor);
-    setText('[data-source="asr"]', sources.asr);
-    setText('[data-source="llm"]', sources.llm);
+    setText('[data-source="asr"]', asrText);
+    setText('[data-source="llm"]', llmText);
 
-    const signature = `Sensor: ${sources.sensor} / ASR: ${sources.asr} / LLM: ${sources.llm}`;
+    const signature = `Sensor: ${sources.sensor} / ASR: ${asrText} / LLM: ${llmText}`;
     if (signature !== lastSourceSignature) {
         console.info(`[Dashboard] data source -> ${signature}`);
         lastSourceSignature = signature;
@@ -1507,11 +2004,25 @@ function renderSmartHomeControls() {
     const devices = Array.isArray(dashboardState.smartHomeDevices) ? dashboardState.smartHomeDevices : [];
     const hasEnabledDevice = devices.some(device => !device.disabled);
     if (note) {
-        note.hidden = false;
-        note.textContent = SMART_HOME_UNAVAILABLE_MESSAGE;
+        note.hidden = hasEnabledDevice;
+        if (dashboardState.sources.smartHome === "loading") {
+            note.textContent = LOADING_TEXT;
+        } else if (dashboardState.sources.smartHome === "error") {
+            note.textContent = ERROR_TEXT;
+        } else {
+            note.textContent = SMART_HOME_UNAVAILABLE_MESSAGE;
+        }
+    }
+    if (dashboardState.sources.smartHome === "loading") {
+        list.innerHTML = '<div class="system-log empty">Loading...</div>';
+        return;
+    }
+    if (dashboardState.sources.smartHome === "error") {
+        list.innerHTML = `<div class="system-log empty">${ERROR_TEXT}</div>`;
+        return;
     }
     if (!devices.length) {
-        list.innerHTML = '<div class="system-log empty">未接入</div>';
+        list.innerHTML = '<div class="system-log empty">暂无智能家居状态</div>';
         return;
     }
 
@@ -1554,8 +2065,22 @@ function handleSmartHomeOptionClick(event) {
     }
 }
 
+function isCurrentCDeviceRequest(deviceId) {
+    return activeDashboardPage !== "s3" && getActiveDeviceId() === deviceId;
+}
+
 async function loadSmartHomeStatuses() {
-    dashboardState.smartHomeDevices = null;
+    const deviceId = getActiveDeviceId();
+    dashboardState.sources.smartHome = "loading";
+    dashboardState.smartHomeDevices = [];
+    renderSmartHomeControls();
+    const result = await fetchSmartHomeStatuses(deviceId);
+    if (!isCurrentCDeviceRequest(deviceId)) {
+        return;
+    }
+
+    dashboardState.sources.smartHome = result.source;
+    dashboardState.smartHomeDevices = Array.isArray(result.data) ? result.data : [];
     renderSmartHomeControls();
 }
 
@@ -1702,22 +2227,59 @@ function openCommandConfirmModal(config) {
     document.body.classList.add("log-modal-open");
 }
 
+async function fetchCDeviceDashboardData(deviceId) {
+    const [
+        sensorResult,
+        deviceStatusResult,
+        asrResult,
+        llmResult,
+        historyResult,
+        alertResult,
+        systemResult,
+        commandResult,
+        smartHomeResult
+    ] = await Promise.all([
+        fetchLatestSensor(deviceId),
+        fetchDeviceStatus(deviceId),
+        fetchLatestASR(deviceId),
+        fetchLatestLLM(deviceId),
+        fetchHistoryData(deviceId),
+        fetchAlertLogs(deviceId),
+        fetchSystemLogs(deviceId),
+        fetchCommandLogs(deviceId),
+        fetchSmartHomeStatuses(deviceId)
+    ]);
+
+    return {
+        sensorResult,
+        deviceStatusResult,
+        asrResult,
+        llmResult,
+        historyResult,
+        alertResult,
+        systemResult,
+        commandResult,
+        smartHomeResult
+    };
+}
+
 async function updateDashboard() {
     const deviceId = getActiveDeviceId();
     setDashboardLoadingState(deviceId);
 
-    const [sensorResult, deviceStatusResult, asrResult, llmResult, historyResult, alertResult, systemResult, commandResult] = await Promise.all([
-        fetchLatestSensor(deviceId),
-        fetchDeviceStatus(deviceId),
-        fetchLatestASR(),
-        fetchLatestLLM(),
-        fetchHistoryData(deviceId),
-        fetchAlertLogs(deviceId),
-        fetchSystemLogs(deviceId),
-        fetchCommandLogs(deviceId)
-    ]);
+    const {
+        sensorResult,
+        deviceStatusResult,
+        asrResult,
+        llmResult,
+        historyResult,
+        alertResult,
+        systemResult,
+        commandResult,
+        smartHomeResult
+    } = await fetchCDeviceDashboardData(deviceId);
 
-    if (activeDashboardPage === "s3" || getActiveDeviceId() !== deviceId) {
+    if (!isCurrentCDeviceRequest(deviceId)) {
         return;
     }
 
@@ -1740,22 +2302,33 @@ async function updateDashboard() {
         history: historyResult.source,
         alerts: alertResult.source,
         logs: systemResult.source,
-        commands: commandResult.source
+        commands: commandResult.source,
+        smartHome: smartHomeResult.source
     };
     dashboardState.metrics = buildMetrics(sensor, deviceStatus);
     dashboardState.history = Array.isArray(historyResult.data) ? historyResult.data : [];
     dashboardState.alertLogs = Array.isArray(alertResult.data) ? alertResult.data.map(normalizeAlertLog) : [];
-    dashboardState.systemLogs = Array.isArray(systemResult.data) ? systemResult.data : [];
+    dashboardState.systemLogs = Array.isArray(systemResult.data) ? systemResult.data.map(normalizeSystemLog) : [];
     dashboardState.operationLogs = Array.isArray(commandResult.data) ? commandResult.data : [];
+    dashboardState.smartHomeDevices = Array.isArray(smartHomeResult.data) ? smartHomeResult.data : [];
 
     renderMetricCards();
     renderMainChart();
     renderAlertSummary();
     renderAlertLogs();
     renderSystemLogs();
+    renderSmartHomeControls();
     renderActiveLogModal();
     renderStatusHeader();
     renderSourceDebug();
+    markRealtimeSuccess({
+        syncAt: Date.now(),
+        dataAt: sensor?.timestamp || deviceStatus?.lastSeenMs || Date.now(),
+        apiOk: sensorResult.ok || deviceStatusResult.ok,
+        apiLatencyMs: deviceStatus?.latestUploadDelayMs ?? null,
+        page: activeDashboardPage,
+        deviceId
+    });
 }
 
 async function handleFetchCurrentData(button) {
@@ -1774,7 +2347,7 @@ async function handleFetchCurrentData(button) {
             return;
         }
 
-        if (activeDashboardPage === "s3" || getActiveDeviceId() !== deviceId) {
+        if (!isCurrentCDeviceRequest(deviceId)) {
             return;
         }
 
@@ -2038,6 +2611,24 @@ function renderS3DashboardIfNeeded(force = false) {
     }
 }
 
+function startS3DashboardTimer() {
+    if (s3DashboardRefreshTimer) {
+        clearInterval(s3DashboardRefreshTimer);
+    }
+    s3DashboardRefreshTimer = setInterval(() => {
+        if (activeDashboardPage === "s3") {
+            renderS3DashboardIfNeeded(true);
+        }
+    }, S3_DASHBOARD_REFRESH_INTERVAL_MS);
+}
+
+function stopS3DashboardTimer() {
+    if (s3DashboardRefreshTimer) {
+        clearInterval(s3DashboardRefreshTimer);
+        s3DashboardRefreshTimer = null;
+    }
+}
+
 function updateRouteChrome(page) {
     document.querySelectorAll("[data-dashboard-page]").forEach(item => {
         const isActive = item.dataset.dashboardPage === page;
@@ -2069,9 +2660,11 @@ function setDashboardPage(page, options = {}) {
     if (nextPage === "s3") {
         cleanupDashboardTimers();
         renderS3DashboardIfNeeded(true);
+        startS3DashboardTimer();
         return;
     }
 
+    stopS3DashboardTimer();
     if (options.refresh !== false) {
         updateDashboard();
     }
@@ -2124,10 +2717,12 @@ function cleanupDashboardTimers() {
         clearInterval(espDelayRefreshTimer);
         espDelayRefreshTimer = null;
     }
+    stopS3DashboardTimer();
 }
 
 document.addEventListener("DOMContentLoaded", () => {
     initThemeToggle();
+    startRealtimeClock();
     initChartRangeSelector();
     initLogModals();
     bindCommandButtons();

@@ -209,12 +209,15 @@ VOLC_GATEWAY_TTS_VOICE=<TTS 音色>
 VOLC_GATEWAY_TTS_PATH=/v1/realtime
 VOLC_GATEWAY_TTS_SAMPLE_RATE=16000
 VOLC_GATEWAY_TTS_FORMAT=pcm_s16le_mono_16k
+VOLC_GATEWAY_TTS_SPEED=1.0
+VOLC_GATEWAY_TTS_PITCH=1.0
+VOLC_GATEWAY_TTS_VOLUME=1.0
 ```
 
 配置说明：
 
 - 当前项目没有内置真实 ASR+LLM+TTS voice turn 上游时，请设置 `VOICE_TURN_MOCK=1`。服务器会稳定返回 `audio/L16; rate=16000; channels=1` 的 mock PCM 音频，用于验证 ESP32 和 Node 后端的 HTTP 音频链路。
-- `VOICE_TURN_MOCK=1` 也会让 `GET /api/voice/prompt` 返回 1 秒非静音 mock PCM，用于验证 wake prompt cache 下载、保存和播放链路；该 mock PCM 只是测试音，不代表真实“我在，你说”TTS 音色。
+- `VOICE_TURN_MOCK=1` 也会让 `GET /api/voice/prompt` 返回 1 秒非静音 mock PCM，用于验证 wake prompt cache 下载、保存和播放链路；该 mock PCM 只是测试音，不代表真实 wake prompt TTS 音色。
 - 只有接入真实火山网关 ASR -> LLM -> TTS 链路时，才设置 `VOICE_TURN_MOCK=0` 并填写 `VOLC_GATEWAY_*` 配置。
 - 火山网关当前已知可用的是文本 Chat Completions：`https://ai-gateway.vei.volces.com/v1/chat/completions`，以及 Realtime WebSocket：`wss://ai-gateway.vei.volces.com/v1/realtime?model=bigmodel`。这些都不是 `/v1/voice` HTTP turn 上游。
 - 当前后端实现使用 `VOLC_GATEWAY_*` 配置完成 ASR -> LLM -> TTS 链式处理；`VOICE_TURN_MOCK=1` 时不调用外部 ASR/LLM/TTS。
@@ -303,9 +306,58 @@ PCM 请求体超过 `VOICE_TURN_MAX_BYTES` 时返回 HTTP `413`：
 }
 ```
 
+### `GET /api/voice/prompt/config`
+
+读取 wake prompt 当前配置。ESPS3 会先读取本接口，比较 `voice_config_hash` 与本地 metadata；hash 变化时重新拉取 PCM 缓存。C5 不调用本接口，也不解析提示词文本。
+
+```json
+{
+  "ok": true,
+  "config": {
+    "wake_prompt_text": "我在，你说",
+    "provider": "volc",
+    "voice_id": "server_prompt_v1",
+    "speaker_id": "",
+    "speed": 1,
+    "pitch": 1,
+    "volume": 1,
+    "sample_rate": 16000,
+    "format": "s16le",
+    "channels": 1,
+    "prompt_version": "wake:...",
+    "voice_config_hash": "...",
+    "updated_at_ms": 1780732144669
+  }
+}
+```
+
+`voice_config_hash` 由 `wake_prompt_text`、`provider`、`voice_id`、`speaker_id`、`speed`、`pitch`、`volume`、`sample_rate`、`format`、`channels` 生成；任一字段变化都会改变 hash。
+
+### `PUT /api/voice/prompt/config`
+
+更新 wake prompt 文本或必要 TTS 参数。配置保存到服务器本地 JSON 文件，默认位于 `cache/voice_prompts/wake_prompt_config.json`；测试可用 `VOICE_PROMPT_CONFIG_PATH` 指向临时文件。修改后不需要重新烧录 C5/S3，下一次 S3 请求会按 hash 重新拉取。
+
+```http
+PUT /api/voice/prompt/config
+Content-Type: application/json
+```
+
+```json
+{
+  "wake_prompt_text": "你好，我在",
+  "voice_id": "server_prompt_v2",
+  "speed": 1,
+  "pitch": 1,
+  "volume": 1,
+  "sample_rate": 16000,
+  "format": "s16le",
+  "channels": 1
+}
+```
+
 ### `GET /api/voice/prompt-cache`
 
-ESP 唤醒提示音服务器缓存接口。当前 `Whole-project` wake prompt 主路径请求：
+ESP 唤醒提示音服务器缓存接口。当前 ESP-111 主链路是 ESPS3 请求 Server 缓存/生成 wake prompt PCM，C5 再从 ESPS3 `/local/v1/audio/wake-prompt` 获取二进制流播放。
 
 ```http
 GET /api/voice/prompt-cache?prompt_key=wake_ack_zh&device_id=esp32-c5-whole-001
@@ -320,6 +372,10 @@ Content-Type: audio/L16; rate=16000; channels=1
 X-Prompt-Key: wake_ack_zh
 X-Prompt-Cache: hit
 X-Audio-Format: pcm_s16le_mono_16k
+X-Audio-Sample-Rate: 16000
+X-Audio-Channels: 1
+X-Audio-Version: wake:...
+X-Voice-Config-Hash: ...
 X-Sample-Rate: 16000
 X-Channels: 1
 X-Server-Time-Ms: 1780732144669
@@ -600,6 +656,316 @@ ESP 执行命令后回传结果。该接口只记录回执，不由 Server 判�
 错误响应：
 
 - `400 DEVICE_ID_INVALID`: `device_id` 超过 `128` 个字符。
+
+### `POST /api/commands/v1/natural-language`
+
+创建一条自然语言命令记录。该接口只保存用户自然语言意图，写入 `natural_language_commands` 并记录 `command_created` 事件；当前不会自动解析成设备控制命令，也不会直接下发到 ESP。
+
+请求体：
+
+```json
+{
+  "text": "把客厅灯打开",
+  "source": "dashboard",
+  "room_id": "living_room",
+  "device_id": "sensair_shuttle_01"
+}
+```
+
+成功响应返回 HTTP `202`，使用通用 API envelope：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "command": {
+      "command_id": "nlcmd_uuid",
+      "type": "natural_language",
+      "text": "把客厅灯打开",
+      "source": "dashboard",
+      "room_id": "living_room",
+      "device_id": "sensair_shuttle_01",
+      "status": "queued",
+      "parsed_intent": null,
+      "created_at_ms": 1780000000000,
+      "updated_at_ms": 1780000000000
+    }
+  },
+  "error": null
+}
+```
+
+错误响应：
+
+- `400 NATURAL_LANGUAGE_TEXT_REQUIRED`: 缺少 `text` 或 trim 后为空。
+
+### `GET /api/commands/v1/recent`
+
+读取最近自然语言命令记录，按创建顺序倒序返回。
+
+查询参数：
+
+- `limit`: 可选，默认 `50`，最大 `200`。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "commands": [
+      {
+        "command_id": "nlcmd_uuid",
+        "type": "natural_language",
+        "text": "把客厅灯打开",
+        "source": "dashboard",
+        "room_id": "living_room",
+        "device_id": "sensair_shuttle_01",
+        "status": "queued",
+        "parsed_intent": null,
+        "created_at_ms": 1780000000000,
+        "updated_at_ms": 1780000000000
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+## 智能家居接口
+
+本节接口用于 Server 记录外部智能家居网关状态、排队控制命令，并供 S3 或其他网关拉取执行。当前后端只维护状态、命令队列和事件日志，不代表真实智能家居云平台已经接入。
+
+本节接口使用通用 API envelope：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {},
+  "error": null
+}
+```
+
+失败时 `data=null`，`error.code` 是稳定错误码，`error.message` 是可读说明。
+
+### `GET /api/smart-home/v1/status`
+
+读取 Server 当前保存的智能家居设备状态。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "available": true,
+    "configured": true,
+    "provider": "s3_gateway",
+    "last_update_ms": 1780000000000,
+    "devices": [
+      {
+        "id": "light_001",
+        "type": "light",
+        "name": "客厅灯",
+        "room_id": "living_room",
+        "room_name": "客厅",
+        "online": true,
+        "state": {
+          "power": true,
+          "brightness": 80
+        },
+        "updated_at_ms": 1780000000000
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+`provider` 当前归一化为 `local`、`s3_gateway` 或 `none`；设备类型归一化为 `air_conditioner`、`light`、`fan`、`tv`、`curtain` 或 `unknown`。
+
+### `POST /api/smart-home/v1/state`
+
+S3 或其他网关批量上报智能家居设备状态。服务器会按 `device_id` upsert `smart_home_devices`，并写入 `smart_home_state_updated` 系统事件。
+
+请求体：
+
+```json
+{
+  "provider": "s3_gateway",
+  "gateway_id": "sensair_s3_gateway_01",
+  "devices": [
+    {
+      "id": "light_001",
+      "type": "light",
+      "name": "客厅灯",
+      "room_id": "living_room",
+      "room_name": "客厅",
+      "online": true,
+      "state": {
+        "power": true,
+        "brightness": 80
+      }
+    }
+  ]
+}
+```
+
+成功响应返回 HTTP `202`，`data.devices[]` 是实际归一化并保存的设备数组。
+
+错误响应：
+
+- `400 SMART_HOME_DEVICES_REQUIRED`: `devices` 不是非空数组。
+- `400 SMART_HOME_DEVICE_ID_REQUIRED`: 某个设备缺少 `id` 或 `device_id`。
+
+### `POST /api/smart-home/v1/control`
+
+创建一条智能家居控制命令，等待网关通过 pending 接口拉取。该接口不直接执行设备动作。
+
+请求体：
+
+```json
+{
+  "target_id": "light_001",
+  "gateway_id": "sensair_s3_gateway_01",
+  "room_id": "living_room",
+  "room_name": "客厅",
+  "action": "set_power",
+  "params": {
+    "power": true
+  },
+  "source": "dashboard",
+  "requested_by": "user"
+}
+```
+
+成功响应返回 HTTP `202`：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "command": {
+      "command_id": "shcmd_uuid",
+      "target_id": "light_001",
+      "gateway_id": "sensair_s3_gateway_01",
+      "room_id": "living_room",
+      "room_name": "客厅",
+      "action": "set_power",
+      "params": {
+        "power": true
+      },
+      "source": "dashboard",
+      "requested_by": "user",
+      "status": "queued",
+      "created_at_ms": 1780000000000,
+      "updated_at_ms": 1780000000000
+    },
+    "message": "queued; waiting for gateway pull"
+  },
+  "error": null
+}
+```
+
+错误响应：
+
+- `400 SMART_HOME_TARGET_REQUIRED`: 缺少 `target_id` 或 `device_id`。
+- `400 SMART_HOME_ACTION_REQUIRED`: 缺少 `action`。
+
+### `GET /api/smart-home/v1/commands`
+
+读取智能家居命令历史，默认按最新记录倒序返回。
+
+查询参数：
+
+- `limit`: 可选，默认 `50`，最大 `200`。
+
+响应 `data.commands[]` 字段包括 `command_id`、`target_id`、`gateway_id`、`action`、`params`、`status`、`result`、`error_message`、`created_at_ms`、`updated_at_ms`、`acknowledged_at_ms` 和 `executed_at_ms`。
+
+### `GET /api/smart-home/v1/commands/pending`
+
+网关拉取待执行智能家居命令。返回前服务器会把命令从 `queued` 标记为 `dispatched`；如果命令原本没有 `gateway_id`，会绑定本次请求的 `gateway_id`。
+
+查询参数：
+
+- `gateway_id`: 可选，网关 ID；为空时只领取未绑定网关的 queued 命令。
+- `limit`: 可选，默认 `20`，最大 `200`。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "commands": [
+      {
+        "command_id": "shcmd_uuid",
+        "target_id": "light_001",
+        "gateway_id": "sensair_s3_gateway_01",
+        "action": "set_power",
+        "params": {
+          "power": true
+        },
+        "status": "dispatched",
+        "created_at_ms": 1780000000000,
+        "updated_at_ms": 1780000000100
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+### `POST /api/smart-home/v1/commands/:command_id/ack`
+
+网关执行智能家居命令后回传结果。`status="completed"` 会兼容归一化为 `success`；最终只接受 `success` 或 `failed`。
+
+请求体：
+
+```json
+{
+  "status": "success",
+  "executed_at_ms": 1780000000200,
+  "result": {
+    "applied": true
+  },
+  "error_message": ""
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "command": {
+      "command_id": "shcmd_uuid",
+      "target_id": "light_001",
+      "status": "success",
+      "result": {
+        "applied": true
+      },
+      "acknowledged_at_ms": 1780000000300,
+      "executed_at_ms": 1780000000200
+    }
+  },
+  "error": null
+}
+```
+
+错误响应：
+
+- `400 SMART_HOME_COMMAND_ID_REQUIRED`: 缺少 `command_id`。
+- `400 SMART_HOME_COMMAND_ACK_STATUS_INVALID`: `status` 不是 `success`、`completed` 或 `failed`。
+- `404 SMART_HOME_COMMAND_NOT_FOUND`: 命令不存在。
 
 ## 长期记忆接口
 
@@ -1096,6 +1462,246 @@ ESP 执行命令后回传结果。该接口只记录回执，不由 Server 判�
   "ok": false,
   "code": "USER_DATA_EXPORT_RESERVED",
   "error": "user data export is reserved for a future backend phase"
+}
+```
+
+## 事件日志与实时事件接口
+
+本节接口用于 Dashboard、调试工具和后端任务读取告警、系统日志、语音事件，以及通过 SSE 订阅实时事件。事件记录写入 `event_logs`；`event_type` 归一化为 `alarm`、`system`、`command`、`voice`、`device` 或 `csi`，未知类型按 `system` 保存。
+
+### `GET /api/logs/v1/alarms`
+
+读取告警事件，按最新记录倒序返回。
+
+查询参数：
+
+- `limit`: 可选，默认 `50`，最大 `200`。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "alarms": [
+      {
+        "id": "alarm_uuid",
+        "level": "warning",
+        "source": "server",
+        "device_id": "sensair_shuttle_01",
+        "room_id": "living_room",
+        "room_name": "客厅",
+        "title": "空气质量提醒",
+        "message": "空气质量下降",
+        "payload": {},
+        "created_at_ms": 1780000000000,
+        "acknowledged": false
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+### `POST /api/logs/v1/alarms`
+
+创建一条告警事件，写入 `event_logs(event_type="alarm")`，并通过 SSE 广播。
+
+请求体：
+
+```json
+{
+  "device_id": "sensair_shuttle_01",
+  "level": "warning",
+  "title": "空气质量提醒",
+  "message": "空气质量下降",
+  "room_id": "living_room",
+  "room_name": "客厅",
+  "acknowledged": false,
+  "payload": {
+    "air_quality_score": 42
+  },
+  "source": "dashboard"
+}
+```
+
+成功响应返回 HTTP `201`，`data.alarm` 为告警展示对象。
+
+### `GET /api/logs/v1/system`
+
+读取系统类日志，包含 `system`、`device`、`csi`、`command` 和 `voice` 事件。
+
+查询参数：
+
+- `limit`: 可选，默认 `50`，最大 `200`。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "logs": [
+      {
+        "id": "system_uuid",
+        "level": "info",
+        "source": "server_startup",
+        "message": "server started and database migrations ensured",
+        "payload": {},
+        "created_at_ms": 1780000000000
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+### `POST /api/logs/v1/system`
+
+创建一条系统日志事件，写入 `event_logs(event_type="system")`，并通过 SSE 广播。
+
+请求体：
+
+```json
+{
+  "device_id": "sensair_shuttle_01",
+  "level": "info",
+  "message": "device connected",
+  "payload": {
+    "rssi": -58
+  },
+  "source": "s3_gateway"
+}
+```
+
+成功响应返回 HTTP `201`，`data.log` 为系统日志展示对象。
+
+### `GET /api/voice/v1/events`
+
+读取语音事件日志，按最新记录倒序返回。该接口只读 `event_logs(event_type="voice")`，不读取或修改 `voice_turns` 原始诊断表。
+
+查询参数：
+
+- `limit`: 可选，默认 `50`，最大 `200`。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "events": [
+      {
+        "id": "voice_uuid",
+        "event": "voice_event_created",
+        "device_id": "sensair_shuttle_01",
+        "message": "voice_turn_completed",
+        "payload": {},
+        "created_at_ms": 1780000000000
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+### `POST /api/logs/v1/cleanup`
+
+清理指定类型的历史事件。默认会拒绝小于 1 小时的清理窗口，除非显式传 `force=true`。`dry_run=true` 时只统计，不删除。
+
+请求体：
+
+```json
+{
+  "types": [
+    "system",
+    "device",
+    "csi"
+  ],
+  "older_than_ms": 604800000,
+  "dry_run": true,
+  "force": false
+}
+```
+
+字段说明：
+
+- `type`: 可选，单个事件类型；传 `"all"` 表示全部类型。
+- `types`: 可选，事件类型数组；可包含 `"all"`。
+- `older_than_ms`: 必填，正整数，表示删除早于当前时间减该窗口的事件。
+- `dry_run`: 可选，`true` 时只返回将删除的数量。
+- `force`: 可选，`older_than_ms < 3600000` 时必须为 `true`。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "deleted": {
+      "system": 12
+    },
+    "dry_run": true
+  },
+  "error": null
+}
+```
+
+错误响应：
+
+- `400 LOG_CLEANUP_OLDER_THAN_INVALID`: `older_than_ms` 不是正数。
+- `400 LOG_CLEANUP_WINDOW_TOO_RECENT`: 清理窗口小于 1 小时且未传 `force=true`。
+
+### `DELETE /api/logs/v1/events`
+
+按 query 参数执行事件删除。该接口会调用同一清理逻辑，并强制 `dry_run=false`。
+
+查询参数：
+
+- `type`: 可选，默认 `system`；可传 `all` 或单个事件类型。
+- `older_than_ms`: 必填，正整数。
+- `force`: 可选，允许小于 1 小时的清理窗口。
+
+成功响应同 `POST /api/logs/v1/cleanup`，其中 `dry_run=false`。
+
+### `GET /api/events/v1/stream`
+
+实时事件 Server-Sent Events 订阅接口。
+
+响应头：
+
+```http
+Content-Type: text/event-stream
+Cache-Control: no-cache, no-transform
+Connection: keep-alive
+X-Accel-Buffering: no
+```
+
+连接建立后立即发送：
+
+```text
+event: connected
+data: {"server_time_ms":1780000000000}
+```
+
+连接存活期间每 `15000ms` 发送一次心跳：
+
+```text
+event: ping
+data: {"server_time_ms":1780000015000}
+```
+
+后端调用 `recordEvent`、智能家居命令创建/回执、日志清理等路径会广播对应事件名，例如 `alarm_created`、`system_log_created`、`command_created`、`voice_event_created`、`command_acknowledged`、`logs_cleaned`。事件数据统一为：
+
+```json
+{
+  "server_time_ms": 1780000000000,
+  "event": "command_created",
+  "data": {}
 }
 ```
 
@@ -1780,7 +2386,7 @@ S3 网关上传 Dashboard 标准快照的入口。该接口只接收 `payload_ty
 - `schema_version` 必须为 `2`。
 - `devices[].appliances.*` 目前允许 S3 或 Server 使用 mock/fake 数据，但每个 mock 对象必须包含 `source:"mock"` 和 `mock:true`。
 - `devices[].occupancy` 可由 S3 snapshot 提供；缺失或 `available=false` 时 Server 归一化为 `state:"unknown"`、`motion_score:null`。
-- 服务器当前保存最近一次 snapshot 的内存副本，`/api/dashboard/v1/overview` 优先读取该快照；Server 重启后若尚未收到 S3 快照，会回退到传感器历史和设备状态聚合。
+- 服务器会把 snapshot 写入 `dashboard_snapshots`，并保留最近一次 snapshot 的内存副本；`/api/dashboard/v1/overview` 优先读取该快照。Server 重启后会先尝试从数据库恢复最近快照，数据库无快照时才回退到传感器历史和设备状态聚合。
 
 错误码：
 
@@ -1793,11 +2399,32 @@ S3 网关上传 Dashboard 标准快照的入口。该接口只接收 `payload_ty
 
 ### `GET /api/device/v1/status`
 
-读取整机状态。`device_id` 可选；为空时返回最近一个设备状态。
+读取整机状态。`device_id` 可选；为空时返回最近一个设备状态。响应包含通用 API envelope 的 `data.devices[]`，并额外保留顶层 `status` 兼容旧调试调用。
 
 ```json
 {
   "ok": true,
+  "server_time_ms": 1780732145869,
+  "data": {
+    "devices": [
+      {
+        "device_id": "esp32-c5-whole-001",
+        "online": true,
+        "device_online": true,
+        "last_seen_ms": 1780732144669,
+        "last_seen_iso": "2026-06-09T20:10:44.669Z",
+        "last_seen_age_ms": 1200,
+        "last_payload_type": "sensor.bme690",
+        "last_module_type": "sensor.bme690",
+        "time_synced": true,
+        "latest_upload_delay_ms": 2462,
+        "avg_upload_delay_ms": 1800,
+        "delay_sample_count": 3,
+        "reboot_count": 0
+      }
+    ]
+  },
+  "error": null,
   "status": {
     "device_id": "esp32-c5-whole-001",
     "online": true,
@@ -1812,10 +2439,13 @@ S3 网关上传 Dashboard 标准快照的入口。该接口只接收 `payload_ty
     "avg_upload_delay_ms": 1800,
     "delay_sample_count": 3,
     "reboot_count": 0
-  },
-  "server_time_ms": 1780732145869
+  }
 }
 ```
+
+### `GET /api/device/v1/status/:device_id`
+
+读取指定设备状态，响应形状同 `GET /api/device/v1/status?device_id=...`。路径参数会 trim，最多保留 `128` 个字符；当前实现没有为超长路径 ID 单独返回 400，而是按截断后的 ID 查询。
 
 ### `GET /api/device/v1/modules/status`
 
@@ -2003,7 +2633,7 @@ BME 模块离线不等于整机离线；整机在线由 `device_status` 判断�
 
 ### `GET /api/dashboard/v1/overview`
 
-Dashboard 首屏聚合读取接口。收到 S3 `gateway.dashboard_snapshot` 后，该接口优先返回 S3 标准快照；尚未收到快照时，后端会用现有 `sensor_records/device_status` 生成同形状兜底数据。某个子读取失败时，整体返回 `ok=false` 和 `DASHBOARD_OVERVIEW_READ_FAILED`。
+Dashboard 首屏聚合读取接口。收到 S3 `gateway.dashboard_snapshot` 后，该接口优先返回 Server 保存的最新标准快照；快照会持久化到 `dashboard_snapshots`，服务重启后可从数据库恢复。尚未收到或恢复到快照时，后端会用现有 `sensor_records/device_status` 生成同形状兜底数据。某个子读取失败时，整体返回 `ok=false` 和 `DASHBOARD_OVERVIEW_READ_FAILED`。
 
 请求参数：
 
@@ -2098,12 +2728,119 @@ CSI fallback 与兼容策略：
 - C5/S3 CSI 运行开关关闭时，`devices[].occupancy` 必须保持 `state:"unknown"`、`available:false`、`motion_score:null`，不影响 BME、voice、command、heartbeat 或整机在线判断。
 - `POST /api/device/v1/ingest payload_type="csi.motion"` 只更新 `device_status`、`device_module_status(module_type="csi.motion")` 和 Dashboard v1 内存聚合，不改变 legacy `/sensor`、`/sensor/latest`、`/sensor/history` 响应形状。
 - `POST /api/device/v1/gateway-state` 的 snapshot 若带 `devices[].occupancy`，Server 会归一化同一字段模型；若同时存在较新的独立 `csi.motion` 结果，会按 `updated_at` 保留较新的 occupancy。
-- Server 重启后内存聚合清空；在下一次 S3 snapshot 或 `csi.motion` 上传前，Dashboard v1 返回 `unknown/unavailable`。
+- Server 重启后会先尝试从 `dashboard_snapshots` 恢复最新快照；如果数据库没有可恢复快照，在下一次 S3 snapshot 或 `csi.motion` 上传前，Dashboard v1 才返回 `unknown/unavailable`。
 - 前端展示层只应读取 `occupancy.state` 和 `motion_score`；`variance/rssi/sample_count/updated_at` 是诊断字段，不应被当作 raw CSI 或业务分类结果展示。
 
 错误码：
 
 - `500 DASHBOARD_OVERVIEW_READ_FAILED`
+
+### `POST /api/dashboard/v1/snapshot`
+
+手动写入 Dashboard 快照，行为和 `POST /api/device/v1/gateway-state` 一致，但返回 Dashboard v1 envelope。该接口用于后端测试、调试或需要直接写快照的管理流程。
+
+请求体：同 `POST /api/device/v1/gateway-state`，并要求 `schema_version=2`、`payload_type="gateway.dashboard_snapshot"`。
+
+成功响应返回 HTTP `202`：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "snapshot_id": "sensair_s3_gateway_01_1781100000100_uuid",
+    "payload_type": "gateway.dashboard_snapshot",
+    "gateway_id": "sensair_s3_gateway_01",
+    "device_count": 1,
+    "history_count": 0,
+    "received_at_ms": 1781100000100
+  },
+  "error": null
+}
+```
+
+错误码与 `POST /api/device/v1/gateway-state` 相同：
+
+- `400 UNSUPPORTED_PAYLOAD_TYPE`
+- `400 INVALID_SCHEMA_VERSION`
+- `400 INVALID_DASHBOARD_SNAPSHOT`
+- `500 DASHBOARD_SNAPSHOT_WRITE_FAILED`
+
+### `GET /api/dashboard/v1/latest`
+
+读取最近一次 Dashboard 标准快照。该接口只返回快照本身；如果内存中没有快照，Server 会从 `dashboard_snapshots` 读取最新记录。没有任何快照时返回 `ok=true, data=null, error=null`。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "gateway": {
+      "gateway_id": "sensair_s3_gateway_01"
+    },
+    "devices": [],
+    "home_summary": {
+      "online_device_count": 0,
+      "offline_device_count": 0,
+      "avg_temperature": null,
+      "avg_humidity": null,
+      "avg_air_quality": null
+    },
+    "history": [],
+    "recent_voice_events": [],
+    "recent_commands": [],
+    "received_at_ms": 1780000000000,
+    "source": "s3_gateway"
+  },
+  "error": null
+}
+```
+
+错误码：
+
+- `500 DASHBOARD_LATEST_READ_FAILED`
+
+### `GET /api/dashboard/v1/history`
+
+读取 Dashboard 快照历史，按最新记录倒序返回。该接口读取 `dashboard_snapshots`，每项包含快照元信息和完整 `payload`。
+
+查询参数：
+
+- `limit`: 可选，默认 `50`，最大 `500`；必须是正整数。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": {
+    "snapshots": [
+      {
+        "snapshot_id": "sensair_s3_gateway_01_1781100000100_uuid",
+        "gateway_id": "sensair_s3_gateway_01",
+        "server_recv_ms": 1781100000100,
+        "schema_version": 2,
+        "payload": {
+          "gateway": {
+            "gateway_id": "sensair_s3_gateway_01"
+          },
+          "devices": []
+        },
+        "created_at": "2026-06-10T10:00:00.100Z"
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+错误码：
+
+- `400 DASHBOARD_BAD_LIMIT`: `limit` 不是正整数。
+- `500 DASHBOARD_HISTORY_READ_FAILED`
 
 ### `GET /api/dashboard/v1/sensors/latest`
 
@@ -2193,6 +2930,48 @@ CSI fallback 与兼容策略：
 
 - `400 DASHBOARD_BAD_LIMIT`: `limit` 不是正整数。
 - `500 DASHBOARD_SENSOR_HISTORY_READ_FAILED`
+
+### `GET /api/dashboard/v1/devices/:device_id/history`
+
+读取指定设备的 Dashboard 传感器历史数组。该接口等价于 `GET /api/dashboard/v1/sensors/history?device_id=...`，但设备 ID 来自路径参数，便于前端按设备页面读取。
+
+路径参数：
+
+- `device_id`: 必填，目标设备 ID。
+
+查询参数：
+
+- `limit`: 可选，默认 `50`，最大 `500`；必须是正整数。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server_time_ms": 1780000000000,
+  "data": [
+    {
+      "id": 1,
+      "timestamp": 1780000000000,
+      "temperature": 29.57,
+      "humidity": 30.29,
+      "pressure": 986.26,
+      "gas_resistance": 35164,
+      "device_id": "sensair_shuttle_01",
+      "payload_type": "sensor.bme690",
+      "air_quality_score": 72,
+      "air_quality_level": "moderate",
+      "air_quality_source": "esp"
+    }
+  ],
+  "error": null
+}
+```
+
+错误码：
+
+- `400 DASHBOARD_BAD_LIMIT`: `limit` 不是正整数。
+- `500 DASHBOARD_DEVICE_HISTORY_READ_FAILED`
 
 ### `GET /api/dashboard/v1/asr/latest`
 

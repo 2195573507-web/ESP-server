@@ -55,7 +55,7 @@ const OFFLINE_TEXT = "离线";
 const DISCONNECTED_TEXT = "未连接";
 
 const SMART_HOME_UNAVAILABLE_MESSAGE = "暂无智能家居状态。";
-const FEATURE_IN_PROGRESS_MESSAGE = "功能开发中";
+const FEATURE_IN_PROGRESS_MESSAGE = "当前暂不可操作";
 const SMART_HOME_DEVICE_DEFINITIONS = {
     air_conditioner: { name: "空调", icon: "air-conditioner" },
     fan: { name: "风扇", icon: "fan" },
@@ -67,6 +67,8 @@ const SMART_HOME_DEVICE_DEFINITIONS = {
 };
 
 let dashboardState = {
+    activeDeviceId: null,
+    hasLoaded: false,
     sensor: null,
     deviceStatus: null,
     asr: null,
@@ -412,11 +414,12 @@ function sourceLabel(source) {
     if (source === "loading") return LOADING_TEXT;
     if (source === "error") return ERROR_TEXT;
     if (source === "empty") return "等待数据";
-    if (source === "not-integrated") return "未接入";
+    if (source === "not-integrated") return EMPTY_TEXT;
     return DISCONNECTED_TEXT;
 }
 
-const INTERNAL_DISPLAY_PATTERN = /\b(?:command|sensor|gateway|voice|llm|mqtt)\.[\w.-]+|\btopic\b|module_type|event_type|dashboard_snapshot|bme690/i;
+const INTERNAL_DISPLAY_PATTERN = /\b(?:command|sensor|gateway|voice|llm|mqtt|module|system)\.[\w.-]+|\btopic\b|module_type|event_type|device_id|dashboard_snapshot|bme690|rssi|heap|cpu|memory|firmware|version|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?:[0-9a-f]{2}:){5}[0-9a-f]{2}/i;
+const HIDDEN_COMMAND_NAMES = new Set(["custom", "calibrate", "reinitialize", "clear-logs", "debug", "test", "mock", "simulation"]);
 const FRIENDLY_COMMAND_LABELS = {
     "light.turn_on": "打开灯",
     "light.turn_off": "关闭灯",
@@ -436,11 +439,7 @@ const FRIENDLY_COMMAND_LABELS = {
     "air_quality.read": "读取空气质量",
     "temperature.read": "读取温度",
     "humidity.read": "读取湿度",
-    "fetch-data": "获取当前数据",
-    calibrate: "校准传感器",
-    reinitialize: "重新初始化设备",
-    "clear-logs": "清理日志",
-    custom: "自定义请求"
+    "fetch-data": "获取当前数据"
 };
 
 function looksInternalText(value) {
@@ -462,6 +461,7 @@ function humanizeDeviceName(value) {
 
 function humanizeCommandName(value) {
     const text = String(value ?? "").trim();
+    if (HIDDEN_COMMAND_NAMES.has(text.toLowerCase())) return "设备操作";
     return FRIENDLY_COMMAND_LABELS[text] || cleanDisplayText(text, "设备控制命令");
 }
 
@@ -520,8 +520,8 @@ function humanizeSystemLogText(log, payload) {
     if (/sensor|bme|temperature|humidity|pressure|air_quality|环境/.test(combined)) return `${deviceName} 环境数据已更新`;
     if (/wifi|sta_connected|network/.test(combined)) return "WiFi 已重新连接";
     if (/mqtt|cloud|server_available/.test(combined)) {
-        if (/disconnect|offline|未连接|异常|failed/.test(combined)) return "MQTT 未连接";
-        return "MQTT 已连接";
+        if (/disconnect|offline|未连接|异常|failed/.test(combined)) return "云端连接异常";
+        return "云端连接恢复";
     }
     if (/gateway|dashboard_snapshot|网关/.test(combined)) {
         if (/disconnect|offline|离线|failed/.test(combined)) return "网关离线";
@@ -1154,16 +1154,11 @@ function getEspStatus(deviceStatus) {
         };
     }
 
-    const ageMs = deviceStatus.lastSeenAgeMs ?? deviceStatus.latestUploadDelayMs;
-    const note = deviceStatus.online
-        ? (ageMs === null ? "在线" : formatDelayText("延迟", ageMs))
-        : (ageMs === null ? OFFLINE_TEXT : formatDelayText(OFFLINE_TEXT, ageMs, { decimalSeconds: false }));
-
     return {
         value: deviceStatus.online ? "在线" : OFFLINE_TEXT,
-        latency: ageMs,
+        latency: null,
         level: deviceStatus.online ? "normal" : "danger",
-        note,
+        note: deviceStatus.online ? "设备在线" : "设备离线",
         source: deviceStatus.source
     };
 }
@@ -1267,6 +1262,8 @@ function createLoadingMetrics() {
 }
 
 function setDashboardLoadingState(deviceId) {
+    dashboardState.activeDeviceId = deviceId || getActiveDeviceId();
+    dashboardState.hasLoaded = false;
     dashboardState.sensor = null;
     dashboardState.deviceStatus = null;
     dashboardState.asr = null;
@@ -1298,7 +1295,7 @@ function setDashboardLoadingState(deviceId) {
     renderStatusHeader();
     const deviceNameElement = document.querySelector("[data-active-device-name]");
     if (deviceNameElement) {
-        deviceNameElement.textContent = deviceId || UNKNOWN_TEXT;
+        setElementText(deviceNameElement, deviceId || UNKNOWN_TEXT);
     }
 }
 
@@ -1343,11 +1340,22 @@ function createSparkline(values, color) {
     `;
 }
 
-function setText(selector, value) {
-    const element = document.querySelector(selector);
-    if (element) {
-        element.textContent = value;
+function setElementText(element, value) {
+    if (!element) return;
+    const nextText = String(value ?? "");
+    if (element.textContent !== nextText) {
+        element.textContent = nextText;
     }
+}
+
+function setElementClass(element, className) {
+    if (element && element.className !== className) {
+        element.className = className;
+    }
+}
+
+function setText(selector, value) {
+    setElementText(document.querySelector(selector), value);
 }
 
 function setStateBadge(selector, levelKey) {
@@ -1355,24 +1363,24 @@ function setStateBadge(selector, levelKey) {
     if (!element) return;
 
     const level = LEVELS[levelKey] || { label: UNKNOWN_TEXT, className: "unknown" };
-    element.textContent = level.label;
-    element.className = `state-badge state-${level.className}`;
+    setElementText(element, level.label);
+    setElementClass(element, `state-badge state-${level.className}`);
 }
 
 function clearStateBadge(selector) {
     const element = document.querySelector(selector);
     if (!element) return;
 
-    element.textContent = "";
-    element.className = "state-badge is-empty";
+    setElementText(element, "");
+    setElementClass(element, "state-badge is-empty");
 }
 
 function setMetricChange(selector, text, levelKey = "normal") {
     const element = document.querySelector(selector);
     if (!element) return;
 
-    element.textContent = text;
-    element.className = `metric-change ${levelKey === "normal" ? "" : levelKey}`;
+    setElementText(element, text);
+    setElementClass(element, `metric-change ${levelKey === "normal" ? "" : levelKey}`);
 }
 
 function setElementTooltip(selector, title) {
@@ -1384,7 +1392,7 @@ function setElementTooltip(selector, title) {
 
 function setStatusDot(element, level) {
     if (!element) return;
-    element.className = `status-dot ${level === "normal" ? "online" : ""}`;
+    setElementClass(element, `status-dot ${level === "normal" ? "online" : ""}`);
 }
 
 function renderDeviceChrome() {
@@ -1395,16 +1403,16 @@ function renderDeviceChrome() {
     const label = `设备${statusText}`;
 
     document.querySelectorAll("[data-active-device-name]").forEach(element => {
-        element.textContent = deviceId;
+        setElementText(element, deviceId);
     });
     document.querySelectorAll("[data-device-status-text]").forEach(element => {
-        element.textContent = statusText;
+        setElementText(element, statusText);
     });
     document.querySelectorAll("[data-top-status-label]").forEach(element => {
-        element.textContent = label;
+        setElementText(element, label);
     });
     document.querySelectorAll("[data-sidebar-status-label]").forEach(element => {
-        element.textContent = label;
+        setElementText(element, label);
     });
     document.querySelectorAll("[data-top-status-dot], [data-sidebar-status-dot], [data-device-status-dot]").forEach(element => {
         setStatusDot(element, statusLevel);
@@ -1444,7 +1452,7 @@ function renderMetricCards() {
     setMetricChange('[data-field="temperatureChange"]', sourceLabel(metrics.temperature.source), metrics.temperature.level);
     setMetricChange('[data-field="humidityChange"]', sourceLabel(metrics.humidity.source), metrics.humidity.level);
     setMetricChange('[data-field="airChange"]', `${sourceLabel(metrics.air.source)} · ${airQualityState.label}`, metrics.air.level);
-    setMetricChange('[data-field="espLatency"]', metrics.esp.note, metrics.esp.level);
+    setMetricChange('[data-field="espStatusNote"]', metrics.esp.note, metrics.esp.level);
     const sensorTooltip = () => [
         `来源：ESP32 ${deviceId}`
     ].filter(Boolean).join("\n");
@@ -1467,7 +1475,7 @@ function refreshEspDelayDisplay() {
 
     setText("#espStatusValue", dashboardState.metrics.esp.value);
     setStateBadge('[data-field="espStatusBadge"]', dashboardState.metrics.esp.level);
-    setMetricChange('[data-field="espLatency"]', dashboardState.metrics.esp.note, dashboardState.metrics.esp.level);
+    setMetricChange('[data-field="espStatusNote"]', dashboardState.metrics.esp.note, dashboardState.metrics.esp.level);
     renderDeviceChrome();
 }
 
@@ -1903,10 +1911,10 @@ function renderStatusHeader() {
         const timestamp = dashboardState.sensor?.timestamp || dashboardState.deviceStatus?.lastSeenMs || null;
         const date = parseTimestamp(timestamp);
         if (date) {
-            element.textContent = updatedText;
+            setElementText(element, updatedText);
             element.title = "";
         } else {
-            element.textContent = updatedText;
+            setElementText(element, updatedText);
             element.title = "";
         }
     });
@@ -1967,7 +1975,9 @@ function renderSmartHomeControls() {
     const note = document.querySelector("[data-smart-home-note]");
     if (!list) return;
 
-    const devices = Array.isArray(dashboardState.smartHomeDevices) ? dashboardState.smartHomeDevices : [];
+    const devices = Array.isArray(dashboardState.smartHomeDevices)
+        ? dashboardState.smartHomeDevices.filter(device => !device.disabled)
+        : [];
     const hasEnabledDevice = devices.some(device => !device.disabled);
     if (note) {
         note.hidden = hasEnabledDevice;
@@ -2231,8 +2241,8 @@ async function fetchCDeviceDashboardData(deviceId) {
 
 async function updateDashboard() {
     const deviceId = getActiveDeviceId();
-    const currentSensorDevice = normalizeDeviceId(dashboardState.sensor?.device_id || "");
-    const shouldShowLoading = !dashboardState.sensor || (currentSensorDevice && currentSensorDevice !== normalizeDeviceId(deviceId));
+    const shouldShowLoading = !dashboardState.hasLoaded ||
+        normalizeDeviceId(dashboardState.activeDeviceId) !== normalizeDeviceId(deviceId);
     if (shouldShowLoading) {
         setDashboardLoadingState(deviceId);
     }
@@ -2262,6 +2272,8 @@ async function updateDashboard() {
 
     dashboardState.sensor = sensor;
     dashboardState.deviceStatus = deviceStatus;
+    dashboardState.activeDeviceId = deviceId;
+    dashboardState.hasLoaded = true;
     dashboardState.asr = asrResult.ok && !asrResult.empty ? asrResult.data : null;
     dashboardState.llm = llmResult.ok && !llmResult.empty ? llmResult.data : null;
     dashboardState.sources = {
@@ -2326,6 +2338,8 @@ async function handleFetchCurrentData(button) {
             : dashboardState.deviceStatus;
         dashboardState.sensor = sensor;
         dashboardState.deviceStatus = deviceStatus;
+        dashboardState.activeDeviceId = deviceId;
+        dashboardState.hasLoaded = true;
         dashboardState.sources.sensor = sensorResult.source;
         dashboardState.sources.deviceStatus = deviceStatusResult.source;
         dashboardState.metrics = buildMetrics(sensor, deviceStatus);
@@ -2378,20 +2392,8 @@ async function handleCustomCommandSubmit(event) {
 }
 
 function handleConfirmedUnavailableAction(action) {
-    const config = {
-        calibrate: {
-            type: "校准传感器",
-            content: "尝试发送传感器校准请求。"
-        },
-        reinitialize: {
-            type: "重新初始化设备",
-            content: "尝试发送设备重新初始化请求，设备可能短暂离线。"
-        }
-    }[action];
-
-    if (!config) return;
-
-    handleUnavailableOperation(config.type, config.content);
+    if (!action) return;
+    handleUnavailableOperation("设备操作", "当前暂不可操作。");
 }
 
 function handleClearLogs() {
@@ -2399,47 +2401,12 @@ function handleClearLogs() {
 }
 
 function handleCommandAction(action, button) {
-    if (action === "custom") {
-        openCustomCommandModal();
-        return;
-    }
-
     if (action === "fetch-data") {
         handleFetchCurrentData(button);
         return;
     }
 
-    if (action === "calibrate") {
-        openCommandConfirmModal({
-            action,
-            title: "确认校准传感器？",
-            message: "校准期间传感器读数可能短暂波动，请确认是否继续。",
-            submitText: "开始校准",
-            danger: false
-        });
-        return;
-    }
-
-    if (action === "reinitialize") {
-        openCommandConfirmModal({
-            action,
-            title: "确认重新初始化设备？",
-            message: "设备可能短暂离线，请确认是否继续。",
-            submitText: "确认重新初始化",
-            danger: true
-        });
-        return;
-    }
-
-    if (action === "clear-logs") {
-        openCommandConfirmModal({
-            action,
-            title: "确认清理日志？",
-            message: "日志清理功能开发中，当前不会删除任何真实日志。",
-            submitText: "确认清理",
-            danger: true
-        });
-    }
+    showDashboardToast(FEATURE_IN_PROGRESS_MESSAGE, "unavailable");
 }
 
 function bindCommandButtons() {

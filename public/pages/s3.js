@@ -613,7 +613,7 @@
         });
     }
 
-    function normalizeOverview(data, modules = [], commands = [], alarms = [], deviceStatus = null, states = {}, relatedOverviews = [], deviceStatuses = [], systemEvents = [], requestMeta = {}) {
+    function normalizeOverview(data, modules = [], alarms = [], deviceStatus = null, states = {}, relatedOverviews = [], deviceStatuses = [], systemEvents = [], requestMeta = {}) {
         const overview = isPlainObject(data) ? data : {};
         const devices = applyDeviceStatuses(mergeOverviewDevices([overview, ...relatedOverviews]), deviceStatuses);
         const normalizedDeviceStatus = normalizeDeviceStatus(deviceStatus);
@@ -624,12 +624,10 @@
             },
             devices,
             home_summary: buildHomeSummary(devices),
-            recent_commands: commands,
             recent_alarms: Array.isArray(alarms) ? alarms.map(normalizeAlarm) : [],
             system_events: normalizeSystemEvents(systemEvents),
             device_status_error: Boolean(states.deviceStatusError),
             module_error: Boolean(states.moduleError),
-            command_error: Boolean(states.commandError),
             alarm_error: Boolean(states.alarmError),
             event_error: Boolean(states.eventError),
             request_meta: requestMeta
@@ -1095,7 +1093,7 @@
     }
 
     function renderLoading(container) {
-        const data = normalizeOverview(null, [], [], [], null, {});
+        const data = normalizeOverview(null, [], [], null, {});
         const summary = buildHomeSummary(data.devices || []);
         container.dataset.s3DashboardReady = "false";
         container.innerHTML = `
@@ -1116,10 +1114,9 @@
     }
 
     function renderError(container) {
-        const data = normalizeOverview(null, [], [], [], null, {
+        const data = normalizeOverview(null, [], [], null, {
             deviceStatusError: true,
             moduleError: true,
-            commandError: true,
             alarmError: true
         });
         const summary = buildHomeSummary(data.devices || []);
@@ -1152,7 +1149,6 @@
                 overviewRaw,
                 deviceStatusRaw,
                 modulesResult,
-                commandsResult,
                 alarmsResult,
                 eventsResult,
                 ...targetResults
@@ -1160,7 +1156,6 @@
                 fetchOverview(),
                 fetchDeviceStatus(),
                 fetchModulesStatus(),
-                fetchCommandHistory(),
                 fetchAlarmLogs(),
                 fetchSystemEvents(),
                 ...TARGET_DEVICE_IDS.map(deviceId => fetchOverview(deviceId)),
@@ -1176,13 +1171,11 @@
             const data = normalizeOverview(
                 overviewRaw.value,
                 modulesResult.status === "fulfilled" ? modulesResult.value : [],
-                commandsResult.status === "fulfilled" ? commandsResult.value : [],
                 alarmsResult.status === "fulfilled" ? alarmsResult.value : [],
                 deviceStatusRaw.status === "fulfilled" ? deviceStatusRaw.value : null,
                 {
                     deviceStatusError: deviceStatusRaw.status === "rejected",
                     moduleError: modulesResult.status === "rejected",
-                    commandError: commandsResult.status === "rejected",
                     alarmError: alarmsResult.status === "rejected",
                     eventError: eventsResult.status === "rejected"
                 },

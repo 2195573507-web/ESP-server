@@ -66,6 +66,18 @@ const SMART_HOME_DEVICE_DEFINITIONS = {
     air_purifier: { name: "空气净化器", icon: "air-purifier" }
 };
 
+function createEmptyActivityState() {
+    return {
+        available: false,
+        online: null,
+        score: null,
+        label: EMPTY_TEXT,
+        level: "unknown",
+        confidence: "--",
+        timestamp: null
+    };
+}
+
 let dashboardState = {
     activeDeviceId: null,
     hasLoaded: false,
@@ -80,6 +92,8 @@ let dashboardState = {
     commandLogs: [],
     operationLogs: [],
     smartHomeDevices: null,
+    activity: createEmptyActivityState(),
+    activityHistory: [],
     sources: {
         sensor: "idle",
         deviceStatus: "idle",
@@ -97,6 +111,7 @@ const THEME_STORAGE_KEY = "dashboardTheme";
 const DASHBOARD_REFRESH_INTERVAL_MS = 3000;
 const S3_DASHBOARD_REFRESH_INTERVAL_MS = 3000;
 const ESP_DELAY_REFRESH_INTERVAL_MS = 1000;
+const ACTIVITY_TREND_WINDOW_MS = 30 * 60 * 1000;
 const CHART_RANGE_OPTIONS = [12, 24, 36, 48];
 const DEFAULT_CHART_RANGE_HOURS = 24;
 const ALERT_LOG_PREVIEW_LIMIT = 4;
@@ -908,7 +923,7 @@ async function fetchCommandLogs(deviceId = getActiveDeviceId()) {
     };
 }
 
-async function fetchSmartHomeStatuses(deviceId = getActiveDeviceId()) {
+async function fetchSmartHomeStatuses(deviceId = getActiveDeviceId(), overviewData = null) {
     const result = await readFirstAvailableEndpoint([
         {
             path: buildUrl("/api/smart-home/v1/status", {
@@ -923,8 +938,16 @@ async function fetchSmartHomeStatuses(deviceId = getActiveDeviceId()) {
     ], `Smart home ${deviceId}`);
     return {
         ...result,
-        data: normalizeSmartHomePayload(result.data, deviceId)
+        data: normalizeSmartHomePayload(result.data || overviewData, deviceId)
     };
+}
+
+async function fetchActivityOverview(deviceId = getActiveDeviceId()) {
+    return readEndpoint(
+        buildUrl("/api/dashboard/v1/overview", { device_id: deviceId }),
+        `Activity ${deviceId}`,
+        { silent: true }
+    );
 }
 
 function normalizeSensor(rawSensor, source) {
@@ -1009,6 +1032,78 @@ function normalizeDeviceStatus(rawStatus, source) {
         lastSeenIso: status.last_seen_iso || "",
         timeSynced: typeof status.time_synced === "boolean" ? status.time_synced : null
     };
+}
+
+function getActivityLabel(score) {
+    if (score === null) return { label: EMPTY_TEXT, level: "unknown" };
+    if (score < 0.2) return { label: "无明显活动", level: "normal" };
+    if (score <= 0.6) return { label: "轻微活动", level: "warning" };
+    return { label: "检测到活动", level: "danger" };
+}
+
+function readOverviewDevice(data, deviceId = getActiveDeviceId()) {
+    const overview = unwrapEnvelope(data);
+    const devices = Array.isArray(overview?.devices) ? overview.devices : [];
+    const normalizedDeviceId = normalizeDeviceId(deviceId);
+    return devices.find(device => normalizeDeviceId(device?.device_id || device?.id) === normalizedDeviceId) || null;
+}
+
+function normalizeActivityFromOverview(overviewData, deviceId = getActiveDeviceId(), deviceStatus = dashboardState.deviceStatus) {
+    const device = readOverviewDevice(overviewData, deviceId);
+    const online = typeof deviceStatus?.online === "boolean"
+        ? deviceStatus.online
+        : (typeof device?.online === "boolean" ? device.online : null);
+
+    if (online === false) {
+        return {
+            ...createEmptyActivityState(),
+            online,
+            label: "设备离线",
+            level: "danger"
+        };
+    }
+
+    const occupancy = isPlainObject(device?.occupancy) ? device.occupancy : null;
+    const score = toNumber(occupancy?.motion_score);
+    const available = occupancy?.available !== false && score !== null;
+    if (!available) {
+        return {
+            ...createEmptyActivityState(),
+            online,
+            label: EMPTY_TEXT
+        };
+    }
+
+    const state = getActivityLabel(score);
+    return {
+        available: true,
+        online,
+        score,
+        label: state.label,
+        level: state.level,
+        confidence: `${Math.round(Math.min(Math.max(score, 0), 1) * 100)}%`,
+        timestamp: parseTimestamp(occupancy.updated_at || device.timestamp) || new Date()
+    };
+}
+
+function updateActivityHistory(activity) {
+    const now = Date.now();
+    const history = Array.isArray(dashboardState.activityHistory) ? dashboardState.activityHistory : [];
+    const timestamp = activity?.timestamp instanceof Date ? activity.timestamp : null;
+    const score = toNumber(activity?.score);
+    const nextHistory = history.filter(point => {
+        const pointTime = point?.timestamp instanceof Date ? point.timestamp.getTime() : 0;
+        return pointTime && now - pointTime <= ACTIVITY_TREND_WINDOW_MS;
+    });
+
+    if (score !== null && timestamp) {
+        const last = nextHistory[nextHistory.length - 1];
+        if (!last || last.timestamp.getTime() !== timestamp.getTime() || last.score !== score) {
+            nextHistory.push({ timestamp, score });
+        }
+    }
+
+    dashboardState.activityHistory = nextHistory;
 }
 
 function normalizeSystemLog(rawLog) {
@@ -1273,6 +1368,8 @@ function setDashboardLoadingState(deviceId) {
     dashboardState.alertLogs = [];
     dashboardState.systemLogs = [];
     dashboardState.operationLogs = [];
+    dashboardState.activity = createEmptyActivityState();
+    dashboardState.activityHistory = [];
     dashboardState.sources = {
         sensor: "loading",
         deviceStatus: "loading",
@@ -1292,6 +1389,7 @@ function setDashboardLoadingState(deviceId) {
     renderSystemLogs();
     renderOperationLogs();
     renderSmartHomeControls();
+    renderActivityDetection();
     renderStatusHeader();
     const deviceNameElement = document.querySelector("[data-active-device-name]");
     if (deviceNameElement) {
@@ -1947,6 +2045,60 @@ function renderStatusHeader() {
     }
 }
 
+function createActivityTrendSvg(points) {
+    const validPoints = (Array.isArray(points) ? points : [])
+        .filter(point => point?.timestamp instanceof Date && toNumber(point.score) !== null);
+    if (validPoints.length < 2) {
+        return '<span class="sparkline-empty">暂无数据</span>';
+    }
+
+    const width = 520;
+    const height = 120;
+    const padding = { top: 12, right: 12, bottom: 18, left: 18 };
+    const minTime = Date.now() - ACTIVITY_TREND_WINDOW_MS;
+    const maxTime = Date.now();
+    const plotWidth = width - padding.left - padding.right;
+    const plotHeight = height - padding.top - padding.bottom;
+    const coordinates = validPoints.map(point => {
+        const score = Math.min(Math.max(toNumber(point.score) ?? 0, 0), 1);
+        const time = point.timestamp.getTime();
+        const x = padding.left + ((time - minTime) / Math.max(1, maxTime - minTime)) * plotWidth;
+        const y = padding.top + (1 - score) * plotHeight;
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+
+    return `
+        <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+            <line x1="${padding.left}" y1="${padding.top + plotHeight}" x2="${width - padding.right}" y2="${padding.top + plotHeight}" class="activity-axis"></line>
+            <line x1="${padding.left}" y1="${padding.top + plotHeight * 0.4}" x2="${width - padding.right}" y2="${padding.top + plotHeight * 0.4}" class="activity-guide"></line>
+            <line x1="${padding.left}" y1="${padding.top + plotHeight * 0.8}" x2="${width - padding.right}" y2="${padding.top + plotHeight * 0.8}" class="activity-guide"></line>
+            <polyline points="${coordinates.join(" ")}" class="activity-line"></polyline>
+        </svg>
+    `;
+}
+
+function renderActivityDetection() {
+    const activity = dashboardState.activity || createEmptyActivityState();
+    const badge = document.querySelector("[data-activity-state-badge]");
+    const chart = document.querySelector("[data-activity-chart]");
+
+    setText("[data-activity-state]", activity.label || EMPTY_TEXT);
+    setText("[data-activity-time]", activity.timestamp ? formatTime(activity.timestamp) : EMPTY_TEXT);
+    setText("[data-activity-confidence]", activity.confidence || "--");
+    if (badge) {
+        setElementText(badge, activity.label || EMPTY_TEXT);
+        setElementClass(badge, `state-badge state-${activity.level || "unknown"}`);
+    }
+
+    if (chart) {
+        const nextChart = createActivityTrendSvg(dashboardState.activityHistory);
+        if (chart.dataset.signature !== nextChart) {
+            chart.innerHTML = nextChart;
+            chart.dataset.signature = nextChart;
+        }
+    }
+}
+
 function showDashboardToast(message, status = "success") {
     const previous = document.querySelector(".dashboard-toast");
     if (previous) {
@@ -2204,6 +2356,7 @@ function openCommandConfirmModal(config) {
 }
 
 async function fetchCDeviceDashboardData(deviceId) {
+    const overviewResultPromise = fetchActivityOverview(deviceId);
     const [
         sensorResult,
         deviceStatusResult,
@@ -2213,7 +2366,7 @@ async function fetchCDeviceDashboardData(deviceId) {
         alertResult,
         systemResult,
         commandResult,
-        smartHomeResult
+        overviewResult
     ] = await Promise.all([
         fetchLatestSensor(deviceId),
         fetchDeviceStatus(deviceId),
@@ -2223,8 +2376,9 @@ async function fetchCDeviceDashboardData(deviceId) {
         fetchAlertLogs(deviceId),
         fetchSystemLogs(deviceId),
         fetchCommandLogs(deviceId),
-        fetchSmartHomeStatuses(deviceId)
+        overviewResultPromise
     ]);
+    const smartHomeResult = await fetchSmartHomeStatuses(deviceId, overviewResult.ok ? overviewResult.data : null);
 
     return {
         sensorResult,
@@ -2235,6 +2389,7 @@ async function fetchCDeviceDashboardData(deviceId) {
         alertResult,
         systemResult,
         commandResult,
+        overviewResult,
         smartHomeResult
     };
 }
@@ -2256,6 +2411,7 @@ async function updateDashboard() {
         alertResult,
         systemResult,
         commandResult,
+        overviewResult,
         smartHomeResult
     } = await fetchCDeviceDashboardData(deviceId);
 
@@ -2293,6 +2449,8 @@ async function updateDashboard() {
     dashboardState.systemLogs = Array.isArray(systemResult.data) ? systemResult.data.map(normalizeSystemLog) : [];
     dashboardState.operationLogs = Array.isArray(commandResult.data) ? commandResult.data : [];
     dashboardState.smartHomeDevices = Array.isArray(smartHomeResult.data) ? smartHomeResult.data : [];
+    dashboardState.activity = normalizeActivityFromOverview(overviewResult.ok ? overviewResult.data : null, deviceId, deviceStatus);
+    updateActivityHistory(dashboardState.activity);
 
     renderMetricCards();
     renderMainChart();
@@ -2300,6 +2458,7 @@ async function updateDashboard() {
     renderAlertLogs();
     renderSystemLogs();
     renderSmartHomeControls();
+    renderActivityDetection();
     renderActiveLogModal();
     renderStatusHeader();
     markRealtimeSuccess({
@@ -2317,9 +2476,10 @@ async function handleFetchCurrentData(button) {
     const deviceId = getActiveDeviceId();
 
     try {
-        const [sensorResult, deviceStatusResult] = await Promise.all([
+        const [sensorResult, deviceStatusResult, overviewResult] = await Promise.all([
             fetchLatestSensor(deviceId),
-            fetchDeviceStatus(deviceId)
+            fetchDeviceStatus(deviceId),
+            fetchActivityOverview(deviceId)
         ]);
         if (!sensorResult.ok || sensorResult.empty) {
             const message = sensorResult.ok ? EMPTY_TEXT : ERROR_TEXT;
@@ -2343,11 +2503,14 @@ async function handleFetchCurrentData(button) {
         dashboardState.sources.sensor = sensorResult.source;
         dashboardState.sources.deviceStatus = deviceStatusResult.source;
         dashboardState.metrics = buildMetrics(sensor, deviceStatus);
+        dashboardState.activity = normalizeActivityFromOverview(overviewResult.ok ? overviewResult.data : null, deviceId, deviceStatus);
+        updateActivityHistory(dashboardState.activity);
 
         const snapshot = buildSensorSnapshotText(sensorResult.data, sensor, deviceStatus);
         renderMetricCards();
         renderMainChart();
         renderAlertSummary();
+        renderActivityDetection();
         renderStatusHeader();
         renderActiveLogModal();
 

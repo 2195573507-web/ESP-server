@@ -5,8 +5,16 @@
     const OFFLINE_TEXT = "离线";
     const UNKNOWN_TEXT = "未知";
     const DISCONNECTED_TEXT = "未连接";
+    const SENSOR_EMPTY_TEXT = "--";
     const TARGET_DEVICE_IDS = ["C51", "C52"];
-    const previousRealtimeValues = new Map();
+    const DEVICE_DISPLAY_NAMES = {
+        C51: "卧室（C51）",
+        C52: "客厅（C52）"
+    };
+    const DEVICE_ROOM_NAMES = {
+        C51: "卧室",
+        C52: "客厅"
+    };
 
     const applianceSlots = [
         { key: "air_conditioner", label: "空调", icon: "❄️" },
@@ -17,27 +25,6 @@
         { key: "humidifier", label: "加湿器", icon: "💧" },
         { key: "air_purifier", label: "空气净化器", icon: "◌" }
     ];
-
-    const commandDisplayMap = {
-        "light.turn_on": "打开灯",
-        "light.turn_off": "关闭灯",
-        "air_conditioner.set_temperature": "设置空调温度",
-        "air_conditioner.turn_on": "打开空调",
-        "air_conditioner.turn_off": "关闭空调",
-        "fan.turn_on": "打开风扇",
-        "fan.turn_off": "关闭风扇",
-        "tv.turn_on": "打开电视",
-        "tv.turn_off": "关闭电视",
-        "curtain.open": "打开窗帘",
-        "curtain.close": "关闭窗帘",
-        "humidifier.turn_on": "打开加湿器",
-        "humidifier.turn_off": "关闭加湿器",
-        "air_purifier.turn_on": "打开空气净化器",
-        "air_purifier.turn_off": "关闭空气净化器",
-        "air_quality.read": "读取空气质量",
-        "temperature.read": "读取温度",
-        "humidity.read": "读取湿度"
-    };
 
     function escapeHtml(value) {
         return String(value ?? "")
@@ -61,12 +48,6 @@
         const numeric = Number(value);
         if (!Number.isFinite(numeric)) return DISCONNECTED_TEXT;
         return Number(numeric.toFixed(digits)).toString();
-    }
-
-    function formatInteger(value) {
-        const numeric = Number(value);
-        if (!Number.isFinite(numeric)) return DISCONNECTED_TEXT;
-        return Math.round(numeric).toLocaleString("zh-CN");
     }
 
     function formatTime(value) {
@@ -117,16 +98,6 @@
         return Number.isNaN(date.getTime()) ? null : date;
     }
 
-    function relativeTime(value) {
-        return realtime().formatRelativeTime ? realtime().formatRelativeTime(value) : "";
-    }
-
-    function updateTime(value, source, api) {
-        return realtime().UpdateTime
-            ? realtime().UpdateTime(value, source, api)
-            : `<span class="update-time">${escapeHtml(formatTime(value))}</span>`;
-    }
-
     async function fetchOverview(deviceId = "") {
         const response = await fetch(buildUrl("/api/dashboard/v1/overview", { device_id: deviceId }), { cache: "no-store" });
         if (!response.ok) {
@@ -153,15 +124,6 @@
         return data || null;
     }
 
-    async function fetchCommandHistory() {
-        const response = await fetch("/api/commands/history?limit=20", { cache: "no-store" });
-        if (!response.ok) {
-            throw new Error(`${response.status}`);
-        }
-        const data = unwrapEnvelope(await response.json());
-        return Array.isArray(data?.commands) ? data.commands : [];
-    }
-
     async function fetchAlarmLogs() {
         const response = await fetch("/api/emergency/events?limit=20", { cache: "no-store" });
         if (!response.ok) {
@@ -169,31 +131,6 @@
         }
         const data = unwrapEnvelope(await response.json());
         return Array.isArray(data?.events) ? data.events : [];
-    }
-
-    async function fetchListEndpoint(path, keys = []) {
-        const response = await fetch(path, { cache: "no-store" });
-        if (!response.ok) {
-            throw new Error(`${response.status}`);
-        }
-        const data = unwrapEnvelope(await response.json());
-        if (Array.isArray(data)) return data;
-        if (!isPlainObject(data)) return [];
-        for (const key of keys) {
-            if (Array.isArray(data[key])) return data[key];
-        }
-        return [];
-    }
-
-    async function fetchSystemEvents() {
-        const results = await Promise.allSettled([
-            fetchListEndpoint("/api/logs/v1/system?limit=20", ["logs", "system_logs", "events", "records"]),
-            fetchListEndpoint("/api/voice/v1/events?limit=20", ["events", "logs", "records"]),
-            fetchCommandHistory(),
-            fetchListEndpoint("/api/logs/v1/alarms?limit=20", ["alarms", "logs", "events"]),
-            fetchAlarmLogs()
-        ]);
-        return results.flatMap(result => result.status === "fulfilled" ? result.value : []);
     }
 
     function getStatusClass(status) {
@@ -216,7 +153,7 @@
             dispatched: "已下发",
             failed: "失败",
             received: "已接收",
-            llm_pending: "LLM 处理中",
+            llm_pending: "AI 处理中",
             forwarded: "已转发",
             resolved: "已解决",
             archived: "已归档",
@@ -226,92 +163,47 @@
         };
         if (status === true) return "在线";
         if (status === false) return OFFLINE_TEXT;
-        return textMap[status] || status || UNKNOWN_TEXT;
+        return textMap[status] || cleanDisplayText(status, UNKNOWN_TEXT);
     }
 
-    function boolText(value, trueText, falseText) {
-        if (value === true) return trueText;
-        if (value === false) return falseText;
-        return DISCONNECTED_TEXT;
+    const INTERNAL_DISPLAY_PATTERN = /\b(?:command|sensor|gateway|voice|llm|mqtt|module|system)\.[\w.-]+|\btopic\b|module_type|event_type|device_id|dashboard_snapshot|bme690|rssi|heap|cpu|memory|firmware|version|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?:[0-9a-f]{2}:){5}[0-9a-f]{2}/i;
+
+    function looksInternalText(value) {
+        const text = String(value ?? "").trim();
+        return Boolean(text) && (INTERNAL_DISPLAY_PATTERN.test(text) || /^\/?api\//i.test(text));
     }
 
-    function localizeCommandText(value) {
-        const text = String(value ?? "");
-        return commandDisplayMap[text] || text || EMPTY_TEXT;
+    function cleanDisplayText(value, fallback = "") {
+        const text = String(value ?? "").trim();
+        if (!text) return fallback;
+        return looksInternalText(text) ? fallback : text;
     }
 
-    function getRecordTime(record) {
-        if (!isPlainObject(record)) return null;
-        const payload = isPlainObject(record.payload) ? record.payload : {};
-        return parseTimestamp(
-            record.created_at ||
-            record.updated_at ||
-            record.timestamp ||
-            record.completed_at ||
-            record.time ||
-            payload.created_at ||
-            payload.timestamp
-        );
+    function getDeviceDisplayName(deviceId) {
+        const key = normalizeDeviceId(deviceId);
+        return DEVICE_DISPLAY_NAMES[key] || "";
     }
 
-    function normalizeSystemEvent(record) {
-        const item = isPlainObject(record) ? record : {};
-        const payload = isPlainObject(item.payload) ? item.payload : {};
-        const command = item.command || item.name || item.command_id || payload.command;
-        const eventType = item.event_type || item.type || payload.event_type || payload.type || "";
-        const message = item.message ||
-            item.content ||
-            item.text ||
-            item.local_action ||
-            payload.message ||
-            payload.summary ||
-            payload.description ||
-            payload.text ||
-            "";
-        const time = getRecordTime(item);
-        let icon = "📡";
-        let type = eventType || "系统事件";
-        let description = message || EMPTY_TEXT;
-        if (command) {
-            icon = "💡";
-            type = "命令事件";
-            description = `${localizeCommandText(command)} ${item.status ? getStatusText(item.status) : ""}`.trim();
-        } else if (String(eventType).toLowerCase().includes("voice") || item.asr_text || payload.asr_text) {
-            icon = "🎤";
-            type = "语音命令";
-            description = message || item.asr_text || payload.asr_text || "收到语音命令";
-        } else if (String(eventType).toLowerCase().includes("llm") || item.response || payload.response) {
-            icon = "🤖";
-            type = "AI 回复";
-            description = message || "AI 回复完成";
-        } else if (item.device_id || payload.device_id) {
-            icon = "📡";
-            type = item.device_id || payload.device_id;
-            description = message || `${type} 上传新的传感器数据`;
-        }
-        return {
-            timestamp: time,
-            icon,
-            type,
-            description,
-            detail: [
-                item.device_id ? `设备：${item.device_id}` : "",
-                eventType ? `类型：${eventType}` : "",
-                item.status ? `状态：${item.status}` : ""
-            ].filter(Boolean).join("\n")
-        };
+    function getDeviceRoomName(deviceId) {
+        const key = normalizeDeviceId(deviceId);
+        return DEVICE_ROOM_NAMES[key] || "";
     }
 
-    function normalizeSystemEvents(records) {
-        return (Array.isArray(records) ? records : [])
-            .map(normalizeSystemEvent)
-            .filter(event => event.timestamp || event.description)
-            .sort((a, b) => {
-                const aTime = a.timestamp ? a.timestamp.getTime() : 0;
-                const bTime = b.timestamp ? b.timestamp.getTime() : 0;
-                return bTime - aTime;
-            })
-            .slice(0, 20);
+    function friendlyDeviceName(value) {
+        const text = String(value || "").trim().toUpperCase();
+        const roomName = getDeviceRoomName(text);
+        if (roomName) return roomName;
+        return text && !looksInternalText(text) ? text : "设备";
+    }
+
+    function humanizeAlarmType(type, message = "") {
+        const text = `${type || ""} ${message || ""}`.toLowerCase();
+        if (/air|aqi|quality|空气/.test(text)) return "空气质量报警";
+        if (/temp|temperature|温度|hot|heat/.test(text)) return "温度过高";
+        if (/humid|humidity|湿度/.test(text)) return "湿度异常";
+        if (/pressure|气压/.test(text)) return "气压异常";
+        if (/offline|disconnect|离线|设备/.test(text)) return "设备离线";
+        return "报警";
     }
 
     function normalizeGateway(rawGateway, deviceStatus = null) {
@@ -331,7 +223,7 @@
                 ? !gateway.server_available
                 : (hasDeviceStatus && typeof deviceStatus?.time_synced === "boolean" ? !deviceStatus.time_synced : null));
         return {
-            name: gateway.name || gateway.gateway_id || "S3 Gateway",
+            name: gateway.name || gateway.gateway_id || "网关",
             online,
             cloud_connected: cloudConnected,
             latency_ms: latency,
@@ -412,6 +304,9 @@
 
     function normalizeDevice(rawDevice) {
         const device = isPlainObject(rawDevice) ? rawDevice : {};
+        const deviceId = device.device_id || device.id || "";
+        const displayName = getDeviceDisplayName(deviceId);
+        const roomName = getDeviceRoomName(deviceId);
         const sensors = normalizeSensors(device.sensors);
         const appliances = normalizeAppliances(device.appliances);
         const occupancy = isPlainObject(device.occupancy) ? device.occupancy : null;
@@ -429,9 +324,9 @@
             hasOccupancyData ||
             toNumberOrNull(device.wifi_rssi) !== null;
         return {
-            id: device.device_id || device.id || "",
-            name: device.name || device.device_id || device.id || UNKNOWN_TEXT,
-            room: rawRoom && rawRoom !== "unassigned" ? rawRoom : "未分配",
+            id: deviceId,
+            name: displayName || cleanDisplayText(device.name || deviceId, UNKNOWN_TEXT),
+            room: roomName || (rawRoom && rawRoom !== "unassigned" ? cleanDisplayText(rawRoom, "未分配") : "未分配"),
             online: hasDeviceEvidence && typeof device.online === "boolean" ? device.online : null,
             timestamp: hasDeviceEvidence ? device.timestamp : null,
             sensors,
@@ -473,8 +368,8 @@
     function createEmptyDevice(deviceId) {
         return {
             id: deviceId,
-            name: deviceId,
-            room: "未分配",
+            name: getDeviceDisplayName(deviceId) || deviceId,
+            room: getDeviceRoomName(deviceId) || "未分配",
             online: null,
             timestamp: null,
             sensors: {
@@ -506,26 +401,25 @@
             const key = normalizeDeviceId(deviceId);
             return byId.get(key) || createEmptyDevice(deviceId);
         });
-        const extras = Array.from(byId.entries())
-            .filter(([id]) => !TARGET_DEVICE_IDS.includes(id))
-            .map(([, device]) => device);
-        return [...orderedTargets, ...extras];
+        return orderedTargets;
     }
 
     function normalizeAlarm(rawAlarm) {
         const alarm = isPlainObject(rawAlarm) ? rawAlarm : {};
         const payload = isPlainObject(alarm.payload) ? alarm.payload : {};
+        const rawMessage = alarm.local_action ||
+            payload.message ||
+            payload.summary ||
+            payload.description ||
+            payload.reason ||
+            "";
+        const eventType = humanizeAlarmType(alarm.event_type || payload.event_type, rawMessage);
         return {
             event_id: alarm.event_id || "",
             device_id: alarm.device_id || "",
-            event_type: alarm.event_type || payload.event_type || UNKNOWN_TEXT,
+            event_type: eventType,
             severity: alarm.severity || payload.severity || "info",
-            message: alarm.local_action ||
-                payload.message ||
-                payload.summary ||
-                payload.description ||
-                payload.reason ||
-                "",
+            message: cleanDisplayText(rawMessage, eventType),
             status: alarm.status || UNKNOWN_TEXT,
             created_at: alarm.created_at || payload.created_at || "",
             updated_at: alarm.updated_at || "",
@@ -553,7 +447,7 @@
         });
     }
 
-    function normalizeOverview(data, modules = [], commands = [], alarms = [], deviceStatus = null, states = {}, relatedOverviews = [], deviceStatuses = [], systemEvents = [], requestMeta = {}) {
+    function normalizeOverview(data, modules = [], alarms = [], deviceStatus = null, states = {}, relatedOverviews = [], deviceStatuses = [], requestMeta = {}) {
         const overview = isPlainObject(data) ? data : {};
         const devices = applyDeviceStatuses(mergeOverviewDevices([overview, ...relatedOverviews]), deviceStatuses);
         const normalizedDeviceStatus = normalizeDeviceStatus(deviceStatus);
@@ -564,14 +458,10 @@
             },
             devices,
             home_summary: buildHomeSummary(devices),
-            recent_commands: commands,
             recent_alarms: Array.isArray(alarms) ? alarms.map(normalizeAlarm) : [],
-            system_events: normalizeSystemEvents(systemEvents),
             device_status_error: Boolean(states.deviceStatusError),
             module_error: Boolean(states.moduleError),
-            command_error: Boolean(states.commandError),
             alarm_error: Boolean(states.alarmError),
-            event_error: Boolean(states.eventError),
             request_meta: requestMeta
         };
     }
@@ -581,9 +471,9 @@
             return {
                 online_device_count: null,
                 offline_device_count: null,
-                avg_temperature: DISCONNECTED_TEXT,
-                avg_humidity: DISCONNECTED_TEXT,
-                avg_air_quality: DISCONNECTED_TEXT
+                avg_temperature: SENSOR_EMPTY_TEXT,
+                avg_humidity: SENSOR_EMPTY_TEXT,
+                avg_air_quality: SENSOR_EMPTY_TEXT
             };
         }
         const onlineDevices = devices.filter(device => device.online === true).length;
@@ -594,7 +484,7 @@
                 .map(reader)
                 .map(Number)
                 .filter(Number.isFinite);
-            if (!values.length) return DISCONNECTED_TEXT;
+            if (!values.length) return SENSOR_EMPTY_TEXT;
             return formatNumber(values.reduce((sum, value) => sum + value, 0) / values.length, digits);
         };
         return {
@@ -604,71 +494,6 @@
             avg_humidity: average(device => device.sensors.humidity),
             avg_air_quality: average(device => device.sensors.air_quality_score, 0)
         };
-    }
-
-    function renderStatusTile(label, value, status) {
-        return `
-            <div class="s3-status-tile">
-                <span>${escapeHtml(label)}</span>
-                <strong>${escapeHtml(value)}</strong>
-                <i class="s3-status-line ${escapeHtml(status)}"></i>
-            </div>
-        `;
-    }
-
-    function renderSystemHealthBar(data) {
-        const gateway = data.gateway || {};
-        const meta = data.request_meta || {};
-        const modules = Array.isArray(gateway.modules) ? gateway.modules : [];
-        const mqttModule = modules.find(module => /mqtt/i.test(String(module.module_type || module.name || module.id || "")));
-        const mqttOnline = mqttModule
-            ? (mqttModule.online === true || mqttModule.module_online === true)
-            : (gateway.cloud_connected === true ? true : null);
-        const dataTimestamp = getLatestDataTimestamp(data);
-        const streamElapsed = dataTimestamp ? Date.now() - dataTimestamp.getTime() : Infinity;
-        const streamStatus = streamElapsed <= 5000 ? "normal" : (streamElapsed <= 30000 ? "warning" : "danger");
-        const apiOk = meta.api_ok !== false;
-        const apiLatency = Number(meta.api_latency_ms);
-        const items = [
-            {
-                label: "ESP32 Gateway",
-                value: gateway.online === true ? "在线" : (gateway.online === false ? "离线" : UNKNOWN_TEXT),
-                status: gateway.online === true ? "normal" : (gateway.online === false ? "danger" : "warning"),
-                detail: `来源：/api/dashboard/v1/overview\n更新时间：${formatTime(dataTimestamp)}`
-            },
-            {
-                label: "MQTT",
-                value: mqttOnline === true ? "已连接" : (mqttOnline === false ? "未连接" : "重连中"),
-                status: mqttOnline === true ? "normal" : (mqttOnline === false ? "danger" : "warning"),
-                detail: `来源：/api/dashboard/v1/modules/status\n模块：${mqttModule?.module_type || "gateway/cloud"}`
-            },
-            {
-                label: "API",
-                value: apiOk ? `正常${Number.isFinite(apiLatency) ? ` · ${Math.round(apiLatency)} ms` : ""}` : "异常",
-                status: apiOk ? "normal" : "danger",
-                detail: `来源：Dashboard 请求\n响应时间：${Number.isFinite(apiLatency) ? `${Math.round(apiLatency)} ms` : UNKNOWN_TEXT}`
-            },
-            {
-                label: "Data Stream",
-                value: streamStatus === "normal" ? "实时更新" : (streamStatus === "warning" ? "等待数据" : "停止更新"),
-                status: streamStatus,
-                detail: dataTimestamp ? `最近数据：${formatTime(dataTimestamp)}\n${relativeTime(dataTimestamp)}` : "尚未收到数据"
-            },
-            {
-                label: "Last Sync",
-                value: meta.last_sync_at ? relativeTime(meta.last_sync_at) : UNKNOWN_TEXT,
-                status: meta.last_sync_at ? "normal" : "warning",
-                detail: meta.last_sync_at ? `同步时间：${formatTime(meta.last_sync_at)}` : "尚未同步"
-            }
-        ];
-        return `<section class="s3-health-bar" aria-label="系统实时状态">
-            ${items.map(item => `
-                <div class="s3-health-item health-${item.status}" title="${escapeHtml(item.detail)}">
-                    <span><i aria-hidden="true"></i>${escapeHtml(item.label)}</span>
-                    <strong>${escapeHtml(item.value)}</strong>
-                </div>
-            `).join("")}
-        </section>`;
     }
 
     function getLatestDataTimestamp(data) {
@@ -685,17 +510,33 @@
         return null;
     }
 
-    function formatAirQuality(sensors) {
-        const score = Number(sensors?.air_quality_score);
-        if (!Number.isFinite(score)) return DISCONNECTED_TEXT;
-        const level = sensors.air_quality_level ? ` · ${sensors.air_quality_level}` : "";
-        return `${formatNumber(score, 0)} 分${level}`;
-    }
-
     function formatSensorValue(value, unit, digits = 1) {
         const numeric = Number(value);
-        if (!Number.isFinite(numeric)) return DISCONNECTED_TEXT;
+        if (!Number.isFinite(numeric)) return SENSOR_EMPTY_TEXT;
         return `${formatNumber(numeric, digits)}${unit}`;
+    }
+
+    function formatDeviceSensorValue(device, key, unit, digits = 1) {
+        if (device?.online !== true) return SENSOR_EMPTY_TEXT;
+        return formatSensorValue(device?.sensors?.[key], unit, digits);
+    }
+
+    function getDeviceAirQualityState(device) {
+        const score = Number(device?.sensors?.air_quality_score);
+        if (device?.online !== true || !Number.isFinite(score)) {
+            return { label: "", className: "unknown" };
+        }
+        return realtime().getAirQualityState
+            ? realtime().getAirQualityState(score)
+            : { label: device.sensors.air_quality_level || "", className: "unknown" };
+    }
+
+    function formatDeviceAirQuality(device) {
+        const score = Number(device?.sensors?.air_quality_score);
+        if (device?.online !== true || !Number.isFinite(score)) return SENSOR_EMPTY_TEXT;
+        const airState = getDeviceAirQualityState(device);
+        const label = airState.label ? ` · ${airState.label}` : "";
+        return `${formatNumber(score, 0)} 分${label}`;
     }
 
     function getApplianceStatus(appliances, slot, online) {
@@ -713,7 +554,7 @@
             return {
                 label: slot.label,
                 icon: slot.icon,
-                state: "未接入",
+                state: "",
                 isActive: false
             };
         }
@@ -727,6 +568,7 @@
         }
 
         const rawState = String(appliance.state ?? appliance.status ?? "").trim();
+        const stateText = cleanDisplayText(rawState, "");
         const explicitOn = appliance.on ?? appliance.enabled ?? appliance.power ?? appliance.online;
         const openPercent = toNumberOrNull(appliance.open_percent);
         const speed = toNumberOrNull(appliance.speed);
@@ -734,8 +576,15 @@
             ? explicitOn
             : (openPercent !== null ? openPercent > 0 : false);
         const stateParts = [];
-        if (rawState) {
-            stateParts.push(rawState);
+        if (stateText) {
+            const lower = stateText.toLowerCase();
+            if (["on", "open", "opened", "enabled", "running", "true", "1"].includes(lower)) {
+                stateParts.push("开启");
+            } else if (["off", "closed", "disabled", "stopped", "false", "0"].includes(lower)) {
+                stateParts.push("关闭");
+            } else {
+                stateParts.push(stateText);
+            }
         } else if (openPercent !== null) {
             stateParts.push(`${Math.round(openPercent)}%`);
         } else {
@@ -752,236 +601,88 @@
         };
     }
 
-    function formatModuleName(moduleType) {
-        const text = String(moduleType || "").trim();
-        return text || "未命名模块";
+    function getConnectedAppliances(data) {
+        const devices = Array.isArray(data?.devices) ? data.devices : [];
+        return devices.flatMap(device => {
+            const deviceKey = normalizeDeviceId(device.id || device.name);
+            return applianceSlots.flatMap(slot => {
+                const rawAppliance = device.appliances?.[slot.key];
+                if (!isPlainObject(rawAppliance) || isMockAppliance(rawAppliance)) return [];
+                const appliance = getApplianceStatus(device.appliances, slot, device.online);
+                if (!appliance.state) return [];
+                return [{
+                    ...appliance,
+                    key: `${deviceKey}-${slot.key}`,
+                    room: device.room || getDeviceRoomName(deviceKey) || ""
+                }];
+            });
+        });
     }
 
-    function renderModuleRows(data) {
-        const modules = Array.isArray(data.gateway?.modules) ? data.gateway.modules : [];
-        if (data.module_error) {
-            return `<div class="system-log empty">${ERROR_TEXT}</div>`;
-        }
-        if (!modules.length) {
-            return '<div class="system-log empty">暂无数据</div>';
-        }
-
-        return modules.map(module => {
-            const online = module.online === true || module.module_online === true;
-            const delay = Number(module.latest_upload_delay_ms);
-            const age = Number(module.last_seen_age_ms);
-            const detailParts = [];
-            if (Number.isFinite(delay)) {
-                detailParts.push(`延迟 ${formatInteger(delay)} ms`);
-            }
-            if (Number.isFinite(age)) {
-                detailParts.push(`最近 ${formatInteger(age)} ms 前`);
-            }
-            return `
-                <div class="s3-module-row">
-                    <span class="status-dot ${online ? "online" : ""}"></span>
-                    <div>
-                        <strong>${escapeHtml(formatModuleName(module.module_type))}</strong>
-                        <small>${escapeHtml(detailParts.join(" · ") || "暂无数据")}</small>
-                    </div>
-                    <span class="level-badge level-${getStatusClass(online)}">${getStatusText(online)}</span>
+    function renderSmartHomeOverview(data) {
+        const appliances = getConnectedAppliances(data);
+        const content = appliances.length
+            ? `<div class="s3-appliance-grid" data-smart-home-grid>${appliances.map(appliance => `
+                <div class="s3-appliance ${appliance.isActive ? "is-on" : "is-off"}" data-smart-home-appliance="${escapeHtml(appliance.key)}">
+                    <span class="s3-appliance-icon" aria-hidden="true">${appliance.icon}</span>
+                    <strong data-appliance-label>${escapeHtml(appliance.label)}</strong>
+                    <small data-appliance-state>${escapeHtml(appliance.state)}</small>
                 </div>
-            `;
-        }).join("");
-    }
-
-    function renderSystemStatus(data) {
-        const gateway = data.gateway || {};
-        const gatewayOnline = gateway.online === true;
-        const cloudConnected = gateway.cloud_connected === true;
-        const latency = Number(gateway.latency_ms);
-        const latencyStatus = Number.isFinite(latency)
-            ? (latency <= 80 ? "normal" : "warning")
-            : "danger";
-        const localDegraded = gateway.local_degraded === true;
-        const gatewayTiles = [
-            {
-                label: "S3 在线状态",
-                value: gateway.online === null ? UNKNOWN_TEXT : boolText(gateway.online, "在线", "离线"),
-                status: getStatusClass(gateway.online)
-            },
-            {
-                label: "云端连接状态",
-                value: gateway.cloud_connected === null ? DISCONNECTED_TEXT : boolText(gateway.cloud_connected, "已连接", "未连接"),
-                status: getStatusClass(gateway.cloud_connected)
-            },
-            {
-                label: "延迟",
-                value: Number.isFinite(latency) ? `${formatInteger(latency)} ms` : DISCONNECTED_TEXT,
-                status: latencyStatus
-            },
-            {
-                label: "本地降级状态",
-                value: gateway.local_degraded === null ? DISCONNECTED_TEXT : boolText(gateway.local_degraded, "已启用", "未启用"),
-                status: localDegraded ? "warning" : (gatewayOnline || cloudConnected ? "normal" : "danger")
-            }
-        ];
-        const rows = renderModuleRowsRealtime(data);
-
+            `).join("")}</div>`
+            : '<div class="system-log empty">暂无智能家居设备。</div>';
         return `
-            <article class="panel s3-gateway-panel">
-                <div class="panel-header">
-                    <h2>系统状态</h2>
+            <section class="s3-section" data-s3-panel="smart-home">
+                <div class="s3-section-heading">
+                    <h2>🏡 智能家居</h2>
                 </div>
-                <div class="s3-status-grid" aria-label="Gateway 状态">
-                    ${gatewayTiles.map(tile => renderStatusTile(tile.label, tile.value, tile.status)).join("")}
-                </div>
-                <div class="s3-module-list" aria-label="系统状态">${rows}</div>
-            </article>
+                ${content}
+            </section>
         `;
     }
 
-    function renderModuleRowsRealtime(data) {
-        const modules = Array.isArray(data.gateway?.modules) ? data.gateway.modules : [];
-        if (data.module_error) {
-            return `<div class="system-log empty">${ERROR_TEXT}</div>`;
+    function updateSmartHomeOverview(root, data) {
+        const panel = root.querySelector('[data-s3-panel="smart-home"]');
+        if (!panel) return;
+        const nextHtml = renderSmartHomeOverview(data);
+        if (panel.dataset.signature !== nextHtml) {
+            panel.outerHTML = nextHtml;
+            const nextPanel = root.querySelector('[data-s3-panel="smart-home"]');
+            if (nextPanel) nextPanel.dataset.signature = nextHtml;
         }
-        if (!modules.length) {
-            return '<div class="system-log empty">暂无数据</div>';
-        }
-        return modules.map(module => {
-            const online = module.online === true || module.module_online === true;
-            const moduleTime = parseTimestamp(module.last_seen_ms || module.updated_at || module.timestamp || data.request_meta?.last_sync_at);
-            const delay = Number(module.latest_upload_delay_ms);
-            const age = Number(module.last_seen_age_ms);
-            const detailParts = [];
-            if (Number.isFinite(delay)) detailParts.push(`延迟 ${formatInteger(delay)} ms`);
-            if (Number.isFinite(age)) detailParts.push(`最近 ${formatInteger(age)} ms 前`);
-            return `
-                <div class="s3-module-row" title="${escapeHtml(`来源：/api/dashboard/v1/modules/status\n更新时间：${moduleTime ? formatTime(moduleTime) : EMPTY_TEXT}`)}">
-                    <span class="status-dot ${online ? "online" : ""}"></span>
-                    <div>
-                        <strong>${escapeHtml(formatModuleName(module.module_type))}</strong>
-                        <small>${escapeHtml(detailParts.join(" · ") || "暂无数据")}</small>
-                        <small>${updateTime(moduleTime, "Gateway Module", "/api/dashboard/v1/modules/status")}</small>
-                    </div>
-                    <span class="level-badge level-${getStatusClass(online)}">${getStatusText(online)}</span>
-                </div>
-            `;
-        }).join("");
     }
 
-    function renderSystemStatusRealtime(data) {
-        const gateway = data.gateway || {};
-        const gatewayOnline = gateway.online === true;
-        const cloudConnected = gateway.cloud_connected === true;
-        const latency = Number(gateway.latency_ms);
-        const latencyStatus = Number.isFinite(latency)
-            ? (latency <= 80 ? "normal" : "warning")
-            : "danger";
-        const localDegraded = gateway.local_degraded === true;
-        const gatewayTiles = [
+    function getHomeSummaryItems(summary) {
+        return [
+            { key: "temperature", label: "平均温度", value: summary.avg_temperature === SENSOR_EMPTY_TEXT ? SENSOR_EMPTY_TEXT : `${summary.avg_temperature}°C`, accent: "blue" },
+            { key: "humidity", label: "平均湿度", value: summary.avg_humidity === SENSOR_EMPTY_TEXT ? SENSOR_EMPTY_TEXT : `${summary.avg_humidity}%`, accent: "green" },
+            { key: "air", label: "空气质量", value: summary.avg_air_quality === SENSOR_EMPTY_TEXT ? SENSOR_EMPTY_TEXT : `${summary.avg_air_quality} 分`, accent: "purple" },
             {
-                label: "S3 在线状态",
-                value: gateway.online === null ? UNKNOWN_TEXT : boolText(gateway.online, "在线", "离线"),
-                status: getStatusClass(gateway.online)
-            },
-            {
-                label: "云端连接状态",
-                value: gateway.cloud_connected === null ? DISCONNECTED_TEXT : boolText(gateway.cloud_connected, "已连接", "未连接"),
-                status: getStatusClass(gateway.cloud_connected)
-            },
-            {
-                label: "延迟",
-                value: Number.isFinite(latency) ? `${formatInteger(latency)} ms` : DISCONNECTED_TEXT,
-                status: latencyStatus
-            },
-            {
-                label: "本地降级状态",
-                value: gateway.local_degraded === null ? DISCONNECTED_TEXT : boolText(gateway.local_degraded, "已启用", "未启用"),
-                status: localDegraded ? "warning" : (gatewayOnline || cloudConnected ? "normal" : "danger")
-            }
-        ];
-        return `
-            <article class="panel s3-gateway-panel" title="${escapeHtml(`来源：/api/dashboard/v1/overview\n更新时间：${formatTime(getLatestDataTimestamp(data))}`)}">
-                <div class="panel-header">
-                    <h2>系统状态</h2>
-                    ${updateTime(getLatestDataTimestamp(data), "S3 Gateway", "/api/dashboard/v1/overview")}
-                </div>
-                <div class="s3-status-grid" aria-label="Gateway 状态">
-                    ${gatewayTiles.map(tile => renderStatusTile(tile.label, tile.value, tile.status)).join("")}
-                </div>
-                <div class="s3-module-list" aria-label="系统模块状态">${renderModuleRowsRealtime(data)}</div>
-            </article>
-        `;
-    }
-
-    function renderHomeSummary(summary) {
-        const items = [
-            { label: "全屋平均温度", value: summary.avg_temperature === DISCONNECTED_TEXT ? DISCONNECTED_TEXT : `${summary.avg_temperature}°C`, accent: "blue" },
-            { label: "全屋平均湿度", value: summary.avg_humidity === DISCONNECTED_TEXT ? DISCONNECTED_TEXT : `${summary.avg_humidity}%`, accent: "green" },
-            { label: "平均空气质量", value: summary.avg_air_quality === DISCONNECTED_TEXT ? DISCONNECTED_TEXT : `${summary.avg_air_quality} 分`, accent: "purple" },
-            {
-                label: "在线 / 离线设备",
+                key: "online",
+                label: "在线设备数",
                 value: summary.online_device_count === null ||
                     summary.offline_device_count === null
                     ? EMPTY_TEXT
-                    : `${summary.online_device_count} / ${summary.offline_device_count}`,
+                    : `${summary.online_device_count} 台`,
                 accent: "orange"
             }
         ];
+    }
+
+    function renderHomeSummary(summary) {
+        const items = getHomeSummaryItems(summary);
 
         return `
             <article class="panel s3-summary-panel">
                 <div class="panel-header">
-                    <h2>全屋概览</h2>
+                    <h2>🏠 全屋状态</h2>
                 </div>
                 <div class="s3-summary-grid">
                     ${items.map(item => `
-                        <div class="s3-summary-tile ${item.accent}">
+                        <div class="s3-summary-tile ${item.accent}" data-summary-key="${escapeHtml(item.key)}">
                             <span>${escapeHtml(item.label)}</span>
-                            <strong>${escapeHtml(item.value)}</strong>
+                            <strong data-summary-value>${escapeHtml(item.value)}</strong>
                         </div>
                     `).join("")}
-                </div>
-            </article>
-        `;
-    }
-
-    function renderSensorMetric(label, value) {
-        return `
-            <div class="s3-sensor-metric">
-                <span>${escapeHtml(label)}</span>
-                <strong>${escapeHtml(value)}</strong>
-            </div>
-        `;
-    }
-
-    function renderDeviceCard(device) {
-        const sensors = device.sensors;
-        const online = device.online === true;
-        return `
-            <article class="panel s3-device-card">
-                <div class="panel-header">
-                    <h2>${escapeHtml(device.name)}</h2>
-                    <span class="state-badge state-${getStatusClass(device.online)}">${getStatusText(device.online)}</span>
-                </div>
-                <div class="s3-sensor-grid">
-                    ${renderSensorMetric("温度", formatSensorValue(sensors.temperature, "°C"))}
-                    ${renderSensorMetric("湿度", formatSensorValue(sensors.humidity, "%"))}
-                    ${renderSensorMetric("气压", formatSensorValue(sensors.pressure, " hPa"))}
-                </div>
-                <div class="s3-sensor-grid">
-                    ${renderSensorMetric("空气质量", formatAirQuality(sensors))}
-                    ${renderSensorMetric("最近上报", device.timestamp ? formatTime(device.timestamp) : DISCONNECTED_TEXT)}
-                    ${renderSensorMetric("占用状态", online && device.occupancy?.available ? getStatusText(device.occupancy.state) : DISCONNECTED_TEXT)}
-                </div>
-                <div class="s3-appliance-grid" aria-label="${escapeHtml(device.room)}设备状态">
-                    ${applianceSlots.map(slot => {
-                        const appliance = getApplianceStatus(device.appliances, slot, online);
-                        return `
-                            <div class="s3-appliance ${appliance.isActive ? "is-on" : "is-off"}">
-                                <span class="s3-appliance-icon" aria-hidden="true">${appliance.icon}</span>
-                                <strong>${escapeHtml(appliance.label)}</strong>
-                                <small>${escapeHtml(appliance.state)}</small>
-                            </div>
-                        `;
-                    }).join("")}
                 </div>
             </article>
         `;
@@ -991,59 +692,33 @@
         const statusClass = meta.statusClass ? ` ${meta.statusClass}` : "";
         const tooltip = meta.tooltip ? ` title="${escapeHtml(meta.tooltip)}"` : "";
         return `
-            <div class="s3-sensor-metric${statusClass}"${tooltip}>
+            <div class="s3-sensor-metric${statusClass}"${tooltip} ${meta.key ? `data-device-metric="${escapeHtml(meta.key)}"` : ""}>
                 <span>${escapeHtml(label)}</span>
-                <strong data-realtime-value="${escapeHtml(meta.valueKey || label)}">${escapeHtml(value)}</strong>
-                ${meta.update ? `<small>${meta.update}</small>` : ""}
+                <strong data-device-metric-value>${escapeHtml(value)}</strong>
             </div>
         `;
     }
 
     function renderDeviceCardRealtime(device) {
-        const sensors = device.sensors;
-        const online = device.online === true;
         const updatedAt = parseTimestamp(device.timestamp);
-        const api = `/api/dashboard/v1/overview?device_id=${encodeURIComponent(device.id || "")}`;
-        const airState = realtime().getAirQualityState
-            ? realtime().getAirQualityState(sensors.air_quality_score)
-            : { label: sensors.air_quality_level || UNKNOWN_TEXT, className: "unknown" };
-        const tooltip = field => [
-            `来源：ESP32 ${device.id || device.name}`,
-            updatedAt ? `更新时间：${formatTime(updatedAt)}` : "",
-            `API：${api}`,
-            `字段：${field}`
-        ].filter(Boolean).join("\n");
+        const deviceKey = normalizeDeviceId(device.id || device.name);
+        const airState = getDeviceAirQualityState(device);
         return `
-            <article class="panel s3-device-card" title="${escapeHtml(`来源：ESP32 ${device.id || device.name}\n更新时间：${updatedAt ? formatTime(updatedAt) : EMPTY_TEXT}\nAPI：${api}`)}">
+            <article class="panel s3-device-card" data-device-card="${escapeHtml(deviceKey)}">
                 <div class="panel-header">
                     <div>
-                        <h2>${escapeHtml(device.name)}</h2>
-                        ${updateTime(updatedAt, `ESP32 ${device.id || device.name}`, api)}
+                        <h2 data-device-name>${escapeHtml(device.name)}</h2>
                     </div>
-                    <span class="state-badge state-${getStatusClass(device.online)}">${getStatusText(device.online)}</span>
+                    <span class="state-badge state-${getStatusClass(device.online)}" data-device-status>${getStatusText(device.online)}</span>
                 </div>
                 <div class="s3-sensor-grid">
-                    ${renderSensorMetricRealtime("温度", formatSensorValue(sensors.temperature, "°C"), { tooltip: tooltip("temperature"), update: updateTime(updatedAt, device.id, api), valueKey: `${device.id}-temperature` })}
-                    ${renderSensorMetricRealtime("湿度", formatSensorValue(sensors.humidity, "%"), { tooltip: tooltip("humidity"), update: updateTime(updatedAt, device.id, api), valueKey: `${device.id}-humidity` })}
-                    ${renderSensorMetricRealtime("气压", formatSensorValue(sensors.pressure, " hPa"), { tooltip: tooltip("pressure"), update: updateTime(updatedAt, device.id, api), valueKey: `${device.id}-pressure` })}
+                    ${renderSensorMetricRealtime("温度", formatDeviceSensorValue(device, "temperature", "°C"), { key: "temperature" })}
+                    ${renderSensorMetricRealtime("湿度", formatDeviceSensorValue(device, "humidity", "%"), { key: "humidity" })}
+                    ${renderSensorMetricRealtime("气压", formatDeviceSensorValue(device, "pressure", " hPa"), { key: "pressure" })}
                 </div>
                 <div class="s3-sensor-grid">
-                    ${renderSensorMetricRealtime("AQI", `${formatAirQuality(sensors)} · ${airState.label}`, { tooltip: tooltip("air_quality_score"), update: updateTime(updatedAt, device.id, api), statusClass: `aqi-${airState.className}`, valueKey: `${device.id}-aqi` })}
-                    ${renderSensorMetricRealtime("最近上报", updatedAt ? formatTime(updatedAt) : DISCONNECTED_TEXT, { update: updateTime(updatedAt, device.id, api) })}
-                    ${renderSensorMetricRealtime("占用状态", online && device.occupancy?.available ? getStatusText(device.occupancy.state) : DISCONNECTED_TEXT, { tooltip: tooltip("occupancy") })}
-                </div>
-                <div class="s3-appliance-grid" aria-label="${escapeHtml(device.room)}设备状态">
-                    ${applianceSlots.map(slot => {
-                        const appliance = getApplianceStatus(device.appliances, slot, online);
-                        return `
-                            <div class="s3-appliance ${appliance.isActive ? "is-on" : "is-off"}" title="${escapeHtml(`来源：智能家居状态\n更新时间：${updatedAt ? formatTime(updatedAt) : EMPTY_TEXT}\nAPI：${api}`)}">
-                                <span class="s3-appliance-icon" aria-hidden="true">${appliance.icon}</span>
-                                <strong>${escapeHtml(appliance.label)}</strong>
-                                <small>${escapeHtml(appliance.state)}</small>
-                                <small>${updateTime(updatedAt, appliance.label, api)}</small>
-                            </div>
-                        `;
-                    }).join("")}
+                    ${renderSensorMetricRealtime("空气质量", formatDeviceAirQuality(device), { statusClass: `aqi-${airState.className}`, key: "aqi" })}
+                    ${renderSensorMetricRealtime("最近上报", updatedAt ? formatTime(updatedAt) : (device.online === false ? "设备离线" : "暂无数据"), { key: "lastReported" })}
                 </div>
             </article>
         `;
@@ -1056,7 +731,7 @@
         return `
             <section class="s3-section">
                 <div class="s3-section-heading">
-                    <h2>设备总览</h2>
+                    <h2>📦 设备总览</h2>
                 </div>
                 <div class="s3-device-grid">
                     ${content}
@@ -1065,60 +740,39 @@
         `;
     }
 
-    function renderRecentCommandsPanel(data) {
-        const commands = data.recent_commands;
-        const rows = commands.length
-            ? commands.map(command => `
-                <tr>
-                    <td>${escapeHtml(localizeCommandText(command.command || command.name || command.command_id))}</td>
-                    <td>${escapeHtml(command.target || command.device_id || EMPTY_TEXT)}</td>
-                    <td><span class="level-badge level-${getStatusClass(command.status)}">${getStatusText(command.status)}</span></td>
-                    <td>${escapeHtml(formatTime(command.created_at || command.timestamp))}</td>
-                    <td>${escapeHtml(formatTime(command.completed_at || command.updated_at))}</td>
-                </tr>
-            `).join("")
-            : `<tr><td colspan="5" class="table-empty">${data.command_error ? ERROR_TEXT : "暂无命令记录"}</td></tr>`;
-        return `
-            <article class="panel">
-                <div class="panel-header">
-                    <h2>最近命令</h2>
-                </div>
-                <div class="table-wrap">
-                    <table class="s3-table">
-                        <thead>
-                            <tr>
-                                <th>命令</th>
-                                <th>目标设备</th>
-                                <th>状态</th>
-                                <th>创建时间</th>
-                                <th>完成时间</th>
-                            </tr>
-                        </thead>
-                        <tbody>${rows}</tbody>
-                    </table>
-                </div>
-            </article>
-        `;
+    function isActiveAlarm(alarm) {
+        const status = String(alarm?.status || "").toLowerCase();
+        if (alarm?.resolved_at) return false;
+        return !["resolved", "archived", "completed", "normal", "recovered", "已恢复", "已解决", "已处理"].includes(status);
     }
 
-    function renderAlarmPanel(data) {
-        const alarms = Array.isArray(data.recent_alarms) ? data.recent_alarms : [];
-        const rows = alarms.length
+    function getActiveAlarms(data) {
+        return (Array.isArray(data.recent_alarms) ? data.recent_alarms : [])
+            .filter(isActiveAlarm)
+            .slice(0, 20);
+    }
+
+    function renderAlarmRows(data) {
+        const alarms = getActiveAlarms(data);
+        return alarms.length
             ? alarms.map(alarm => `
                 <tr>
                     <td>${escapeHtml(formatTime(alarm.created_at))}</td>
-                    <td>${escapeHtml(alarm.device_id || EMPTY_TEXT)}</td>
+                    <td>${escapeHtml(friendlyDeviceName(alarm.device_id))}</td>
                     <td>${escapeHtml(alarm.event_type)}</td>
                     <td>${escapeHtml(alarm.message || EMPTY_TEXT)}</td>
                     <td><span class="level-badge level-${getStatusClass(alarm.severity)}">${getStatusText(alarm.severity)}</span></td>
-                    <td><span class="level-badge level-${getStatusClass(alarm.status)}">${getStatusText(alarm.status)}</span></td>
                 </tr>
             `).join("")
-            : `<tr><td colspan="6" class="table-empty">${data.alarm_error ? ERROR_TEXT : "暂无报警信息"}</td></tr>`;
+            : `<tr><td colspan="5" class="table-empty">${data.alarm_error ? ERROR_TEXT : "当前无报警。"}</td></tr>`;
+    }
+
+    function renderAlarmPanel(data) {
+        const rows = renderAlarmRows(data);
         return `
-            <article class="panel">
+            <article class="panel" data-s3-panel="alarms">
                 <div class="panel-header">
-                    <h2>报警信息</h2>
+                    <h2>⚠️ 当前报警</h2>
                 </div>
                 <div class="table-wrap">
                     <table class="s3-table">
@@ -1129,132 +783,183 @@
                                 <th>类型</th>
                                 <th>内容</th>
                                 <th>级别</th>
-                                <th>状态</th>
                             </tr>
                         </thead>
-                        <tbody>${rows}</tbody>
+                        <tbody data-alarm-rows>${rows}</tbody>
                     </table>
                 </div>
             </article>
         `;
     }
 
-    function renderActivity(data) {
-        return `
-            <section class="s3-activity-grid">
-                ${renderRecentCommandsPanel(data)}
-                ${renderAlarmPanel(data)}
-            </section>
-        `;
+    function setStableText(element, value) {
+        if (!element) return;
+        const text = String(value ?? "");
+        if (element.textContent !== text) {
+            element.textContent = text;
+        }
     }
 
-    function renderSystemEventsPanel(data) {
-        const events = Array.isArray(data.system_events) ? data.system_events : [];
-        const timeline = realtime().EventTimeline
-            ? realtime().EventTimeline(events)
-            : '<div class="system-log empty">暂无系统事件。</div>';
-        return `
-            <article class="panel s3-events-panel">
-                <div class="panel-header">
-                    <h2>最近系统事件</h2>
-                    ${updateTime(data.request_meta?.last_sync_at, "System Events", "/api/logs/v1/system")}
-                </div>
-                ${timeline}
-            </article>
-        `;
+    function setStableClass(element, className) {
+        if (element && element.className !== className) {
+            element.className = className;
+        }
     }
 
-    function applyRealtimeValueAnimation(container) {
-        container.querySelectorAll("[data-realtime-value]").forEach(element => {
-            const key = element.dataset.realtimeValue;
-            const numericText = String(element.textContent || "").replace(/[^\d.-]/g, "");
-            const next = Number(numericText);
-            if (!Number.isFinite(next)) return;
-            const previous = previousRealtimeValues.get(key);
-            previousRealtimeValues.set(key, next);
-            if (!Number.isFinite(previous) || previous === next) return;
-            element.classList.remove("value-increase", "value-decrease");
-            void element.offsetWidth;
-            element.classList.add(next > previous ? "value-increase" : "value-decrease");
-            window.setTimeout(() => {
-                element.classList.remove("value-increase", "value-decrease");
-            }, 500);
+    function setStableTitle(element, title) {
+        if (element && element.title !== title) {
+            element.title = title;
+        }
+    }
+
+    function updateDeviceCards(root, devices) {
+        const grid = root.querySelector(".s3-device-grid");
+        if (!grid) return;
+        const cards = Array.from(grid.querySelectorAll("[data-device-card]"));
+        if (!Array.isArray(devices) || cards.length !== devices.length) {
+            const html = devices?.length ? devices.map(renderDeviceCardRealtime).join("") : '<div class="system-log empty">暂无数据</div>';
+            if (grid.dataset.signature !== html) {
+                grid.innerHTML = html;
+                grid.dataset.signature = html;
+            }
+            return;
+        }
+
+        devices.forEach(device => {
+            const key = normalizeDeviceId(device.id || device.name);
+            const card = cards.find(item => item.dataset.deviceCard === key);
+            if (!card) return;
+            const updatedAt = parseTimestamp(device.timestamp);
+            const airState = getDeviceAirQualityState(device);
+            const values = {
+                temperature: formatDeviceSensorValue(device, "temperature", "°C"),
+                humidity: formatDeviceSensorValue(device, "humidity", "%"),
+                pressure: formatDeviceSensorValue(device, "pressure", " hPa"),
+                aqi: formatDeviceAirQuality(device),
+                lastReported: updatedAt ? formatTime(updatedAt) : (device.online === false ? "设备离线" : "暂无数据")
+            };
+
+            setStableTitle(card, "");
+            setStableText(card.querySelector("[data-device-name]"), device.name);
+            const status = card.querySelector("[data-device-status]");
+            setStableClass(status, `state-badge state-${getStatusClass(device.online)}`);
+            setStableText(status, getStatusText(device.online));
+            Object.entries(values).forEach(([metric, value]) => {
+                const metricNode = card.querySelector(`[data-device-metric="${metric}"]`);
+                if (!metricNode) return;
+                if (metric === "aqi") {
+                    setStableClass(metricNode, `s3-sensor-metric aqi-${airState.className}`);
+                }
+                setStableText(metricNode.querySelector("[data-device-metric-value]"), value);
+            });
         });
     }
 
-    function renderLoading(container) {
-        const data = normalizeOverview(null, [], [], [], null, {});
-        const summary = buildHomeSummary(data.devices || []);
+    function updateStableDashboard(container, data, summary) {
+        const root = container.querySelector(".s3-dashboard");
+        if (!root) return false;
+
+        const header = root.querySelector(".s3-page-header");
+        setStableText(header?.querySelector("p"), "家庭环境与设备状态");
+
+        getHomeSummaryItems(summary).forEach(item => {
+            const node = root.querySelector(`[data-summary-key="${item.key}"]`);
+            setStableText(node?.querySelector("[data-summary-value]"), item.value);
+        });
+
+        updateDeviceCards(root, data.devices || []);
+        updateSmartHomeOverview(root, data);
+
+        const alarmRows = renderAlarmRows(data);
+        const alarmBody = root.querySelector("[data-alarm-rows]");
+        if (alarmBody && alarmBody.dataset.signature !== alarmRows) {
+            alarmBody.innerHTML = alarmRows;
+            alarmBody.dataset.signature = alarmRows;
+        }
+
+        return true;
+    }
+
+    function renderReady(container, data, summary) {
         container.innerHTML = `
             <div class="s3-dashboard">
                 <div class="s3-page-header">
                     <div>
-                        <h1>S3 系统总览</h1>
+                        <h1>家庭环境总览</h1>
+                        <p>家庭环境与设备状态</p>
+                    </div>
+                </div>
+                ${renderHomeSummary(summary)}
+                ${renderDeviceOverview(data.devices || [])}
+                ${renderSmartHomeOverview(data)}
+                ${renderAlarmPanel(data)}
+            </div>
+        `;
+        container.dataset.s3DashboardReady = "true";
+    }
+
+    function renderLoading(container) {
+        const data = normalizeOverview(null, [], [], null, {});
+        const summary = buildHomeSummary(data.devices || []);
+        container.dataset.s3DashboardReady = "false";
+        container.innerHTML = `
+            <div class="s3-dashboard">
+                <div class="s3-page-header">
+                    <div>
+                        <h1>家庭环境总览</h1>
                         <p>Loading...</p>
                     </div>
-                    <span class="state-badge state-warning">Loading...</span>
                 </div>
-                ${renderSystemHealthBar(data)}
-                <div class="s3-overview-grid">
-                    ${renderSystemStatusRealtime(data)}
-                    ${renderHomeSummary(summary)}
-                </div>
+                ${renderHomeSummary(summary)}
                 ${renderDeviceOverview(data.devices || [])}
-                ${renderActivity(data)}
-                ${renderSystemEventsPanel(data)}
+                ${renderSmartHomeOverview(data)}
+                ${renderAlarmPanel(data)}
             </div>
         `;
     }
 
     function renderError(container) {
-        const data = normalizeOverview(null, [], [], [], null, {
+        const data = normalizeOverview(null, [], [], null, {
             deviceStatusError: true,
             moduleError: true,
-            commandError: true,
             alarmError: true
         });
         const summary = buildHomeSummary(data.devices || []);
+        container.dataset.s3DashboardReady = "false";
         container.innerHTML = `
             <div class="s3-dashboard">
                 <div class="s3-page-header">
                     <div>
-                        <h1>S3 系统总览</h1>
+                        <h1>家庭环境总览</h1>
                         <p>${UNAVAILABLE_TEXT}</p>
                     </div>
-                    <span class="state-badge state-danger">网关离线</span>
                 </div>
-                ${renderSystemHealthBar(data)}
-                <div class="s3-overview-grid">
-                    ${renderSystemStatusRealtime(data)}
-                    ${renderHomeSummary(summary)}
-                </div>
+                ${renderHomeSummary(summary)}
                 ${renderDeviceOverview(data.devices || [])}
-                ${renderActivity(data)}
-                ${renderSystemEventsPanel(data)}
+                ${renderSmartHomeOverview(data)}
+                ${renderAlarmPanel(data)}
             </div>
         `;
     }
 
     async function render(container) {
         if (!container) return;
-        renderLoading(container);
+        if (!container.querySelector(".s3-dashboard")) {
+            renderLoading(container);
+        }
         const requestStart = performance.now();
         try {
             const [
                 overviewRaw,
                 deviceStatusRaw,
                 modulesResult,
-                commandsResult,
                 alarmsResult,
-                eventsResult,
                 ...targetResults
             ] = await Promise.allSettled([
                 fetchOverview(),
                 fetchDeviceStatus(),
                 fetchModulesStatus(),
-                fetchCommandHistory(),
                 fetchAlarmLogs(),
-                fetchSystemEvents(),
                 ...TARGET_DEVICE_IDS.map(deviceId => fetchOverview(deviceId)),
                 ...TARGET_DEVICE_IDS.map(deviceId => fetchDeviceStatus(deviceId))
             ]);
@@ -1268,15 +973,12 @@
             const data = normalizeOverview(
                 overviewRaw.value,
                 modulesResult.status === "fulfilled" ? modulesResult.value : [],
-                commandsResult.status === "fulfilled" ? commandsResult.value : [],
                 alarmsResult.status === "fulfilled" ? alarmsResult.value : [],
                 deviceStatusRaw.status === "fulfilled" ? deviceStatusRaw.value : null,
                 {
                     deviceStatusError: deviceStatusRaw.status === "rejected",
                     moduleError: modulesResult.status === "rejected",
-                    commandError: commandsResult.status === "rejected",
-                    alarmError: alarmsResult.status === "rejected",
-                    eventError: eventsResult.status === "rejected"
+                    alarmError: alarmsResult.status === "rejected"
                 },
                 targetOverviewResults
                     .filter(result => result.status === "fulfilled")
@@ -1284,7 +986,6 @@
                 targetDeviceStatusResults
                     .filter(result => result.status === "fulfilled")
                     .map(result => result.value),
-                eventsResult.status === "fulfilled" ? eventsResult.value : [],
                 {
                     api_ok: true,
                     api_latency_ms: performance.now() - requestStart,
@@ -1299,30 +1000,19 @@
                 page: "s3"
             });
             const summary = data.home_summary || buildHomeSummary(data.devices || []);
-            container.innerHTML = `
-                <div class="s3-dashboard">
-                    <div class="s3-page-header">
-                        <div>
-                            <h1>S3 系统总览</h1>
-                            <p>系统总览与全屋状态面板</p>
-                        </div>
-                        <span class="state-badge state-${getStatusClass(data.gateway.online)}">${getStatusText(data.gateway.online)}</span>
-                    </div>
-                    ${renderSystemHealthBar(data)}
-                    <div class="s3-overview-grid">
-                        ${renderSystemStatusRealtime(data)}
-                        ${renderHomeSummary(summary)}
-                    </div>
-                    ${renderDeviceOverview(data.devices || [])}
-                    ${renderActivity(data)}
-                    ${renderSystemEventsPanel(data)}
-                </div>
-            `;
-            applyRealtimeValueAnimation(container);
-            realtime().renderClock?.();
+            if (container.dataset.s3DashboardReady === "true") {
+                updateStableDashboard(container, data, summary);
+            } else {
+                renderReady(container, data, summary);
+            }
         } catch (error) {
             console.warn("[S3Dashboard] overview request failed", error.message);
-            renderError(container);
+            if (container.dataset.s3DashboardReady === "true") {
+                const message = container.querySelector(".s3-page-header p");
+                setStableText(message, UNAVAILABLE_TEXT);
+            } else {
+                renderError(container);
+            }
         }
     }
 

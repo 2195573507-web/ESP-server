@@ -124,15 +124,6 @@
         return data || null;
     }
 
-    async function fetchCommandHistory() {
-        const response = await fetch("/api/commands/history?limit=20", { cache: "no-store" });
-        if (!response.ok) {
-            throw new Error(`${response.status}`);
-        }
-        const data = unwrapEnvelope(await response.json());
-        return Array.isArray(data?.commands) ? data.commands : [];
-    }
-
     async function fetchAlarmLogs() {
         const response = await fetch("/api/emergency/events?limit=20", { cache: "no-store" });
         if (!response.ok) {
@@ -140,31 +131,6 @@
         }
         const data = unwrapEnvelope(await response.json());
         return Array.isArray(data?.events) ? data.events : [];
-    }
-
-    async function fetchListEndpoint(path, keys = []) {
-        const response = await fetch(path, { cache: "no-store" });
-        if (!response.ok) {
-            throw new Error(`${response.status}`);
-        }
-        const data = unwrapEnvelope(await response.json());
-        if (Array.isArray(data)) return data;
-        if (!isPlainObject(data)) return [];
-        for (const key of keys) {
-            if (Array.isArray(data[key])) return data[key];
-        }
-        return [];
-    }
-
-    async function fetchSystemEvents() {
-        const results = await Promise.allSettled([
-            fetchListEndpoint("/api/logs/v1/system?limit=20", ["logs", "system_logs", "events", "records"]),
-            fetchListEndpoint("/api/voice/v1/events?limit=20", ["events", "logs", "records"]),
-            fetchCommandHistory(),
-            fetchListEndpoint("/api/logs/v1/alarms?limit=20", ["alarms", "logs", "events"]),
-            fetchAlarmLogs()
-        ]);
-        return results.flatMap(result => result.status === "fulfilled" ? result.value : []);
     }
 
     function getStatusClass(status) {
@@ -238,138 +204,6 @@
         if (/pressure|气压/.test(text)) return "气压异常";
         if (/offline|disconnect|离线|设备/.test(text)) return "设备离线";
         return "报警";
-    }
-
-    function getCommandActionText(command, status) {
-        const text = String(command || "").toLowerCase();
-        const statusText = String(status || "").toLowerCase();
-        if (["failed", "error", "danger", "unavailable"].includes(statusText)) return "命令执行失败";
-        if (/turn_on|\.on|open|enable/.test(text)) return "已开启";
-        if (/turn_off|\.off|close|disable/.test(text)) return "已关闭";
-        if (/set_temperature/.test(text)) return "温度已调整";
-        if (["completed", "success", "resolved"].includes(statusText)) return "命令执行成功";
-        if (["queued", "pending", "dispatched", "received"].includes(statusText)) return "命令处理中";
-        return "命令记录已更新";
-    }
-
-    function getCommandTargetLabel(command, record, payload) {
-        const commandText = String(command || "").toLowerCase();
-        const targetText = String(record.target || record.device_name || payload.target || payload.device_name || "").trim();
-        if (targetText && !looksInternalText(targetText)) return targetText;
-        const match = applianceSlots.find(slot => commandText.includes(slot.key) || commandText.includes(slot.key.replace("_", "")));
-        return match?.label || "设备";
-    }
-
-    function humanizeCommandEvent(command, record, payload) {
-        const action = getCommandActionText(command, record.status || payload.status);
-        if (action === "命令执行成功" || action === "命令执行失败" || action === "命令处理中" || action === "命令记录已更新") {
-            return action;
-        }
-        return `${getCommandTargetLabel(command, record, payload)}${action}`;
-    }
-
-    function getRecordTime(record) {
-        if (!isPlainObject(record)) return null;
-        const payload = isPlainObject(record.payload) ? record.payload : {};
-        return parseTimestamp(
-            record.created_at ||
-            record.updated_at ||
-            record.timestamp ||
-            record.completed_at ||
-            record.time ||
-            payload.created_at ||
-            payload.timestamp
-        );
-    }
-
-    function normalizeSystemEvent(record) {
-        const item = isPlainObject(record) ? record : {};
-        const payload = isPlainObject(item.payload) ? item.payload : {};
-        const command = item.command || item.name || item.command_id || payload.command;
-        const eventType = item.event_type || item.type || payload.event_type || payload.type || "";
-        const message = item.message ||
-            item.content ||
-            item.text ||
-            item.local_action ||
-            payload.message ||
-            payload.summary ||
-            payload.description ||
-            payload.text ||
-            "";
-        const time = getRecordTime(item);
-        const combined = `${eventType} ${item.source || ""} ${item.module || ""} ${payload.source || ""} ${payload.module || ""} ${message}`.toLowerCase();
-        const deviceName = friendlyDeviceName(item.device_id || payload.device_id || "");
-        let event = null;
-        if (command) {
-            event = {
-                icon: "💡",
-                type: "设备控制",
-                description: humanizeCommandEvent(command, item, payload)
-            };
-        } else if (/voice|asr|语音/.test(combined) || item.asr_text || payload.asr_text) {
-            const speechText = cleanDisplayText(item.asr_text || payload.asr_text || message, "");
-            event = {
-                icon: "🎤",
-                type: "语音命令",
-                description: speechText ? `收到语音命令：${speechText}` : "收到语音命令"
-            };
-        } else if (/llm|ai|response|回复|分析/.test(combined) || item.response || payload.response) {
-            event = {
-                icon: "🤖",
-                type: "AI 分析",
-                description: "AI 已完成分析"
-            };
-        } else if (/alarm|warning|critical|报警/.test(combined)) {
-            event = {
-                icon: "⚠",
-                type: "报警",
-                description: humanizeAlarmType(eventType, message)
-            };
-        } else if (/wifi|sta_connected|network/.test(combined)) {
-            event = {
-                icon: "📶",
-                type: "网络状态",
-                description: "WiFi 已重新连接"
-            };
-        } else if (/mqtt|cloud|server_available/.test(combined)) {
-            event = {
-                icon: "☁",
-                type: "云端连接",
-                description: /disconnect|offline|failed|未连接|异常/.test(combined) ? "云端连接异常" : "云端连接恢复"
-            };
-        } else if (/gateway|dashboard_snapshot|网关/.test(combined)) {
-            event = {
-                icon: "📡",
-                type: "网关状态",
-                description: /disconnect|offline|failed|离线/.test(combined) ? "设备离线" : "网关重新连接"
-            };
-        } else if (/sensor|bme|temperature|humidity|pressure|air_quality|环境/.test(combined) || item.device_id || payload.device_id) {
-            event = {
-                icon: "🌡️",
-                type: "环境数据",
-                description: `${deviceName.replace(/\s+/g, "")}环境数据更新`
-            };
-        }
-        if (!event) return null;
-        return {
-            timestamp: time,
-            icon: event.icon,
-            type: event.type,
-            description: event.description,
-            detail: event.description
-        };
-    }
-
-    function normalizeSystemEvents(records) {
-        return (Array.isArray(records) ? records : [])
-            .map(normalizeSystemEvent)
-            .filter(event => event && (event.timestamp || event.description))
-            .sort((a, b) => {
-                const aTime = a.timestamp ? a.timestamp.getTime() : 0;
-                const bTime = b.timestamp ? b.timestamp.getTime() : 0;
-                return bTime - aTime;
-            })
-            .slice(0, 20);
     }
 
     function normalizeGateway(rawGateway, deviceStatus = null) {
@@ -613,7 +447,7 @@
         });
     }
 
-    function normalizeOverview(data, modules = [], alarms = [], deviceStatus = null, states = {}, relatedOverviews = [], deviceStatuses = [], systemEvents = [], requestMeta = {}) {
+    function normalizeOverview(data, modules = [], alarms = [], deviceStatus = null, states = {}, relatedOverviews = [], deviceStatuses = [], requestMeta = {}) {
         const overview = isPlainObject(data) ? data : {};
         const devices = applyDeviceStatuses(mergeOverviewDevices([overview, ...relatedOverviews]), deviceStatuses);
         const normalizedDeviceStatus = normalizeDeviceStatus(deviceStatus);
@@ -625,11 +459,9 @@
             devices,
             home_summary: buildHomeSummary(devices),
             recent_alarms: Array.isArray(alarms) ? alarms.map(normalizeAlarm) : [],
-            system_events: normalizeSystemEvents(systemEvents),
             device_status_error: Boolean(states.deviceStatusError),
             module_error: Boolean(states.moduleError),
             alarm_error: Boolean(states.alarmError),
-            event_error: Boolean(states.eventError),
             request_meta: requestMeta
         };
     }
@@ -960,21 +792,6 @@
         `;
     }
 
-    function renderSystemEventsPanel(data) {
-        const events = Array.isArray(data.system_events) ? data.system_events : [];
-        const timeline = realtime().EventTimeline
-            ? realtime().EventTimeline(events)
-            : '<div class="system-log empty">暂无系统事件。</div>';
-        return `
-            <article class="panel s3-events-panel" data-s3-panel="events">
-                <div class="panel-header">
-                    <h2>📝 最近系统事件</h2>
-                </div>
-                <div data-event-timeline>${timeline}</div>
-            </article>
-        `;
-    }
-
     function setStableText(element, value) {
         if (!element) return;
         const text = String(value ?? "");
@@ -1060,16 +877,6 @@
             alarmBody.dataset.signature = alarmRows;
         }
 
-        const events = Array.isArray(data.system_events) ? data.system_events : [];
-        const timeline = realtime().EventTimeline
-            ? realtime().EventTimeline(events)
-            : '<div class="system-log empty">暂无系统事件。</div>';
-        const timelineBody = root.querySelector("[data-event-timeline]");
-        if (timelineBody && timelineBody.dataset.signature !== timeline) {
-            timelineBody.innerHTML = timeline;
-            timelineBody.dataset.signature = timeline;
-        }
-
         return true;
     }
 
@@ -1086,7 +893,6 @@
                 ${renderDeviceOverview(data.devices || [])}
                 ${renderSmartHomeOverview(data)}
                 ${renderAlarmPanel(data)}
-                ${renderSystemEventsPanel(data)}
             </div>
         `;
         container.dataset.s3DashboardReady = "true";
@@ -1108,7 +914,6 @@
                 ${renderDeviceOverview(data.devices || [])}
                 ${renderSmartHomeOverview(data)}
                 ${renderAlarmPanel(data)}
-                ${renderSystemEventsPanel(data)}
             </div>
         `;
     }
@@ -1133,7 +938,6 @@
                 ${renderDeviceOverview(data.devices || [])}
                 ${renderSmartHomeOverview(data)}
                 ${renderAlarmPanel(data)}
-                ${renderSystemEventsPanel(data)}
             </div>
         `;
     }
@@ -1150,14 +954,12 @@
                 deviceStatusRaw,
                 modulesResult,
                 alarmsResult,
-                eventsResult,
                 ...targetResults
             ] = await Promise.allSettled([
                 fetchOverview(),
                 fetchDeviceStatus(),
                 fetchModulesStatus(),
                 fetchAlarmLogs(),
-                fetchSystemEvents(),
                 ...TARGET_DEVICE_IDS.map(deviceId => fetchOverview(deviceId)),
                 ...TARGET_DEVICE_IDS.map(deviceId => fetchDeviceStatus(deviceId))
             ]);
@@ -1176,8 +978,7 @@
                 {
                     deviceStatusError: deviceStatusRaw.status === "rejected",
                     moduleError: modulesResult.status === "rejected",
-                    alarmError: alarmsResult.status === "rejected",
-                    eventError: eventsResult.status === "rejected"
+                    alarmError: alarmsResult.status === "rejected"
                 },
                 targetOverviewResults
                     .filter(result => result.status === "fulfilled")
@@ -1185,7 +986,6 @@
                 targetDeviceStatusResults
                     .filter(result => result.status === "fulfilled")
                     .map(result => result.value),
-                eventsResult.status === "fulfilled" ? eventsResult.value : [],
                 {
                     api_ok: true,
                     api_latency_ms: performance.now() - requestStart,

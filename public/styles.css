@@ -1031,10 +1031,6 @@ svg {
     overflow-wrap: anywhere;
 }
 
-.s3-events-panel {
-    min-width: 0;
-}
-
 .event-timeline {
     display: grid;
     gap: 0;

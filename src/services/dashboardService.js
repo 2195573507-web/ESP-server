@@ -28,6 +28,17 @@ const DASHBOARD_HISTORY_MAX_LIMIT = 500;
 const DASHBOARD_SNAPSHOT_PAYLOAD_TYPE = "gateway.dashboard_snapshot";
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
 const CSI_STATES = new Set(["IDLE", "MOTION", "HOLD"]);
+const DASHBOARD_DEVICE_ID_ALIASES = Object.freeze({
+    S3: "sensair_s3_gateway_01",
+    s3: "sensair_s3_gateway_01",
+    C51: "sensair_shuttle_01",
+    c51: "sensair_shuttle_01",
+    C52: "sensair_shuttle_02",
+    c52: "sensair_shuttle_02",
+    sensair_s3_gateway_01: "sensair_s3_gateway_01",
+    sensair_shuttle_01: "sensair_shuttle_01",
+    sensair_shuttle_02: "sensair_shuttle_02"
+});
 
 let latestDashboardSnapshot = null;
 const latestCsiMotionByDevice = new Map();
@@ -46,7 +57,12 @@ function parseJsonObject(value, fallback = null) {
 }
 
 function normalizeDashboardDeviceId(value) {
-    return trimText(value, 128);
+    const deviceId = trimText(value, 128);
+    if (!deviceId) {
+        return "";
+    }
+
+    return DASHBOARD_DEVICE_ID_ALIASES[deviceId] || deviceId;
 }
 
 function readDashboardLimit(value) {

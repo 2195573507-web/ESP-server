@@ -222,6 +222,25 @@ const TABLE_POLICIES = [
         updatedColumn: "updated_at"
     },
     {
+        table: "dashboard_snapshots",
+        scope: "device_history",
+        displayName: "Dashboard 快照",
+        description: "dashboard_snapshots S3 网关快照历史",
+        dangerLevel: "medium",
+        dateColumn: "server_recv_ms",
+        updatedColumn: "updated_at"
+    },
+    {
+        table: "event_logs",
+        scope: "device_history",
+        displayName: "事件日志",
+        description: "event_logs 设备、语音、命令、告警和系统事件",
+        dangerLevel: "medium",
+        dateColumn: "server_recv_ms",
+        fallbackDateColumn: "created_at",
+        updatedColumn: "updated_at"
+    },
+    {
         table: "csi_behavior_events",
         scope: "device_history",
         displayName: "CSI 行为事件",

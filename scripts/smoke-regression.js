@@ -45,6 +45,14 @@ const {
 
 const SERVER_START_TIMEOUT_MS = 15000;
 const SERVER_STOP_TIMEOUT_MS = 5000;
+const SMOKE_GATEWAY_ID = "sensair_s3_gateway_01";
+const VERIFY_GATEWAY_ID = "verify-s3";
+const SMOKE_GATEWAY_HEADERS = {
+    "X-Gateway-Id": SMOKE_GATEWAY_ID
+};
+const VERIFY_GATEWAY_HEADERS = {
+    "X-Gateway-Id": VERIFY_GATEWAY_ID
+};
 const USER_DATA_DELETE_TOKEN = "smoke-user-data-token";
 const USER_DATA_HEADERS = {
     "X-Admin-Token": USER_DATA_DELETE_TOKEN
@@ -237,9 +245,13 @@ async function request(baseUrl, method, pathname, body, headers = {}) {
         headers: body
             ? {
                 "Content-Type": "application/json",
+                ...SMOKE_GATEWAY_HEADERS,
                 ...headers
             }
-            : headers,
+            : {
+                ...SMOKE_GATEWAY_HEADERS,
+                ...headers
+            },
         body: body ? JSON.stringify(body) : undefined
     });
     const contentType = response.headers.get("content-type") || "";
@@ -259,7 +271,10 @@ async function request(baseUrl, method, pathname, body, headers = {}) {
 async function requestRaw(baseUrl, method, pathname, body, headers = {}) {
     const response = await fetch(`${baseUrl}${pathname}`, {
         method,
-        headers,
+        headers: {
+            ...SMOKE_GATEWAY_HEADERS,
+            ...headers
+        },
         body
     });
     const contentType = response.headers.get("content-type") || "";
@@ -510,7 +525,11 @@ async function assertUniqueIndexes(dbPath) {
         ["emergency_events", ["event_id"]],
         ["csi_behavior_events", ["event_id"]],
         ["lcd_status", ["device_id"]],
-        ["data_deletion_runs", ["run_id"]]
+        ["data_deletion_runs", ["run_id"]],
+        ["event_logs", ["event_id"]],
+        ["smart_home_devices", ["device_id"]],
+        ["smart_home_commands", ["command_id"]],
+        ["natural_language_commands", ["command_id"]]
     ];
 
     for (const [tableName, columns] of expectations) {
@@ -739,6 +758,7 @@ async function run() {
     const tempDir = makeTempDir();
     const dbPath = path.join(tempDir, "nested", "smoke.sqlite");
     const promptCacheDir = path.join(tempDir, "voice_prompts");
+    const promptConfigPath = path.join(tempDir, "voice_prompts", "wake_prompt_config.json");
     const port = String(44000 + Math.floor(Math.random() * 1000));
     const baseUrl = `http://127.0.0.1:${port}`;
     const mockLlm = await startMockLlmServer();
@@ -753,10 +773,13 @@ async function run() {
             VOICE_TURN_MOCK: "1",
             VOICE_TURN_MAX_BYTES: "4096",
             VOICE_PROMPT_CACHE_DIR: promptCacheDir,
+            VOICE_PROMPT_CONFIG_PATH: promptConfigPath,
             LLM_API_KEY: "smoke-llm-key",
             LLM_BASE_URL: mockLlm.baseUrl,
             LLM_CHAT_PATH: "/v1/chat/completions",
             USER_DATA_DELETE_TOKEN,
+            GATEWAY_AUTH_TOKEN: "",
+            GATEWAY_AUTH_TOKENS: "",
             VOLC_GATEWAY_API_KEY: ""
         },
         stdio: ["ignore", "pipe", "pipe"]
@@ -863,7 +886,7 @@ async function run() {
             }
         });
         assert.equal(result.response.status, 200);
-        assert.equal(result.body.status, "completed");
+        assert.equal(result.body.status, "succeeded");
 
         result = await request(baseUrl, "POST", "/api/llm/structured", {
             text: "目标为空白时回退到请求设备",
@@ -887,7 +910,7 @@ async function run() {
             }
         });
         assert.equal(result.response.status, 200);
-        assert.equal(result.body.status, "completed");
+        assert.equal(result.body.status, "succeeded");
 
         result = await request(baseUrl, "POST", "/api/llm/structured", {
             text: "目标设备过长时拒绝结构化命令",
@@ -945,7 +968,7 @@ async function run() {
             }
         });
         assert.equal(result.response.status, 200);
-        assert.equal(result.body.status, "completed");
+        assert.equal(result.body.status, "succeeded");
 
         result = await request(baseUrl, "POST", "/api/llm/text", {
             text: "   "
@@ -1119,7 +1142,7 @@ async function run() {
             }
         });
         assert.equal(result.response.status, 200);
-        assert.equal(result.body.status, "completed");
+        assert.equal(result.body.status, "succeeded");
 
         result = await request(baseUrl, "POST", `/api/commands/${commandId}/ack`, {
             status: "completed",
@@ -1128,9 +1151,10 @@ async function run() {
                 duplicate: true
             }
         });
-        assert.equal(result.response.status, 404);
-        assert.equal(result.body.ok, false);
-        assert.equal(result.body.code, "COMMAND_ACK_NOT_ACCEPTED");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.idempotent, true);
+        assert.equal(result.body.status, "succeeded");
         assert.equal(result.body.command_id, commandId);
 
         result = await request(baseUrl, "POST", "/api/conversation/turns", {
@@ -2427,109 +2451,131 @@ async function run() {
         assert.equal(result.response.status, 200);
         assertDashboardEnvelope(result.body, true);
         assert.equal(result.body.data.devices.length, 1);
-        assert.equal(result.body.data.devices[0].occupancy.state, "unknown");
-        assert.equal(result.body.data.devices[0].occupancy.available, false);
-        assert.equal(result.body.data.devices[0].occupancy.motion_score, null);
+        assert.equal(result.body.data.devices[0].csi.state, "IDLE");
+        assert.equal(result.body.data.devices[0].csi.available, false);
+        assert.equal(result.body.data.csi.available, false);
 
         const csiUpdatedAt = Date.now() - 5;
-        const csiMotionEnvelope = {
-            schema_version: 1,
-            device_id: bmeDeviceId,
-            device_type: "esp32c5_env_voice_node",
-            firmware_version: "0.1.0-smoke",
-            request_seq: 201,
-            esp_uptime_ms: 988001,
-            payload_type: "csi.motion",
-            room_id: "living_room",
-            payload: {
-                occupancy: {
-                    state: "occupied"
-                },
-                motion_score: 0.73,
-                variance: 0.0182,
-                rssi: -58,
-                sample_count: 96,
-                updated_at: csiUpdatedAt
-            }
+        const canonicalCsiEvent = {
+            schema_version: "v2",
+            trace_id: "s3-csi-smoke-201",
+            tick_id: 201,
+            fused_state: "MOTION",
+            confidence: 0.73,
+            links: ["link_0"],
+            timestamp_ms: csiUpdatedAt
         };
-        result = await request(baseUrl, "POST", "/api/device/v1/ingest", csiMotionEnvelope);
+        result = await request(baseUrl, "POST", "/kernel/csi_event", canonicalCsiEvent);
         assert.equal(result.response.status, 202);
         assert.equal(result.body.ok, true);
-        assert.equal(result.body.data.device_id, bmeDeviceId);
+        assert.equal(result.body.data.device_id, "sensair_s3_gateway_01");
         assert.equal(result.body.data.payload_type, "csi.motion");
-        assert.equal(result.body.data.occupancy.state, "occupied");
+        assert.equal(result.body.data.link_id, "fused");
+        assert.equal(result.body.data.state, "MOTION");
+        assert.equal(result.body.data.frame_energy, null);
+        assert.equal(result.body.data.variance, null);
         assert.equal(result.body.data.motion_score, 0.73);
-        assert.equal(result.body.data.sample_count, 96);
 
-        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
-            ...csiMotionEnvelope,
-            device_id: "esp32-c5-csi-002",
-            request_seq: 202,
-            room_id: "bedroom",
-            payload: {
-                ...csiMotionEnvelope.payload,
-                occupancy: {
-                    state: "vacant"
-                },
-                motion_score: 0.11,
-                variance: 0.0021,
-                rssi: -62,
-                sample_count: 64,
-                updated_at: csiUpdatedAt + 1
-            }
+        result = await request(baseUrl, "POST", "/kernel/csi_event", {
+            ...canonicalCsiEvent,
+            trace_id: "s3-csi-smoke-202",
+            tick_id: 202,
+            fused_state: "HOLD",
+            confidence: 0.11,
+            links: ["link_0"],
+            timestamp_ms: csiUpdatedAt + 1
         });
         assert.equal(result.response.status, 202);
         assert.equal(result.body.ok, true);
-        assert.equal(result.body.data.device_id, "esp32-c5-csi-002");
-        assert.equal(result.body.data.occupancy.state, "vacant");
+        assert.equal(result.body.data.device_id, "sensair_s3_gateway_01");
+        assert.equal(result.body.data.state, "HOLD");
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
+            schema_version: 1,
+            device_id: "sensair_s3_gateway_01",
+            payload_type: "csi.motion",
+            payload: {
+                link_id: "fused",
+                state: "MOTION",
+                frame_energy: 12.75,
+                variance: 0.0182,
+                rssi: -58,
+                motion_score: 0.73,
+                timestamp: csiUpdatedAt
+            }
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.error.code, "UNSUPPORTED_PAYLOAD_TYPE");
 
         sensorRows = await dbAll(dbPath, "SELECT * FROM sensor_records WHERE payload_type='csi.motion'");
         assert.equal(sensorRows.length, 0);
 
+        let csiRows = await dbAll(dbPath, "SELECT * FROM csi_motion_events ORDER BY timestamp ASC, id ASC");
+        assert.equal(csiRows.length, 2);
+        assert.equal(csiRows[0].state, "MOTION");
+        assert.equal(csiRows[0].link_id, "fused");
+        assert.equal(csiRows[0].frame_energy, null);
+        assert.equal(csiRows[1].state, "HOLD");
+        assert.ok(csiRows[0].raw_json.includes("\"schema_version\":\"v2\""));
+
         result = await request(baseUrl, "GET", `/api/device/v1/modules/status?${new URLSearchParams({
-            device_id: bmeDeviceId
+            device_id: "sensair_s3_gateway_01"
         }).toString()}`);
         const csiModule = result.body.modules.find(module => module.module_type === "csi.motion");
         assert.ok(csiModule);
         assert.equal(csiModule.online, true);
 
         result = await request(baseUrl, "GET", `/api/device/v1/context?${new URLSearchParams({
-            device_id: bmeDeviceId
+            device_id: "sensair_s3_gateway_01"
         }).toString()}`);
         assert.equal(result.response.status, 200);
         assert.equal(result.body.context.modules["csi.motion"].available, true);
 
-        result = await request(baseUrl, "GET", `/api/dashboard/v1/overview?${new URLSearchParams({
-            device_id: bmeDeviceId
-        }).toString()}`);
-        assert.equal(result.response.status, 200);
-        assertDashboardEnvelope(result.body, true);
-        assert.equal(result.body.data.devices.length, 1);
-        assert.equal(result.body.data.devices[0].occupancy.state, "occupied");
-        assert.equal(result.body.data.devices[0].occupancy.available, true);
-        assert.equal(result.body.data.devices[0].occupancy.motion_score, 0.73);
-
         result = await request(baseUrl, "GET", "/api/dashboard/v1/overview");
         assert.equal(result.response.status, 200);
         assertDashboardEnvelope(result.body, true);
-        const csiOne = result.body.data.devices.find(device => device.device_id === bmeDeviceId);
-        const csiTwo = result.body.data.devices.find(device => device.device_id === "esp32-c5-csi-002");
-        assert.equal(csiOne.occupancy.state, "occupied");
-        assert.equal(csiTwo.occupancy.state, "vacant");
+        assert.equal(result.body.data.csi.state, "HOLD");
+        assert.equal(result.body.data.csi.available, true);
+        assert.equal(result.body.data.csi.motion_score, 0.11);
+        assert.equal(result.body.data.csi.frame_energy, null);
 
-        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
-            ...csiMotionEnvelope,
-            request_seq: 203,
-            payload: {
-                ...csiMotionEnvelope.payload,
-                occupancy: {
-                    state: "moving"
-                }
-            }
+        result = await request(baseUrl, "GET", "/api/dashboard/v1/csi/history?limit=5");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body, true);
+        assert.equal(result.body.data.events.length, 2);
+        assert.equal(result.body.data.events[0].state, "MOTION");
+        assert.equal(result.body.data.events[1].state, "HOLD");
+        assert.equal(result.body.data.events[1].motion_score, 0.11);
+
+        result = await request(baseUrl, "POST", "/kernel/csi_event", {
+            ...canonicalCsiEvent,
+            trace_id: "s3-csi-smoke-device-specific",
+            tick_id: 203,
+            device_id: "C51"
         });
         assert.equal(result.response.status, 400);
         assert.equal(result.body.ok, false);
-        assert.equal(result.body.error.code, "INVALID_CSI_OCCUPANCY_STATE");
+        assert.equal(result.body.error.code, "INVALID_CANONICAL_CSI_EVENT");
+
+        result = await request(baseUrl, "POST", "/kernel/csi_event", {
+            ...canonicalCsiEvent,
+            trace_id: "s3-csi-smoke-raw",
+            tick_id: 204,
+            links: ["C51"]
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.error.code, "INVALID_CSI_LINK");
+
+        result = await request(baseUrl, "POST", "/kernel/csi_event", {
+            ...canonicalCsiEvent,
+            trace_id: "s3-csi-smoke-state",
+            tick_id: 205,
+            fused_state: "occupied"
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.error.code, "INVALID_FUSED_STATE");
 
         result = await request(baseUrl, "GET", `/api/device/v1/sensors/latest?${new URLSearchParams({
             device_id: bmeDeviceId
@@ -2733,15 +2779,6 @@ async function run() {
                     air_quality_level: "moderate",
                     air_quality_source: "s3_mapped"
                 },
-                occupancy: {
-                    state: "vacant",
-                    available: true,
-                    motion_score: 0.21,
-                    variance: 0.004,
-                    rssi: -61,
-                    sample_count: 48,
-                    updated_at: Date.now() + 1000
-                },
                 appliances: {
                     air_conditioner: {
                         power: false,
@@ -2793,6 +2830,11 @@ async function run() {
         assert.equal(result.body.data.payload_type, "gateway.dashboard_snapshot");
         assert.equal(result.body.data.gateway_id, "sensair_s3_gateway_01");
         assert.equal(result.body.data.device_count, 1);
+        const persistedSnapshotRows = await dbAll(dbPath, "SELECT payload_json FROM dashboard_snapshots WHERE snapshot_id=? LIMIT 1", [result.body.data.snapshot_id]);
+        assert.equal(persistedSnapshotRows.length, 1);
+        const persistedSnapshot = JSON.parse(persistedSnapshotRows[0].payload_json);
+        assert.equal(persistedSnapshot.mock_persistence, "stripped");
+        assert.deepEqual(persistedSnapshot.devices[0].appliances, {});
 
         const dashboardEndpoints = [
             `/api/dashboard/v1/overview?${dashboardDeviceQuery}`,
@@ -2801,6 +2843,7 @@ async function run() {
             `/api/dashboard/v1/devices/${encodeURIComponent(bmeDeviceId)}/history?limit=5`,
             "/api/dashboard/v1/asr/latest",
             "/api/dashboard/v1/llm/latest",
+            "/api/dashboard/v1/csi/history?limit=5",
             "/api/dashboard/v1/time/status",
             `/api/dashboard/v1/device/status?${dashboardDeviceQuery}`,
             `/api/dashboard/v1/modules/status?${dashboardDeviceQuery}`
@@ -2860,9 +2903,10 @@ async function run() {
         assert.equal(result.body.data.devices[0].device_id, bmeDeviceId);
         assert.equal(result.body.data.devices[0].sensors.gas_resistance, 35164);
         assert.equal(result.body.data.devices[0].sensors.air_quality_score, 72);
-        assert.equal(result.body.data.devices[0].occupancy.state, "vacant");
-        assert.equal(result.body.data.devices[0].occupancy.available, true);
-        assert.equal(result.body.data.devices[0].occupancy.motion_score, 0.21);
+        assert.equal(result.body.data.csi.state, "HOLD");
+        assert.equal(result.body.data.csi.available, true);
+        assert.equal(result.body.data.csi.motion_score, 0.11);
+        assert.equal(result.body.data.csi.frame_energy, null);
         assert.equal(result.body.data.devices[0].appliances.air_conditioner.source, "mock");
         assert.equal(result.body.data.devices[0].appliances.fan.mock, true);
         assert.equal(result.body.data.home_summary.online_device_count, 1);
@@ -2908,7 +2952,8 @@ async function run() {
         assert.equal(result.response.status, 200);
         assert.equal(result.body.ok, true);
         assert.equal(hasOwn(result.body, "status"), true);
-        assert.equal(hasOwn(result.body, "data"), false);
+        assertDashboardEnvelope(result.body, true);
+        assert.ok(Array.isArray(result.body.data.devices));
 
         result = await request(baseUrl, "GET", "/api/not-found-for-smoke");
         assert.equal(result.response.status, 404);
@@ -2926,6 +2971,179 @@ async function run() {
         assert.ok(Buffer.isBuffer(result.body));
         assert.ok(result.body.length > 0);
 
+        result = await request(baseUrl, "GET", "/api/smart-home/v1/status");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.configured, false);
+        assert.equal(result.body.data.available, false);
+        assert.equal(result.body.data.provider, "none");
+        assert.deepEqual(result.body.data.devices, []);
+
+        result = await request(baseUrl, "POST", "/api/logs/v1/system", {
+            level: "info",
+            source: "server",
+            message: "manual system log test",
+            payload: {
+                from: "smoke"
+            }
+        });
+        assert.equal(result.response.status, 201);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.log.message, "manual system log test");
+
+        result = await request(baseUrl, "GET", "/api/logs/v1/system?limit=10");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.ok(result.body.data.logs.some(log => log.message === "manual system log test"));
+
+        result = await request(baseUrl, "POST", "/api/logs/v1/alarms", {
+            level: "warning",
+            source: "device",
+            device_id: "verify-c5",
+            room_id: "bedroom",
+            room_name: "卧室",
+            title: "测试报警",
+            message: "curl alarm test",
+            payload: {
+                from: "smoke"
+            }
+        });
+        assert.equal(result.response.status, 201);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.alarm.title, "测试报警");
+        assert.equal(result.body.data.alarm.acknowledged, false);
+
+        result = await request(baseUrl, "GET", "/api/logs/v1/alarms?limit=10");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.ok(result.body.data.alarms.some(alarm => alarm.message === "curl alarm test"));
+
+        result = await request(baseUrl, "POST", "/api/smart-home/v1/state", {
+            provider: "s3_gateway",
+            gateway_id: "verify-s3",
+            devices: [{
+                id: "ac_living_room",
+                type: "air_conditioner",
+                name: "客厅空调",
+                room_id: "living_room",
+                room_name: "客厅",
+                online: true,
+                state: {
+                    power: "off",
+                    temperature: 26
+                }
+            }]
+        }, VERIFY_GATEWAY_HEADERS);
+        assert.equal(result.response.status, 202);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.provider, "s3_gateway");
+        assert.equal(result.body.data.devices.length, 1);
+
+        result = await request(baseUrl, "GET", "/api/smart-home/v1/status");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.configured, true);
+        assert.equal(result.body.data.available, true);
+        assert.equal(result.body.data.provider, "s3_gateway");
+        assert.equal(result.body.data.devices[0].id, "ac_living_room");
+        assert.equal(result.body.data.devices[0].state.power, "off");
+
+        result = await request(baseUrl, "POST", "/api/smart-home/v1/control", {
+            target_id: "ac_living_room",
+            room_id: "living_room",
+            room_name: "客厅",
+            action: "set_power",
+            params: {
+                power: "on"
+            },
+            source: "dashboard",
+            requested_by: "user"
+        });
+        assert.equal(result.response.status, 202);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.command.status, "queued");
+        assert.match(result.body.data.message, /waiting for gateway pull/);
+        const smartHomeCommandId = result.body.data.command.command_id;
+
+        result = await request(baseUrl, "GET", "/api/smart-home/v1/commands?limit=10");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.ok(result.body.data.commands.some(command => command.command_id === smartHomeCommandId));
+
+        result = await request(baseUrl, "GET", "/api/smart-home/v1/commands/pending?gateway_id=verify-s3&limit=10", null, VERIFY_GATEWAY_HEADERS);
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.commands.length, 1);
+        assert.equal(result.body.data.commands[0].command_id, smartHomeCommandId);
+        assert.equal(result.body.data.commands[0].status, "dispatched");
+
+        result = await request(baseUrl, "POST", `/api/smart-home/v1/commands/${smartHomeCommandId}/ack`, {
+            status: "succeeded",
+            result: {
+                applied: true
+            },
+            executed_at_ms: Date.now()
+        }, VERIFY_GATEWAY_HEADERS);
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.command.status, "succeeded");
+
+        result = await request(baseUrl, "POST", "/api/commands/v1/natural-language", {
+            text: "把客厅空调打开到 26 度",
+            source: "dashboard",
+            room_id: "living_room",
+            device_id: "verify-s3"
+        });
+        assert.equal(result.response.status, 202);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.command.type, "natural_language");
+        assert.equal(result.body.data.command.status, "queued");
+        assert.equal(result.body.data.command.parsed_intent, null);
+        const naturalLanguageCommandId = result.body.data.command.command_id;
+
+        result = await request(baseUrl, "GET", "/api/commands/v1/recent?limit=10");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.ok(result.body.data.commands.some(command => command.command_id === naturalLanguageCommandId));
+
+        result = await request(baseUrl, "POST", "/api/logs/v1/cleanup", {
+            types: ["system", "alarm", "command"],
+            older_than_ms: 604800000,
+            dry_run: true
+        });
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.dry_run, true);
+        assert.equal(typeof result.body.data.deleted.system, "number");
+
+        result = await request(baseUrl, "GET", "/api/voice/prompt/config");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.config.wake_prompt_text, "我在，你说");
+        assert.equal(result.body.config.sample_rate, 16000);
+        assert.equal(result.body.config.format, "s16le");
+        assert.equal(result.body.config.channels, 1);
+        assert.ok(result.body.config.voice_config_hash);
+        const initialPromptHash = result.body.config.voice_config_hash;
+
+        result = await request(baseUrl, "PUT", "/api/voice/prompt/config", {
+            wake_prompt_text: "你好，我在",
+            voice_id: "smoke_voice_v2",
+            speed: 1.05,
+            pitch: 1,
+            volume: 1,
+            sample_rate: 16000,
+            format: "s16le",
+            channels: 1
+        });
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.config.wake_prompt_text, "你好，我在");
+        assert.equal(result.body.config.voice_id, "smoke_voice_v2");
+        assert.notEqual(result.body.config.voice_config_hash, initialPromptHash);
+        const updatedPromptHash = result.body.config.voice_config_hash;
+        const updatedPromptVersion = result.body.config.prompt_version;
+
         const promptPath = `/api/voice/prompt-cache?${new URLSearchParams({
             prompt_key: "smoke_wake",
             device_id: deviceId
@@ -2933,6 +3151,10 @@ async function run() {
         result = await request(baseUrl, "GET", promptPath);
         assert.equal(result.response.status, 200);
         assert.equal(result.response.headers.get("x-audio-format"), "pcm_s16le_mono_16k");
+        assert.equal(result.response.headers.get("x-audio-sample-rate"), "16000");
+        assert.equal(result.response.headers.get("x-audio-channels"), "1");
+        assert.equal(result.response.headers.get("x-voice-config-hash"), updatedPromptHash);
+        assert.equal(result.response.headers.get("x-audio-version"), updatedPromptVersion);
         assert.equal(result.response.headers.get("x-prompt-cache"), "miss");
         assert.equal(result.body.length, 32000);
         const promptCacheFiles = fs.readdirSync(promptCacheDir).filter(file => file.includes("smoke_wake"));
@@ -2942,6 +3164,7 @@ async function run() {
         result = await request(baseUrl, "GET", promptPath);
         assert.equal(result.response.status, 200);
         assert.equal(result.response.headers.get("x-prompt-cache"), "hit");
+        assert.equal(result.response.headers.get("x-voice-config-hash"), updatedPromptHash);
         assert.equal(result.body.length, 32000);
 
         result = await request(baseUrl, "GET", `/api/voice/prompt?${new URLSearchParams({
@@ -2963,6 +3186,7 @@ async function run() {
                 ESP_SERVER_DB_PATH: staleDbPath,
                 VOICE_TURN_MOCK: "0",
                 VOICE_PROMPT_CACHE_DIR: promptCacheDir,
+                VOICE_PROMPT_CONFIG_PATH: promptConfigPath,
                 VOLC_GATEWAY_API_KEY: "",
                 LLM_API_KEY: "smoke-llm-key",
                 LLM_BASE_URL: mockLlm.baseUrl,

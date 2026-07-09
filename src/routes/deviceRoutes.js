@@ -8,10 +8,12 @@ const {
 } = require("../services/deviceContextService");
 const {
     readDeviceStatus,
+    readDeviceStatuses,
+    markTimedOutDevices,
     readModuleStatuses
 } = require("../services/deviceStatusService");
 const {
-    ingestCsiMotion
+    ingestCanonicalCsiEventV2
 } = require("../services/csiMotionService");
 const {
     ingestBme690
@@ -19,6 +21,15 @@ const {
 const {
     ingestDashboardSnapshot
 } = require("../services/dashboardService");
+const {
+    bindDeviceToGateway,
+    requireBoundDevice,
+    requireGatewayAuth
+} = require("../services/gatewayAuthService");
+const {
+    apiEnvelope,
+    apiError
+} = require("../utils/apiEnvelope");
 
 function parseJsonObject(value, fallback = {}) {
     if (!value) {
@@ -92,27 +103,43 @@ function createDeviceRouter(options) {
     const dbRun = options.dbRun;
     const dbAll = options.dbAll;
     const logger = options.logger || console;
+    const gatewayContext = {
+        dbRun,
+        dbAll
+    };
+    const gatewayOnly = requireGatewayAuth(gatewayContext);
 
-    router.post("/api/device/v1/ingest", async (req, res) => {
+    router.post("/api/device/v1/ingest", gatewayOnly, async (req, res) => {
         const serverRecvMs = Date.now();
         const payloadType = trimText(req.body?.payload_type, 80);
-        if (payloadType !== "sensor.bme690" && payloadType !== "csi.motion") {
+        if (payloadType !== "sensor.bme690") {
             return res.status(400).json(makeDeviceEnvelope({
                 ok: false,
                 serverRecvMs,
                 error: {
                     code: "UNSUPPORTED_PAYLOAD_TYPE",
-                    message: "payload_type must be sensor.bme690 or csi.motion"
+                    message: "payload_type must be sensor.bme690; CSI uses /kernel/csi_event"
                 }
             }));
         }
 
+        const boundDevice = await requireBoundDevice(req, res, gatewayContext, {
+            source: payloadType,
+            deviceId: req.body?.device_id,
+            allowNewBinding: true,
+            serverRecvMs
+        });
+        if (!boundDevice.ok) {
+            return boundDevice.response;
+        }
+
         try {
-            const ingest = payloadType === "csi.motion" ? ingestCsiMotion : ingestBme690;
-            const result = await ingest(dbRun, dbAll, req.body, {
+            const result = await ingestBme690(dbRun, dbAll, req.body, {
                 headers: req.headers,
                 query: req.query,
-                serverRecvMs
+                serverRecvMs,
+                trustedGatewayId: boundDevice.gateway_id,
+                trustedDeviceId: boundDevice.device_id
             });
             if (!result.ok) {
                 return res.status(result.status || 400).json(makeDeviceEnvelope({
@@ -132,7 +159,14 @@ function createDeviceRouter(options) {
             return res.status(result.status).json(makeDeviceEnvelope({
                 ok: true,
                 serverRecvMs,
-                data: result.data
+                data: {
+                    ...result.data,
+                    ...(result.metadata?.clock_skew_warning ? {
+                        warnings: {
+                            clock_skew: result.metadata.clock_skew_warning
+                        }
+                    } : {})
+                }
             }));
         } catch (error) {
             logger.error(`[device-v1] ingest failed ${error?.message || error}`);
@@ -147,12 +181,73 @@ function createDeviceRouter(options) {
         }
     });
 
-    router.post("/api/device/v1/gateway-state", async (req, res) => {
+    router.post("/kernel/csi_event", gatewayOnly, async (req, res) => {
         const serverRecvMs = Date.now();
+        const gatewayId = req.gatewayAuth?.gateway_id || "";
+        const boundGateway = await requireBoundDevice(req, res, gatewayContext, {
+            source: "kernel.csi_event",
+            deviceId: gatewayId,
+            allowNewBinding: true,
+            serverRecvMs
+        });
+        if (!boundGateway.ok) {
+            return boundGateway.response;
+        }
+
+        try {
+            const result = await ingestCanonicalCsiEventV2(dbRun, dbAll, req.body, {
+                headers: req.headers,
+                query: req.query,
+                serverRecvMs,
+                trustedGatewayId: boundGateway.gateway_id
+            });
+            if (!result.ok) {
+                logger.warn(
+                    `[kernel-csi] dropped invalid canonical event code=${result.code || "INVALID_PAYLOAD"} gateway_id=${boundGateway.gateway_id}`
+                );
+                return res.status(result.status || 400).json(makeDeviceEnvelope({
+                    ok: false,
+                    serverRecvMs,
+                    error: {
+                        code: result.code || "INVALID_PAYLOAD",
+                        message: result.error || "invalid canonical csi event"
+                    }
+                }));
+            }
+
+            logger.log(
+                `[kernel-csi] accepted trace_id=${result.data.trace_id} tick_id=${result.data.tick_id} state=${result.data.state} gateway_id=${boundGateway.gateway_id}`
+            );
+
+            return res.status(result.status).json(makeDeviceEnvelope({
+                ok: true,
+                serverRecvMs,
+                data: result.data
+            }));
+        } catch (error) {
+            logger.error(`[kernel-csi] ingest failed ${error?.message || error}`);
+            return res.status(500).json(makeDeviceEnvelope({
+                ok: false,
+                serverRecvMs,
+                error: {
+                    code: "CANONICAL_CSI_EVENT_FAILED",
+                    message: "canonical csi event ingest failed"
+                }
+            }));
+        }
+    });
+
+    router.post("/api/device/v1/gateway-state", gatewayOnly, async (req, res) => {
+        const serverRecvMs = Date.now();
+        const gatewayId = req.gatewayAuth?.gateway_id || "";
 
         try {
             const result = await ingestDashboardSnapshot(req.body, {
-                serverRecvMs
+                dbRun,
+                dbAll,
+                headers: req.headers,
+                serverRecvMs,
+                trustedGatewayId: gatewayId
             });
             if (!result.ok) {
                 return res.status(result.status || 400).json(makeDeviceEnvelope({
@@ -168,6 +263,9 @@ function createDeviceRouter(options) {
             logger.log(
                 `[device-v1] gateway-state gateway_id=${result.data.gateway_id || "-"} devices=${result.data.device_count}`
             );
+            for (const deviceId of result.data.bound_device_ids || []) {
+                await bindDeviceToGateway(dbRun, gatewayId, deviceId, "gateway_state", serverRecvMs, dbAll);
+            }
 
             return res.status(result.status).json(makeDeviceEnvelope({
                 ok: true,
@@ -187,14 +285,43 @@ function createDeviceRouter(options) {
         }
     });
 
-    router.get("/api/device/v1/status", async (req, res) => {
-        const deviceId = trimText(req.query.device_id, 128);
-        const status = await readDeviceStatus(dbAll, deviceId);
+    async function sendDeviceStatus(req, res, forcedDeviceId = "") {
+        const nowMs = Date.now();
+        await markTimedOutDevices(dbRun, dbAll, nowMs);
+        const deviceId = trimText(forcedDeviceId || req.query.device_id, 128);
+        const devices = await readDeviceStatuses(dbAll, {
+            device_id: deviceId
+        }, nowMs);
+        const status = deviceId
+            ? (await readDeviceStatus(dbAll, deviceId, nowMs))
+            : (devices[0] ? await readDeviceStatus(dbAll, devices[0].device_id, nowMs) : null);
+
         return res.json({
-            ok: true,
-            status,
-            server_time_ms: Date.now()
+            ...apiEnvelope({
+                devices
+            }, {
+                serverTimeMs: nowMs
+            }),
+            status
         });
+    }
+
+    router.get("/api/device/v1/status", async (req, res) => {
+        try {
+            return await sendDeviceStatus(req, res);
+        } catch (error) {
+            logger.error(`[device-v1] status failed ${error?.message || error}`);
+            return res.status(500).json(apiError("DEVICE_STATUS_READ_FAILED", "device status read failed"));
+        }
+    });
+
+    router.get("/api/device/v1/status/:device_id", async (req, res) => {
+        try {
+            return await sendDeviceStatus(req, res, req.params.device_id);
+        } catch (error) {
+            logger.error(`[device-v1] status device failed ${error?.message || error}`);
+            return res.status(500).json(apiError("DEVICE_STATUS_READ_FAILED", "device status read failed"));
+        }
     });
 
     router.get("/api/device/v1/modules/status", async (req, res) => {

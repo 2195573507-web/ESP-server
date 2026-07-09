@@ -103,13 +103,22 @@ function writePromptCache(promptKey, text, pcm, extra = {}) {
         file_path: path.relative(path.join(__dirname, "..", ".."), paths.pcmPath),
         content_type: PROMPT_CACHE_CONTENT_TYPE,
         byte_length: pcm.length,
-        version: `${paths.promptKey}:v1`,
+        version: extra.prompt_version || `${paths.promptKey}:v1`,
+        prompt_version: extra.prompt_version || `${paths.promptKey}:v1`,
+        voice_config_hash: extra.voice_config_hash || "",
         checksum,
         created_at: extra.created_at || now,
         updated_at: now,
         enabled: true,
-        tts_provider: extra.tts_provider || "",
-        tts_voice: extra.tts_voice || ""
+        provider: extra.provider || extra.tts_provider || "",
+        voice_id: extra.voice_id || extra.tts_voice || "",
+        speaker_id: extra.speaker_id || "",
+        speed: Number.isFinite(extra.speed) ? extra.speed : 1.0,
+        pitch: Number.isFinite(extra.pitch) ? extra.pitch : 1.0,
+        volume: Number.isFinite(extra.volume) ? extra.volume : 1.0,
+        format: extra.format || PROMPT_CACHE_ENCODING,
+        tts_provider: extra.tts_provider || extra.provider || "",
+        tts_voice: extra.tts_voice || extra.voice_id || ""
     };
     const tmpPcm = `${paths.pcmPath}.tmp`;
     const tmpMeta = `${paths.metaPath}.tmp`;
@@ -125,6 +134,7 @@ function writePromptCache(promptKey, text, pcm, extra = {}) {
 }
 
 function sendPromptCachePcm(res, cacheRecord, cacheState, serverTimeMs = Date.now()) {
+    const meta = cacheRecord.meta || {};
     res
         .status(200)
         .set({
@@ -132,6 +142,11 @@ function sendPromptCachePcm(res, cacheRecord, cacheState, serverTimeMs = Date.no
             "X-Prompt-Key": cacheRecord.promptKey,
             "X-Prompt-Cache": cacheState,
             "X-Audio-Format": PROMPT_CACHE_FORMAT,
+            "X-Audio-Sample-Rate": String(PROMPT_CACHE_SAMPLE_RATE),
+            "X-Audio-Channels": String(PROMPT_CACHE_CHANNELS),
+            "X-Audio-Version": meta.prompt_version || meta.version || "",
+            "X-Prompt-Version": meta.prompt_version || meta.version || "",
+            "X-Voice-Config-Hash": meta.voice_config_hash || "",
             "X-Sample-Rate": String(PROMPT_CACHE_SAMPLE_RATE),
             "X-Channels": String(PROMPT_CACHE_CHANNELS),
             "X-Server-Time-Ms": String(serverTimeMs),

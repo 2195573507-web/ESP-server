@@ -1,7 +1,6 @@
 const {
     readDeviceMetadata,
     toFiniteNumber,
-    toIntegerOrNull,
     trimText
 } = require("./deviceMetadata");
 const {
@@ -10,112 +9,142 @@ const {
 const {
     recordCsiMotion
 } = require("./dashboardService");
+const {
+    recordEvent
+} = require("./eventLogService");
+const {
+    broadcastEvent
+} = require("./eventStreamService");
+const {
+    insertCsiMotionEvent
+} = require("../db/csiMotion");
 
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
-const CSI_OCCUPANCY_STATES = new Set(["unknown", "vacant", "occupied"]);
+const CSI_EVENT_SCHEMA_VERSION = "v2";
+const CSI_STATES = new Set(["IDLE", "MOTION", "HOLD"]);
+const TOP_LEVEL_KEYS = new Set([
+    "schema_version",
+    "trace_id",
+    "tick_id",
+    "fused_state",
+    "confidence",
+    "links",
+    "timestamp_ms"
+]);
 
-function clampMotionScore(value) {
+function isPlainObject(value) {
+    return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOnlyKeys(object, allowedKeys) {
+    return Object.keys(object).every(key => allowedKeys.has(key)) &&
+        allowedKeys.size === Object.keys(object).length;
+}
+
+function finiteNumber(value, min = -Infinity, max = Infinity) {
     const numeric = toFiniteNumber(value);
-    if (numeric === null) {
+    if (numeric === null || numeric < min || numeric > max) {
         return null;
     }
-
-    return Math.min(Math.max(numeric, 0), 1);
+    return numeric;
 }
 
-function readOptionalInteger(value) {
-    const numeric = toIntegerOrNull(value);
-    return numeric === null ? null : numeric;
+function strictInteger(value, min = -Infinity, max = Infinity) {
+    const numeric = finiteNumber(value, min, max);
+    if (numeric === null || !Number.isInteger(numeric)) {
+        return null;
+    }
+    return numeric;
 }
 
-function validateCsiMotionEnvelope(body, serverRecvMs) {
-    if (!body || typeof body !== "object" || Array.isArray(body)) {
-        return {
-            ok: false,
-            code: "INVALID_ENVELOPE",
-            error: "JSON object envelope is required"
-        };
+function invalid(code, error) {
+    return {
+        ok: false,
+        code,
+        error
+    };
+}
+
+function validateCanonicalLink(link, expectedIndex) {
+    const expected = `link_${expectedIndex}`;
+    if (link !== expected) {
+        return invalid("INVALID_CSI_LINK", "links must use canonical link_N identifiers");
     }
-    if (Number(body.schema_version) !== 1) {
-        return {
-            ok: false,
-            code: "INVALID_SCHEMA_VERSION",
-            error: "schema_version must be 1"
-        };
+    return {
+        ok: true,
+        link: expected
+    };
+}
+
+function validateCanonicalCsiEventV2(body) {
+    if (!isPlainObject(body) || !hasOnlyKeys(body, TOP_LEVEL_KEYS)) {
+        return invalid("INVALID_CANONICAL_CSI_EVENT", "canonical CSI event v2 object is required");
     }
-    if (trimText(body.payload_type, 80) !== CSI_MOTION_PAYLOAD_TYPE) {
-        return {
-            ok: false,
-            code: "UNSUPPORTED_PAYLOAD_TYPE",
-            error: "payload_type must be csi.motion"
-        };
+    if (body.schema_version !== CSI_EVENT_SCHEMA_VERSION) {
+        return invalid("INVALID_SCHEMA_VERSION", "schema_version must be v2");
     }
-    if (!trimText(body.device_id, 128)) {
-        return {
-            ok: false,
-            code: "DEVICE_ID_REQUIRED",
-            error: "device_id is required"
-        };
-    }
-    if (!body.payload || typeof body.payload !== "object" || Array.isArray(body.payload)) {
-        return {
-            ok: false,
-            code: "INVALID_PAYLOAD",
-            error: "payload object is required"
-        };
+    const traceId = trimText(body.trace_id, 128);
+    if (!traceId || traceId !== body.trace_id) {
+        return invalid("INVALID_TRACE_ID", "trace_id must be a non-empty canonical string");
     }
 
-    const occupancy = body.payload.occupancy;
-    if (!occupancy || typeof occupancy !== "object" || Array.isArray(occupancy)) {
-        return {
-            ok: false,
-            code: "INVALID_PAYLOAD",
-            error: "payload.occupancy object is required"
-        };
+    const tickId = strictInteger(body.tick_id, 0);
+    const timestampMs = strictInteger(body.timestamp_ms, 1);
+    const confidence = finiteNumber(body.confidence, 0, 1);
+    if (tickId === null || timestampMs === null || confidence === null) {
+        return invalid("INVALID_CANONICAL_TIMING", "tick_id, timestamp_ms, and confidence are invalid");
     }
 
-    const state = trimText(occupancy.state, 16).toLowerCase() || "unknown";
-    if (!CSI_OCCUPANCY_STATES.has(state)) {
-        return {
-            ok: false,
-            code: "INVALID_CSI_OCCUPANCY_STATE",
-            error: "occupancy.state must be unknown, vacant, or occupied"
-        };
+    const state = trimText(body.fused_state, 16).toUpperCase();
+    if (!CSI_STATES.has(state)) {
+        return invalid("INVALID_FUSED_STATE", "fused_state must be IDLE, MOTION, or HOLD");
     }
 
-    const sampleCount = toIntegerOrNull(body.payload.sample_count);
-    const updatedAt = toIntegerOrNull(body.payload.updated_at) ||
-        toIntegerOrNull(body.timestamp_ms) ||
-        serverRecvMs;
+    if (!Array.isArray(body.links) || body.links.length === 0 || body.links.length > 8) {
+        return invalid("INVALID_CSI_LINKS", "links must be a non-empty canonical array");
+    }
+    const links = [];
+    for (let i = 0; i < body.links.length; i++) {
+        const validation = validateCanonicalLink(body.links[i], i);
+        if (!validation.ok) {
+            return validation;
+        }
+        links.push(validation.link);
+    }
 
     return {
         ok: true,
         csi: {
-            occupancy: {
-                state,
-                available: true,
-                motion_score: clampMotionScore(body.payload.motion_score),
-                variance: toFiniteNumber(body.payload.variance),
-                rssi: readOptionalInteger(body.payload.rssi),
-                sample_count: sampleCount === null ? 0 : Math.max(0, sampleCount),
-                updated_at: updatedAt
-            },
-            room_id: trimText(body.room_id, 128),
-            local_id: toIntegerOrNull(body.local_id)
+            trace_id: traceId,
+            tick_id: tickId,
+            link_id: "fused",
+            state,
+            frame_energy: null,
+            variance: null,
+            rssi: null,
+            motion_score: confidence,
+            confidence,
+            timestamp: timestampMs,
+            links
         }
     };
 }
 
-async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
+async function ingestCanonicalCsiEventV2(dbRun, dbAll, body, options = {}) {
     const serverRecvMs = Number.isFinite(options.serverRecvMs) ? options.serverRecvMs : Date.now();
+    const gatewayId = trimText(options.trustedGatewayId, 128);
     const metadata = readDeviceMetadata({
-        body,
+        body: {},
         headers: options.headers,
         query: options.query,
+        deviceId: gatewayId,
         payloadType: CSI_MOTION_PAYLOAD_TYPE,
         serverRecvMs
     });
-    const validation = validateCsiMotionEnvelope(body, serverRecvMs);
+    metadata.gateway_id = gatewayId;
+    metadata.device_id = gatewayId;
+
+    const validation = validateCanonicalCsiEventV2(body);
     if (!validation.ok) {
         return {
             ok: false,
@@ -126,31 +155,62 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
         };
     }
 
-    await refreshDeviceActivity(dbRun, dbAll, metadata, CSI_MOTION_PAYLOAD_TYPE);
-    const dashboardRecord = recordCsiMotion({
+    const fact = {
         device_id: metadata.device_id,
-        local_id: validation.csi.local_id,
-        room_id: validation.csi.room_id,
-        occupancy: validation.csi.occupancy
-    }, {
+        gateway_id: metadata.gateway_id,
+        link_id: validation.csi.link_id,
+        state: validation.csi.state,
+        frame_energy: validation.csi.frame_energy,
+        variance: validation.csi.variance,
+        rssi: validation.csi.rssi,
+        motion_score: validation.csi.motion_score,
+        timestamp: validation.csi.timestamp,
+        server_recv_ms: metadata.server_recv_ms,
+        server_time_iso: metadata.server_time_iso,
+        raw_json: body
+    };
+
+    await refreshDeviceActivity(dbRun, dbAll, metadata, CSI_MOTION_PAYLOAD_TYPE);
+    const id = await insertCsiMotionEvent(dbRun, fact);
+    const dashboardRecord = recordCsiMotion(fact, {
         serverRecvMs
     });
+
+    await recordEvent(dbRun, {
+        event_type: "csi",
+        event_name: "canonical_csi_event_v2_received",
+        device_id: fact.device_id,
+        severity: fact.state === "MOTION" ? "warning" : "info",
+        message: `canonical csi state ${fact.state}`,
+        payload: {
+            ...validation.csi,
+            device_id: fact.device_id,
+            gateway_id: fact.gateway_id
+        },
+        source: "kernel_csi_event",
+        server_recv_ms: metadata.server_recv_ms
+    });
+
+    broadcastEvent("csi_motion", fact);
 
     return {
         ok: true,
         status: 202,
         metadata,
         data: {
-            device_id: metadata.device_id,
+            id,
+            trace_id: validation.csi.trace_id,
+            tick_id: validation.csi.tick_id,
+            device_id: fact.device_id,
             payload_type: CSI_MOTION_PAYLOAD_TYPE,
-            occupancy: {
-                state: validation.csi.occupancy.state
-            },
-            motion_score: validation.csi.occupancy.motion_score,
-            variance: validation.csi.occupancy.variance,
-            rssi: validation.csi.occupancy.rssi,
-            sample_count: validation.csi.occupancy.sample_count,
-            updated_at: validation.csi.occupancy.updated_at,
+            link_id: fact.link_id,
+            state: fact.state,
+            frame_energy: fact.frame_energy,
+            variance: fact.variance,
+            rssi: fact.rssi,
+            motion_score: fact.motion_score,
+            confidence: validation.csi.confidence,
+            timestamp: fact.timestamp,
             server_recv_ms: metadata.server_recv_ms,
             server_time_iso: metadata.server_time_iso,
             dashboard_recorded: Boolean(dashboardRecord)
@@ -159,7 +219,9 @@ async function ingestCsiMotion(dbRun, dbAll, body, options = {}) {
 }
 
 module.exports = {
+    CSI_EVENT_SCHEMA_VERSION,
     CSI_MOTION_PAYLOAD_TYPE,
-    ingestCsiMotion,
-    validateCsiMotionEnvelope
+    CSI_STATES,
+    ingestCanonicalCsiEventV2,
+    validateCanonicalCsiEventV2
 };

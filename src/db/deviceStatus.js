@@ -7,14 +7,19 @@ const DEVICE_STATUS_COLUMNS = [
     { name: "id", type: "INTEGER PRIMARY KEY AUTOINCREMENT" },
     { name: "device_id", type: "TEXT NOT NULL" },
     { name: "device_type", type: "TEXT" },
+    { name: "room_id", type: "TEXT" },
+    { name: "room_name", type: "TEXT" },
     { name: "firmware_version", type: "TEXT" },
     { name: "last_seen_ms", type: "INTEGER" },
     { name: "last_seen_iso", type: "TEXT" },
     { name: "last_payload_type", type: "TEXT" },
+    { name: "last_server_recv_ms", type: "INTEGER" },
     { name: "last_module_type", type: "TEXT" },
     { name: "last_esp_uptime_ms", type: "INTEGER" },
     { name: "last_esp_time_ms", type: "INTEGER" },
     { name: "time_synced", type: "INTEGER" },
+    { name: "online", type: "INTEGER NOT NULL DEFAULT 0", addType: "INTEGER" },
+    { name: "offline_reason", type: "TEXT" },
     { name: "reboot_count", type: "INTEGER NOT NULL DEFAULT 0", addType: "INTEGER" },
     { name: "latest_upload_delay_ms", type: "INTEGER" },
     { name: "avg_upload_delay_ms", type: "INTEGER" },
@@ -27,9 +32,12 @@ const DEVICE_MODULE_STATUS_COLUMNS = [
     { name: "id", type: "INTEGER PRIMARY KEY AUTOINCREMENT" },
     { name: "device_id", type: "TEXT NOT NULL" },
     { name: "module_type", type: "TEXT NOT NULL" },
+    { name: "room_id", type: "TEXT" },
+    { name: "room_name", type: "TEXT" },
     { name: "last_seen_ms", type: "INTEGER" },
     { name: "last_seen_iso", type: "TEXT" },
     { name: "last_payload_type", type: "TEXT" },
+    { name: "last_server_recv_ms", type: "INTEGER" },
     { name: "last_esp_uptime_ms", type: "INTEGER" },
     { name: "last_esp_time_ms", type: "INTEGER" },
     { name: "time_synced", type: "INTEGER" },
@@ -68,6 +76,7 @@ async function ensureDeviceStatusTables(dbRun, dbAll) {
     }
 
     await dbRun("CREATE INDEX IF NOT EXISTS idx_device_status_last_seen ON device_status(last_seen_ms DESC)");
+    await dbRun("CREATE INDEX IF NOT EXISTS idx_device_status_online ON device_status(online,last_seen_ms DESC)");
     await dbRun("CREATE INDEX IF NOT EXISTS idx_device_module_status_last_seen ON device_module_status(device_id,last_seen_ms DESC)");
 }
 

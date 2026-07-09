@@ -20,6 +20,7 @@ const COMMAND_QUEUE_COLUMNS = [
     { name: "name", type: "TEXT NOT NULL" },
     { name: "payload_json", type: "TEXT NOT NULL DEFAULT '{}'" },
     { name: "status", type: "TEXT NOT NULL DEFAULT 'queued'" },
+    { name: "gateway_id", type: "TEXT" },
     { name: "source", type: "TEXT" },
     { name: "requested_by", type: "TEXT" },
     { name: "related_llm_record_id", type: "INTEGER" },
@@ -30,7 +31,11 @@ const COMMAND_QUEUE_COLUMNS = [
     { name: "created_at", type: "TEXT NOT NULL DEFAULT (datetime('now'))", addType: "TEXT" },
     { name: "updated_at", type: "TEXT NOT NULL DEFAULT (datetime('now'))", addType: "TEXT" },
     { name: "dispatched_at", type: "TEXT" },
-    { name: "completed_at", type: "TEXT" }
+    { name: "dispatch_count", type: "INTEGER NOT NULL DEFAULT 0", addType: "INTEGER" },
+    { name: "acknowledged_at", type: "TEXT" },
+    { name: "completed_at", type: "TEXT" },
+    { name: "expires_at", type: "TEXT" },
+    { name: "reject_reason", type: "TEXT" }
 ];
 
 function columnSql(columns) {
@@ -62,6 +67,7 @@ async function ensureCommandTables(dbRun, dbAll) {
     }
 
     await dbRun("CREATE INDEX IF NOT EXISTS idx_command_queue_device_status ON command_queue(device_id,status,id)");
+    await dbRun("CREATE INDEX IF NOT EXISTS idx_command_queue_gateway_device_status ON command_queue(gateway_id,device_id,status,id)");
     await dbRun("CREATE INDEX IF NOT EXISTS idx_command_queue_command_id ON command_queue(command_id)");
 }
 

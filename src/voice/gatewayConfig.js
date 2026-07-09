@@ -77,6 +77,9 @@ function readVolcGatewayConfig() {
     );
     const ttsFormat = readTrimmedEnv("VOLC_GATEWAY_TTS_FORMAT", DEFAULT_VOLC_GATEWAY_TTS_FORMAT);
     const ttsResourceId = readTrimmedEnv("VOLC_GATEWAY_TTS_RESOURCE_ID");
+    const ttsSpeed = Number.parseFloat(process.env.VOLC_GATEWAY_TTS_SPEED || "1");
+    const ttsPitch = Number.parseFloat(process.env.VOLC_GATEWAY_TTS_PITCH || "1");
+    const ttsVolume = Number.parseFloat(process.env.VOLC_GATEWAY_TTS_VOLUME || "1");
 
     return {
         apiKey,
@@ -109,6 +112,9 @@ function readVolcGatewayConfig() {
             url: ttsModel && ttsPath ? buildGatewayTtsUrl(wsBaseUrl, httpBaseUrl, ttsPath, ttsModel) : "",
             sampleRate: ttsSampleRate,
             format: ttsFormat,
+            speed: Number.isFinite(ttsSpeed) && ttsSpeed > 0 ? ttsSpeed : 1.0,
+            pitch: Number.isFinite(ttsPitch) && ttsPitch > 0 ? ttsPitch : 1.0,
+            volume: Number.isFinite(ttsVolume) && ttsVolume > 0 ? ttsVolume : 1.0,
             useResourceId: readBooleanFlag(process.env.VOLC_GATEWAY_TTS_USE_RESOURCE_ID),
             resourceId: ttsResourceId
         }

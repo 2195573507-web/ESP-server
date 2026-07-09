@@ -1592,7 +1592,7 @@ function renderMainChart() {
     const padding = { top: 22, right: 26, bottom: 42, left: 52 };
     const width = rect.width - padding.left - padding.right;
     const height = rect.height - padding.top - padding.bottom;
-    const data = getFilteredChartData();
+    const data = getFilteredChartData().slice(-100);
     const chartColors = {
         grid: readThemeColor("--chart-grid", "#dfe7f3"),
         label: readThemeColor("--chart-label", "#33537f"),
@@ -1650,6 +1650,7 @@ function renderMainChart() {
         : padding.left + (index / (data.length - 1)) * width;
     const yFor = value => padding.top + height - ((Math.max(yMin, Math.min(yMax, value)) - yMin) / (yMax - yMin)) * height;
 
+    const shouldDrawMarkers = data.length < 60;
     const drawLine = (field, color) => {
         const drawablePoints = data
             .map((point, index) => ({ point, index, value: toNumber(point[field]) }))
@@ -1665,18 +1666,19 @@ function renderMainChart() {
             else context.lineTo(x, y);
         });
         context.strokeStyle = color;
-        context.lineWidth = 3;
+        context.lineWidth = 2;
         context.lineJoin = "round";
         context.lineCap = "round";
         if (drawablePoints.length > 1) {
             context.stroke();
         }
 
+        if (!shouldDrawMarkers) return;
         drawablePoints.forEach(item => {
             const x = xFor(item.index);
             const y = yFor(item.value);
             context.beginPath();
-            context.arc(x, y, 4, 0, Math.PI * 2);
+            context.arc(x, y, 2, 0, Math.PI * 2);
             context.fillStyle = color;
             context.fill();
         });
@@ -1685,8 +1687,10 @@ function renderMainChart() {
     chartFields.forEach(item => drawLine(item.field, item.color));
 
     context.fillStyle = chartColors.axisLabel;
+    const maxXAxisLabels = 7;
+    const labelStep = Math.max(1, Math.ceil(data.length / maxXAxisLabels));
     data.forEach((point, index) => {
-        if (index % 2 === 0 || rect.width > 760) {
+        if (index % labelStep === 0 || index === data.length - 1) {
             context.fillText(point.time, xFor(index) - 17, padding.top + height + 30);
         }
     });

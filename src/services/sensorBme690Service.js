@@ -182,7 +182,7 @@ function validateBmeEnvelope(body) {
     };
 }
 
-async function ingestBme690(dbRun, dbAll, body, options = {}) {
+function prepareBme690Ingest(body, options = {}) {
     const validation = validateBmeEnvelope(body);
     const serverRecvMs = Number.isFinite(options.serverRecvMs) ? options.serverRecvMs : Date.now();
     const metadata = readDeviceMetadata({
@@ -215,16 +215,47 @@ async function ingestBme690(dbRun, dbAll, body, options = {}) {
     const metadataJson = JSON.stringify(metadataForStorage(metadata));
     const airQualityJson = JSON.stringify(airQuality);
 
+    return {
+        ok: true,
+        status: 201,
+        metadata,
+        body,
+        readings: validation.readings,
+        sensorId,
+        airQuality,
+        rawJson,
+        metadataJson,
+        airQualityJson,
+        hasAlarm: Boolean(body.alarm || body.payload?.alarm || body.payload?.alarm_type),
+        data: {
+            id: null,
+            device_id: metadata.device_id,
+            payload_type: "sensor.bme690",
+            sensor_id: sensorId,
+            server_recv_ms: metadata.server_recv_ms,
+            server_time_iso: metadata.server_time_iso,
+            upload_delay_ms: metadata.upload_delay_ms,
+            air_quality: airQuality
+        }
+    };
+}
+
+async function persistBme690Ingest(dbRun, dbAll, prepared) {
+    if (!prepared?.ok) {
+        return null;
+    }
+
+    const metadata = prepared.metadata;
     const result = await dbRun(
         `INSERT INTO sensor_records
         (timestamp,temperature,humidity,pressure,gas_resistance,device_id,esp_time_ms,esp_uptime_ms,server_recv_ms,server_time_iso,upload_delay_ms,schema_version,device_type,firmware_version,request_seq,time_synced,payload_type,sensor_id,metadata_json,raw_json,air_quality_json,air_quality_score,air_quality_level,air_quality_confidence,air_quality_algo_version,air_quality_source,gas_baseline_ohm,gas_ratio,gas_score,humidity_score)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
-            serverRecvMs,
-            validation.readings.temperature_c,
-            validation.readings.humidity_percent,
-            validation.readings.pressure_hpa,
-            validation.readings.gas_resistance_ohm,
+            metadata.server_recv_ms,
+            prepared.readings.temperature_c,
+            prepared.readings.humidity_percent,
+            prepared.readings.pressure_hpa,
+            prepared.readings.gas_resistance_ohm,
             metadata.device_id,
             metadata.esp_time_ms,
             metadata.esp_uptime_ms,
@@ -237,24 +268,25 @@ async function ingestBme690(dbRun, dbAll, body, options = {}) {
             metadata.request_seq,
             metadata.time_synced === null ? null : (metadata.time_synced ? 1 : 0),
             "sensor.bme690",
-            sensorId,
-            metadataJson,
-            rawJson,
-            airQualityJson,
-            airQuality.air_quality_score,
-            airQuality.air_quality_level,
-            airQuality.air_quality_confidence,
-            airQuality.air_quality_algo_version,
-            airQuality.air_quality_source,
-            airQuality.gas_baseline_ohm,
-            airQuality.gas_ratio,
-            airQuality.gas_score,
-            airQuality.humidity_score
+            prepared.sensorId,
+            prepared.metadataJson,
+            prepared.rawJson,
+            prepared.airQualityJson,
+            prepared.airQuality.air_quality_score,
+            prepared.airQuality.air_quality_level,
+            prepared.airQuality.air_quality_confidence,
+            prepared.airQuality.air_quality_algo_version,
+            prepared.airQuality.air_quality_source,
+            prepared.airQuality.gas_baseline_ohm,
+            prepared.airQuality.gas_ratio,
+            prepared.airQuality.gas_score,
+            prepared.airQuality.humidity_score
         ]
     );
 
     await refreshDeviceActivity(dbRun, dbAll, metadata, "sensor.bme690");
-    if (body.alarm || body.payload?.alarm || body.payload?.alarm_type) {
+    if (prepared.hasAlarm) {
+        const body = prepared.body;
         await recordEvent(dbRun, {
             event_type: "alarm",
             event_name: "alarm_created",
@@ -267,26 +299,29 @@ async function ingestBme690(dbRun, dbAll, body, options = {}) {
         });
     }
 
+    prepared.data.id = result.lastID;
     return {
         ok: true,
         status: 201,
         metadata,
-        data: {
-            id: result.lastID,
-            device_id: metadata.device_id,
-            payload_type: "sensor.bme690",
-            sensor_id: sensorId,
-            server_recv_ms: metadata.server_recv_ms,
-            server_time_iso: metadata.server_time_iso,
-            upload_delay_ms: metadata.upload_delay_ms,
-            air_quality: airQuality
-        }
+        data: prepared.data
     };
+}
+
+async function ingestBme690(dbRun, dbAll, body, options = {}) {
+    const prepared = prepareBme690Ingest(body, options);
+    if (!prepared.ok) {
+        return prepared;
+    }
+
+    return persistBme690Ingest(dbRun, dbAll, prepared);
 }
 
 module.exports = {
     AIR_QUALITY_ALGO_VERSION,
     ingestBme690,
     normalizeAirQuality,
+    prepareBme690Ingest,
+    persistBme690Ingest,
     validateBmeEnvelope
 };

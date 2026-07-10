@@ -340,6 +340,25 @@ function dbAll(dbPath, sql, params = []) {
     });
 }
 
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForDbRows(dbPath, sql, params = [], predicate = rows => rows.length > 0, timeoutMs = 3000) {
+    const deadline = Date.now() + timeoutMs;
+    let latestRows = [];
+
+    while (Date.now() <= deadline) {
+        latestRows = await dbAll(dbPath, sql, params);
+        if (predicate(latestRows)) {
+            return latestRows;
+        }
+        await sleep(100);
+    }
+
+    assert.fail(`timed out waiting for db rows: ${sql}; latest=${JSON.stringify(latestRows)}`);
+}
+
 async function createLegacySchema(dbPath) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     await dbRun(dbPath, `
@@ -2350,7 +2369,11 @@ async function run() {
         assert.notEqual(result.body.server_recv_ms, bmeEnvelope.server_recv_ms);
         assert.notEqual(result.body.data.upload_delay_ms, bmeEnvelope.upload_delay_ms);
 
-        let sensorRows = await dbAll(dbPath, "SELECT * FROM sensor_records WHERE id=? LIMIT 1", [result.body.data.id]);
+        let sensorRows = await waitForDbRows(
+            dbPath,
+            "SELECT * FROM sensor_records WHERE device_id=? AND request_seq=? LIMIT 1",
+            [bmeDeviceId, 101]
+        );
         assert.equal(sensorRows.length, 1);
         assert.equal(sensorRows[0].device_id, bmeDeviceId);
         assert.equal(sensorRows[0].temperature, 29.57);
@@ -2510,7 +2533,12 @@ async function run() {
         sensorRows = await dbAll(dbPath, "SELECT * FROM sensor_records WHERE payload_type='csi.motion'");
         assert.equal(sensorRows.length, 0);
 
-        let csiRows = await dbAll(dbPath, "SELECT * FROM csi_motion_events ORDER BY timestamp ASC, id ASC");
+        let csiRows = await waitForDbRows(
+            dbPath,
+            "SELECT * FROM csi_motion_events ORDER BY timestamp ASC, id ASC",
+            [],
+            rows => rows.length >= 2
+        );
         assert.equal(csiRows.length, 2);
         assert.equal(csiRows[0].state, "MOTION");
         assert.equal(csiRows[0].link_id, "fused");
@@ -2837,7 +2865,7 @@ async function run() {
         assert.equal(result.body.data.payload_type, "gateway.dashboard_snapshot");
         assert.equal(result.body.data.gateway_id, "sensair_s3_gateway_01");
         assert.equal(result.body.data.device_count, 1);
-        const persistedSnapshotRows = await dbAll(dbPath, "SELECT payload_json FROM dashboard_snapshots WHERE snapshot_id=? LIMIT 1", [result.body.data.snapshot_id]);
+        const persistedSnapshotRows = await waitForDbRows(dbPath, "SELECT payload_json FROM dashboard_snapshots WHERE snapshot_id=? LIMIT 1", [result.body.data.snapshot_id]);
         assert.equal(persistedSnapshotRows.length, 1);
         const persistedSnapshot = JSON.parse(persistedSnapshotRows[0].payload_json);
         assert.equal(persistedSnapshot.mock_persistence, "stripped");
@@ -2847,7 +2875,11 @@ async function run() {
         assert.equal(persistedSnapshot.devices[0].child_last_seen_ms, childLastSeenUptimeMs);
         assert.equal(persistedSnapshot.devices[0].last_seen_ms, projectedChildLastSeenMs);
 
-        let s3StatusRows = await dbAll(dbPath, "SELECT * FROM device_status WHERE device_id=? LIMIT 1", [bmeDeviceId]);
+        let s3StatusRows = await waitForDbRows(
+            dbPath,
+            "SELECT * FROM device_status WHERE device_id=? AND status_source='s3' LIMIT 1",
+            [bmeDeviceId]
+        );
         assert.equal(s3StatusRows.length, 1);
         assert.equal(s3StatusRows[0].status_source, "s3");
         assert.equal(s3StatusRows[0].child_last_seen_ms, childLastSeenUptimeMs);
@@ -3008,6 +3040,12 @@ async function run() {
         const offlineProjectedLastSeenMs = offlineServerReceivedMs -
             (offlineGatewayUptimeMs - offlineChildLastSeenUptimeMs);
 
+        await waitForDbRows(
+            dbPath,
+            "SELECT * FROM device_status WHERE device_id=? AND status_source='s3' AND server_received_ms=? LIMIT 1",
+            [bmeDeviceId, offlineServerReceivedMs]
+        );
+
         result = await request(baseUrl, "GET", `/api/device/v1/status?${dashboardDeviceQuery}`);
         assert.equal(result.body.status.online, false);
         assert.equal(result.body.status.status_source, "s3");
@@ -3025,6 +3063,12 @@ async function run() {
         assert.equal(result.response.status, 201);
         const telemetryServerRecvMs = result.body.server_recv_ms;
 
+        await waitForDbRows(
+            dbPath,
+            "SELECT * FROM device_status WHERE device_id=? AND last_server_recv_ms=? LIMIT 1",
+            [bmeDeviceId, telemetryServerRecvMs]
+        );
+
         result = await request(baseUrl, "GET", `/api/device/v1/status?${dashboardDeviceQuery}`);
         assert.equal(result.body.status.online, false);
         assert.equal(result.body.status.status_source, "s3");
@@ -3036,7 +3080,11 @@ async function run() {
         assert.equal(result.body.status.last_payload_type, "sensor.bme690");
         assert.ok(result.body.status.delay_sample_count >= 2);
 
-        s3StatusRows = await dbAll(dbPath, "SELECT * FROM device_status WHERE device_id=? LIMIT 1", [bmeDeviceId]);
+        s3StatusRows = await waitForDbRows(
+            dbPath,
+            "SELECT * FROM device_status WHERE device_id=? AND status_source='s3' AND server_received_ms=? LIMIT 1",
+            [bmeDeviceId, offlineServerReceivedMs]
+        );
         assert.equal(s3StatusRows[0].online, 0);
         assert.equal(s3StatusRows[0].status_source, "s3");
         assert.equal(s3StatusRows[0].child_status, "offline");

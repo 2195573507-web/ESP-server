@@ -593,10 +593,12 @@ function mergeCsiMotionIntoSnapshot(snapshot) {
     return snapshot;
 }
 
-function filterSnapshotForQuery(snapshot, query = {}) {
+function filterSnapshotForQuery(snapshot, query = {}, options = {}) {
     const deviceId = normalizeDashboardDeviceId(query.device_id);
     const cloned = cloneJson(snapshot);
-    mergeCsiMotionIntoSnapshot(cloned, deviceId);
+    if (options.mergeCsi !== false) {
+        mergeCsiMotionIntoSnapshot(cloned, deviceId);
+    }
     if (!deviceId) {
         return cloned;
     }
@@ -693,7 +695,7 @@ function recordCsiMotion(record, options = {}) {
     return cloneJson(normalized);
 }
 
-async function ingestDashboardSnapshot(body, options = {}) {
+function prepareDashboardSnapshot(body, options = {}) {
     const serverRecvMs = Number.isFinite(options.serverRecvMs) ? options.serverRecvMs : Date.now();
     const validation = normalizeGatewaySnapshot(body, serverRecvMs);
     if (!validation.ok) {
@@ -706,101 +708,21 @@ async function ingestDashboardSnapshot(body, options = {}) {
     }
 
     latestDashboardSnapshot = applyTrustedGatewayId(validation.snapshot, options.trustedGatewayId);
-    const dbRun = options.dbRun;
-    const dbAll = options.dbAll;
     const gatewayId = latestDashboardSnapshot.gateway.gateway_id;
     const snapshotId = makeSnapshotId(gatewayId, serverRecvMs);
 
     console.info(`[dashboard_snapshot] gateway_status_source=server gateway_id=${gatewayId}`);
     console.info(`[dashboard_snapshot] child_status_source=s3 child_count=${latestDashboardSnapshot.devices.length}`);
 
-    if (typeof dbRun === "function") {
-        await dbRun(
-            `INSERT INTO dashboard_snapshots
-            (snapshot_id,gateway_id,server_recv_ms,payload_json,schema_version,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?)`,
-            [
-                snapshotId,
-                gatewayId,
-                serverRecvMs,
-                JSON.stringify(stripMockAppliancesForStorage(latestDashboardSnapshot)),
-                Number(body.schema_version) || 2,
-                new Date(serverRecvMs).toISOString(),
-                new Date(serverRecvMs).toISOString()
-            ]
-        );
-
-        const gatewayMetadata = readDeviceMetadata({
-            body: {
-                device_id: gatewayId,
-                device_type: "S3",
-                room_id: body.gateway?.room_id || body.room_id,
-                room_name: body.gateway?.room_name || body.room_name,
-                payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
-                esp_time_ms: body.gateway?.timestamp || body.timestamp,
-                esp_uptime_ms: body.gateway?.esp_uptime_ms
-            },
-            headers: options.headers,
-            payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
-            serverRecvMs
-        });
-        await refreshDeviceActivity(dbRun, dbAll, gatewayMetadata, DASHBOARD_SNAPSHOT_PAYLOAD_TYPE);
-
-        for (const device of latestDashboardSnapshot.devices) {
-            // C5 status is stored exactly as S3 reported it; never infer it from
-            // this server receiving a dashboard snapshot.
-            await updateChildStatusFromGatewaySnapshot(dbRun, dbAll, device, {
-                payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
-                serverReceivedMs: serverRecvMs
-            });
-        }
-
-        await recordEvent(dbRun, {
-            event_type: "system",
-            event_name: "dashboard_snapshot_updated",
-            device_id: gatewayId,
-            severity: "info",
-            message: "dashboard snapshot updated",
-            payload: {
-                snapshot_id: snapshotId,
-                gateway_id: gatewayId,
-                device_count: latestDashboardSnapshot.devices.length,
-                history_count: latestDashboardSnapshot.history.length
-            },
-            source: "dashboard_snapshot",
-            server_recv_ms: serverRecvMs
-        });
-
-        for (const voiceEvent of latestDashboardSnapshot.recent_voice_events || []) {
-            await recordEvent(dbRun, {
-                event_type: "voice",
-                event_name: "voice_event_created",
-                device_id: voiceEvent.device_id,
-                severity: "info",
-                message: voiceEvent.event || "voice event",
-                payload: voiceEvent,
-                source: "dashboard_snapshot",
-                server_recv_ms: serverRecvMs
-            });
-        }
-
-        for (const commandEvent of latestDashboardSnapshot.recent_commands || []) {
-            await recordEvent(dbRun, {
-                event_type: "command",
-                event_name: "command_created",
-                device_id: commandEvent.device_id,
-                severity: "info",
-                message: commandEvent.status || "command event",
-                payload: commandEvent,
-                source: "dashboard_snapshot",
-                server_recv_ms: serverRecvMs
-            });
-        }
-    }
-
     return {
         ok: true,
         status: 202,
+        body,
+        headers: options.headers,
+        snapshot: latestDashboardSnapshot,
+        snapshotId,
+        gatewayId,
+        serverRecvMs,
         data: {
             snapshot_id: snapshotId,
             payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
@@ -810,6 +732,124 @@ async function ingestDashboardSnapshot(body, options = {}) {
             bound_device_ids: latestDashboardSnapshot.devices.map(device => device.device_id).filter(Boolean),
             received_at_ms: latestDashboardSnapshot.received_at_ms
         }
+    };
+}
+
+async function persistDashboardSnapshot(dbRun, dbAll, prepared) {
+    if (!prepared?.ok) {
+        return null;
+    }
+
+    const body = prepared.body;
+    const snapshot = prepared.snapshot;
+    const serverRecvMs = prepared.serverRecvMs;
+    const gatewayId = prepared.gatewayId;
+    const snapshotId = prepared.snapshotId;
+    const nowIso = new Date(serverRecvMs).toISOString();
+
+    await dbRun(
+        `INSERT INTO dashboard_snapshots
+        (snapshot_id,gateway_id,server_recv_ms,payload_json,schema_version,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?)`,
+        [
+            snapshotId,
+            gatewayId,
+            serverRecvMs,
+            JSON.stringify(stripMockAppliancesForStorage(snapshot)),
+            Number(body.schema_version) || 2,
+            nowIso,
+            nowIso
+        ]
+    );
+
+    const gatewayMetadata = readDeviceMetadata({
+        body: {
+            device_id: gatewayId,
+            device_type: "S3",
+            room_id: body.gateway?.room_id || body.room_id,
+            room_name: body.gateway?.room_name || body.room_name,
+            payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
+            esp_time_ms: body.gateway?.timestamp || body.timestamp,
+            esp_uptime_ms: body.gateway?.esp_uptime_ms
+        },
+        headers: prepared.headers,
+        payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
+        serverRecvMs
+    });
+    await refreshDeviceActivity(dbRun, dbAll, gatewayMetadata, DASHBOARD_SNAPSHOT_PAYLOAD_TYPE);
+
+    for (const device of snapshot.devices) {
+        // C5 status is stored exactly as S3 reported it; never infer it from
+        // this server receiving a dashboard snapshot.
+        await updateChildStatusFromGatewaySnapshot(dbRun, dbAll, device, {
+            payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
+            serverReceivedMs: serverRecvMs
+        });
+    }
+
+    await recordEvent(dbRun, {
+        event_type: "system",
+        event_name: "dashboard_snapshot_updated",
+        device_id: gatewayId,
+        severity: "info",
+        message: "dashboard snapshot updated",
+        payload: {
+            snapshot_id: snapshotId,
+            gateway_id: gatewayId,
+            device_count: snapshot.devices.length,
+            history_count: snapshot.history.length
+        },
+        source: "dashboard_snapshot",
+        server_recv_ms: serverRecvMs
+    });
+
+    for (const voiceEvent of snapshot.recent_voice_events || []) {
+        await recordEvent(dbRun, {
+            event_type: "voice",
+            event_name: "voice_event_created",
+            device_id: voiceEvent.device_id,
+            severity: "info",
+            message: voiceEvent.event || "voice event",
+            payload: voiceEvent,
+            source: "dashboard_snapshot",
+            server_recv_ms: serverRecvMs
+        });
+    }
+
+    for (const commandEvent of snapshot.recent_commands || []) {
+        await recordEvent(dbRun, {
+            event_type: "command",
+            event_name: "command_created",
+            device_id: commandEvent.device_id,
+            severity: "info",
+            message: commandEvent.status || "command event",
+            payload: commandEvent,
+            source: "dashboard_snapshot",
+            server_recv_ms: serverRecvMs
+        });
+    }
+
+    return {
+        ok: true,
+        status: 202,
+        data: prepared.data
+    };
+}
+
+async function ingestDashboardSnapshot(body, options = {}) {
+    const prepared = prepareDashboardSnapshot(body, options);
+    if (!prepared.ok) {
+        return prepared;
+    }
+
+    if (typeof options.dbRun === "function") {
+        await persistDashboardSnapshot(options.dbRun, options.dbAll, prepared);
+    }
+
+    return {
+        ok: true,
+        status: 202,
+        data: prepared.data
     };
 }
 
@@ -1047,6 +1087,40 @@ async function attachUnifiedOverview(dbAll, snapshot, query = {}) {
     return filteredSnapshot;
 }
 
+function attachRuntimeOverview(snapshot, query = {}) {
+    const deviceId = normalizeDashboardDeviceId(query.device_id);
+    const filteredSnapshot = filterSnapshotForQuery(snapshot, query, {
+        mergeCsi: false
+    });
+    const gatewayId = filteredSnapshot.gateway?.gateway_id || "sensair_s3_gateway_01";
+    const gatewayStatuses = [{
+        device_id: gatewayId,
+        online: Boolean(filteredSnapshot.gateway?.online),
+        last_seen_ms: filteredSnapshot.received_at_ms || Date.now()
+    }];
+
+    filteredSnapshot.gateway = adaptGatewayForOverview(filteredSnapshot, gatewayStatuses);
+    filteredSnapshot.modules = buildModuleSummary(filteredSnapshot, []);
+    filteredSnapshot.devices = filteredSnapshot.devices.map(device => adaptDeviceForOverview(device, [], []));
+    filteredSnapshot.csi = normalizeSnapshotCsi(filteredSnapshot.csi, filteredSnapshot.received_at_ms || Date.now(), {
+        availableDefault: Boolean(filteredSnapshot.csi?.available)
+    });
+    filteredSnapshot.home_summary = computeHomeSummary(filteredSnapshot.devices);
+    filteredSnapshot.alarms = Array.isArray(filteredSnapshot.alarms) ? filteredSnapshot.alarms : [];
+    filteredSnapshot.recent_commands = Array.isArray(filteredSnapshot.recent_commands) ? filteredSnapshot.recent_commands : [];
+    filteredSnapshot.recent_voice_events = Array.isArray(filteredSnapshot.recent_voice_events) ? filteredSnapshot.recent_voice_events : [];
+    filteredSnapshot.system_logs = Array.isArray(filteredSnapshot.system_logs) ? filteredSnapshot.system_logs : [];
+
+    if (deviceId) {
+        filteredSnapshot.recent_commands = filteredSnapshot.recent_commands.filter(item => !item.device_id || item.device_id === deviceId);
+        filteredSnapshot.recent_voice_events = filteredSnapshot.recent_voice_events.filter(item => !item.device_id || item.device_id === deviceId);
+        filteredSnapshot.system_logs = filteredSnapshot.system_logs.filter(item => !item.device_id || item.device_id === deviceId);
+        filteredSnapshot.alarms = filteredSnapshot.alarms.filter(item => !item.device_id || item.device_id === deviceId);
+    }
+
+    return filteredSnapshot;
+}
+
 function pickSensorDelay(row, deviceStatus, moduleStatus) {
     return {
         latest_upload_delay_ms: moduleStatus?.latest_upload_delay_ms ?? deviceStatus?.latest_upload_delay_ms ?? integerOrNull(row?.upload_delay_ms),
@@ -1260,7 +1334,15 @@ async function readDashboardModulesStatus(dbAll, query = {}) {
     };
 }
 
-async function readDashboardOverview(dbAll, query = {}) {
+async function readDashboardOverview(dbAll, query = {}, options = {}) {
+    const runtimeSnapshot = options.runtimeCache?.readDashboardOverviewSnapshot?.();
+    const logger = options.logger || console;
+    if (runtimeSnapshot) {
+        logger.info("[CACHE_HIT] path=/api/dashboard/v1/overview source=runtimeStateCache");
+        return attachRuntimeOverview(runtimeSnapshot, query);
+    }
+
+    logger.info("[CACHE_MISS] path=/api/dashboard/v1/overview source=runtimeStateCache fallback=sqlite");
     const restoredSnapshot = await readLatestDashboardSnapshot(dbAll);
     if (restoredSnapshot) {
         return attachUnifiedOverview(dbAll, restoredSnapshot, query);
@@ -1351,6 +1433,8 @@ module.exports = {
     ingestDashboardSnapshot,
     mapDashboardSensor,
     normalizeSnapshotCsi,
+    persistDashboardSnapshot,
+    prepareDashboardSnapshot,
     recordCsiMotion,
     readDashboardCsiHistory,
     readDashboardSnapshotHistory,

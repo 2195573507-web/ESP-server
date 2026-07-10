@@ -19,13 +19,6 @@ const metricDefinitions = {
         icon: "drop",
         historyField: "humidity"
     },
-    pressure: {
-        name: "气压",
-        unit: "hPa",
-        accent: "#f97316",
-        icon: "chip",
-        historyField: "pressure"
-    },
     air: {
         name: "空气质量",
         unit: "",
@@ -211,7 +204,6 @@ function createEmptyMetrics(status = UNKNOWN_TEXT, note = EMPTY_TEXT) {
     return {
         temperature: createEmptyMetric("温度", "°C"),
         humidity: createEmptyMetric("湿度", "%"),
-        pressure: createEmptyMetric("气压", "hPa"),
         air: createEmptyMetric("空气质量", ""),
         esp,
         overall: "unknown"
@@ -512,9 +504,12 @@ function humanizeAlertType(type, content = "") {
     if (/air|aqi|quality|空气/.test(text)) return "空气质量报警";
     if (/temp|temperature|温度|hot|heat/.test(text)) return "温度过高";
     if (/humid|humidity|湿度/.test(text)) return "湿度异常";
-    if (/pressure|气压/.test(text)) return "气压异常";
     if (/offline|disconnect|离线|设备/.test(text)) return "设备离线";
     return "报警";
+}
+
+function isPressureAlertText(type = "", content = "") {
+    return /pressure|气压/.test(`${type || ""} ${content || ""}`.toLowerCase());
 }
 
 function humanizeSystemLogText(log, payload) {
@@ -607,11 +602,10 @@ function normalizeHistoryPoint(point) {
 
     const temperature = toNumber(pickFirst(point, ["temperature", "temp"]));
     const humidity = toNumber(pickFirst(point, ["humidity"]));
-    const pressure = toNumber(pickFirst(point, ["pressure"]));
     const airQualityObject = isPlainObject(point.air_quality) ? point.air_quality : {};
     const airScore = toNumber(point.air_quality_score) ?? toNumber(airQualityObject.air_quality_score);
 
-    if (temperature === null && humidity === null && pressure === null && airScore === null) {
+    if (temperature === null && humidity === null && airScore === null) {
         return null;
     }
 
@@ -620,7 +614,6 @@ function normalizeHistoryPoint(point) {
         time: formatChartTime(timestamp),
         temperature,
         humidity,
-        pressure,
         air: airScore,
         air_quality_score: airScore
     };
@@ -635,7 +628,6 @@ function getLatestSensorChartPoint() {
         time: formatChartTime(sensor.timestamp),
         temperature: toNumber(sensor.temperature),
         humidity: toNumber(sensor.humidity),
-        pressure: toNumber(sensor.pressure),
         air: toNumber(sensor.airQualityScore),
         air_quality_score: toNumber(sensor.airQualityScore)
     };
@@ -891,6 +883,11 @@ async function fetchAlertLogs(deviceId = getActiveDeviceId()) {
     return {
         ...result,
         data: readListPayload(result.data, ["alarms", "logs", "events"])
+            .filter(event => {
+                const payload = isPlainObject(event?.payload) ? event.payload : {};
+                const content = payload.summary || payload.message || payload.description || event?.local_action || event?.event_id || "";
+                return !isPressureAlertText(event?.event_type || payload.type, content);
+            })
     };
 }
 
@@ -1259,7 +1256,7 @@ function getEspStatus(deviceStatus) {
 }
 
 function getOverallLevel(metrics) {
-    const levels = [metrics.temperature.level, metrics.humidity.level, metrics.pressure.level, metrics.air.level, metrics.esp.level];
+    const levels = [metrics.temperature.level, metrics.humidity.level, metrics.air.level, metrics.esp.level];
     if (levels.includes("danger")) return "danger";
     if (levels.includes("warning")) return "warning";
     if (levels.includes("unknown")) return "unknown";
@@ -1276,7 +1273,6 @@ function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
     const esp = getEspStatus(deviceStatus);
     const temperatureLevel = sensor.temperature === null ? "unknown" : getTemperatureLevel(sensor.temperature);
     const humidityLevel = sensor.humidity === null ? "unknown" : getHumidityLevel(sensor.humidity);
-    const pressureLevel = sensor.pressure === null ? "unknown" : "normal";
     const airLevel = sensor.airQualityScore === null ? "unknown" : "normal";
     const airDisplay = sensor.airQualityScore === null
         ? DISCONNECTED_TEXT
@@ -1299,14 +1295,6 @@ function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
             label: "湿度",
             unit: "%"
         },
-        pressure: {
-            value: sensor.pressure,
-            display: formatNumber(sensor.pressure),
-            level: pressureLevel,
-            source: sensor.pressure === null ? "empty" : sensor.source,
-            label: "气压",
-            unit: "hPa"
-        },
         air: {
             value: sensor.airQualityScore,
             display: airDisplay,
@@ -1319,7 +1307,6 @@ function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
         overall: getOverallLevel({
             temperature: { level: temperatureLevel },
             humidity: { level: humidityLevel },
-            pressure: { level: pressureLevel },
             air: { level: airLevel },
             esp
         })
@@ -1599,13 +1586,11 @@ function renderMainChart() {
         axisLabel: readThemeColor("--chart-axis-label", "#1f3b68"),
         temperature: readThemeColor("--chart-temperature", "#2266f3"),
         humidity: readThemeColor("--chart-humidity", "#10b981"),
-        pressure: readThemeColor("--orange", "#f97316"),
         air: readThemeColor("--chart-air", "#7c3aed")
     };
     const chartFields = [
         { field: "temperature", color: chartColors.temperature },
-        { field: "humidity", color: chartColors.humidity },
-        { field: "pressure", color: chartColors.pressure }
+        { field: "humidity", color: chartColors.humidity }
     ];
     if (hasHistoryValues("air")) {
         chartFields.push({ field: "air", color: chartColors.air });
@@ -1703,7 +1688,6 @@ function renderAlertSummary() {
     const rows = [
         { label: "温度", value: metricDisplay(dashboardState.metrics.temperature), key: "temperature", icon: "thermometer" },
         { label: "湿度", value: metricDisplay(dashboardState.metrics.humidity), key: "humidity", icon: "drop" },
-        { label: "气压", value: metricDisplay(dashboardState.metrics.pressure), key: "pressure", icon: "chip" },
         {
             label: dashboardState.metrics.air.label,
             value: metricDisplay(dashboardState.metrics.air),
@@ -2272,7 +2256,6 @@ function buildSensorSnapshotText(rawSensor, sensor, deviceStatus = dashboardStat
     const parts = [];
     const temperature = toNumber(pickFirst(rawSensor, ["temperature", "temp"]));
     const humidity = toNumber(pickFirst(rawSensor, ["humidity"]));
-    const pressure = toNumber(pickFirst(rawSensor, ["pressure"]));
     const airQualityObject = isPlainObject(rawSensor.air_quality) ? rawSensor.air_quality : {};
     const airQualityScore = toNumber(rawSensor.air_quality_score) ?? toNumber(airQualityObject.air_quality_score);
     const airQualityLevel = pickFirst(rawSensor, [
@@ -2285,9 +2268,6 @@ function buildSensorSnapshotText(rawSensor, sensor, deviceStatus = dashboardStat
     }
     if (humidity !== null) {
         parts.push(`湿度 ${formatNumber(humidity)}%`);
-    }
-    if (pressure !== null) {
-        parts.push(`气压 ${formatNumber(pressure)} hPa`);
     }
     if (airQualityScore !== null) {
         parts.push(`空气质量 ${formatNumber(airQualityScore, 0)} 分${airQualityLevel ? ` · ${airQualityLevel}` : ""}`);

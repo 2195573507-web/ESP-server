@@ -216,9 +216,12 @@
         if (/air|aqi|quality|空气/.test(text)) return "空气质量报警";
         if (/temp|temperature|温度|hot|heat/.test(text)) return "温度过高";
         if (/humid|humidity|湿度/.test(text)) return "湿度异常";
-        if (/pressure|气压/.test(text)) return "气压异常";
         if (/offline|disconnect|离线|设备/.test(text)) return "设备离线";
         return "报警";
+    }
+
+    function isPressureAlarmText(type = "", message = "") {
+        return /pressure|气压/.test(`${type || ""} ${message || ""}`.toLowerCase());
     }
 
     function normalizeGateway(rawGateway, deviceStatus = null) {
@@ -517,6 +520,7 @@
         return {
             event_id: alarm.event_id || "",
             device_id: alarm.device_id || "",
+            raw_event_type: alarm.event_type || payload.event_type || "",
             event_type: eventType,
             severity: alarm.severity || payload.severity || "info",
             message: cleanDisplayText(rawMessage, eventType),
@@ -819,7 +823,6 @@
                 <div class="s3-sensor-grid">
                     ${renderSensorMetricRealtime("温度", formatDeviceSensorValue(device, "temperature", "°C"), { key: "temperature" })}
                     ${renderSensorMetricRealtime("湿度", formatDeviceSensorValue(device, "humidity", "%"), { key: "humidity" })}
-                    ${renderSensorMetricRealtime("气压", formatDeviceSensorValue(device, "pressure", " hPa"), { key: "pressure" })}
                 </div>
                 <div class="s3-sensor-grid">
                     ${renderSensorMetricRealtime("空气质量", formatDeviceAirQuality(device), { statusClass: `aqi-${airState.className}`, key: "aqi" })}
@@ -854,6 +857,7 @@
     function getActiveAlarms(data) {
         return (Array.isArray(data.recent_alarms) ? data.recent_alarms : [])
             .filter(isActiveAlarm)
+            .filter(alarm => !isPressureAlarmText(alarm.raw_event_type || alarm.event_type, alarm.message))
             .slice(0, 20);
     }
 
@@ -939,7 +943,6 @@
             const values = {
                 temperature: formatDeviceSensorValue(device, "temperature", "°C"),
                 humidity: formatDeviceSensorValue(device, "humidity", "%"),
-                pressure: formatDeviceSensorValue(device, "pressure", " hPa"),
                 aqi: formatDeviceAirQuality(device),
                 lastReported: updatedAt ? formatTime(updatedAt) : (device.online === false ? "设备离线" : "暂无数据")
             };

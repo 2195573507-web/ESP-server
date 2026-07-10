@@ -164,7 +164,16 @@ function requireGatewayAuth(context = {}) {
         };
 
         try {
-            await recordGatewaySeen(context.dbRun, result.gateway_id);
+            if (typeof context.enqueuePersistenceJob === "function") {
+                context.enqueuePersistenceJob({
+                    type: "gateway_auth.seen",
+                    priority: "high",
+                    run: () => recordGatewaySeen(context.dbRun, result.gateway_id)
+                });
+                context.persistenceWorker?.scheduleImmediateFlushIfNeeded?.();
+            } else {
+                await recordGatewaySeen(context.dbRun, result.gateway_id);
+            }
         } catch (_) {
             // Auth has already succeeded; last_seen bookkeeping is not part of authorization.
         }
@@ -213,6 +222,25 @@ async function bindDeviceToGateway(dbRun, gatewayId, deviceId, source = "gateway
     };
 }
 
+function queueGatewayBinding(dbRun, gatewayId, deviceId, source, serverRecvMs, options = {}) {
+    if (typeof options.enqueuePersistenceJob !== "function") {
+        return null;
+    }
+
+    options.enqueuePersistenceJob({
+        type: "gateway_device_binding",
+        priority: "high",
+        run: () => bindDeviceToGateway(dbRun, gatewayId, deviceId, source, serverRecvMs)
+    });
+    options.persistenceWorker?.scheduleImmediateFlushIfNeeded?.();
+    return {
+        ok: true,
+        gateway_id: gatewayId,
+        device_id: deviceId,
+        queued: true
+    };
+}
+
 async function requireGatewayBinding(dbRun, dbAll, binding, options = {}) {
     const gatewayId = normalizeGatewayId(binding?.gateway_id);
     const deviceId = normalizeDeviceId(binding?.device_id);
@@ -238,6 +266,11 @@ async function requireGatewayBinding(dbRun, dbAll, binding, options = {}) {
     );
     if (!rows[0]) {
         if (options.createIfMissing === true) {
+            const queued = queueGatewayBinding(dbRun, gatewayId, deviceId, options.source, options.serverRecvMs, options);
+            if (queued) {
+                return queued;
+            }
+
             return bindDeviceToGateway(dbRun, gatewayId, deviceId, options.source, options.serverRecvMs);
         }
 
@@ -248,7 +281,18 @@ async function requireGatewayBinding(dbRun, dbAll, binding, options = {}) {
         };
     }
 
-    await bindDeviceToGateway(dbRun, gatewayId, deviceId, rows[0].source || options.source || "gateway", options.serverRecvMs);
+    const queued = queueGatewayBinding(
+        dbRun,
+        gatewayId,
+        deviceId,
+        rows[0].source || options.source || "gateway",
+        options.serverRecvMs,
+        options
+    );
+    if (!queued) {
+        await bindDeviceToGateway(dbRun, gatewayId, deviceId, rows[0].source || options.source || "gateway", options.serverRecvMs);
+    }
+
     return {
         ok: true,
         gateway_id: gatewayId,
@@ -265,7 +309,9 @@ async function requireBoundDevice(req, res, context = {}, options = {}) {
     }, {
         createIfMissing: options.createIfMissing === true || options.allowNewBinding === true,
         source: options.source,
-        serverRecvMs: options.serverRecvMs
+        serverRecvMs: options.serverRecvMs,
+        enqueuePersistenceJob: context.enqueuePersistenceJob,
+        persistenceWorker: context.persistenceWorker
     });
 
     if (!result.ok) {

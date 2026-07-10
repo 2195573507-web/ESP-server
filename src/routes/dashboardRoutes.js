@@ -1,6 +1,5 @@
 const express = require("express");
 const {
-    ingestDashboardSnapshot,
     readDashboardCsiHistory,
     readDashboardAsrLatest,
     readDashboardDeviceStatus,
@@ -8,16 +7,23 @@ const {
     readDashboardLlmLatest,
     readDashboardModulesStatus,
     readDashboardOverview,
+    readDashboardSensorHistoryQuery,
     readDashboardSnapshotHistory,
     readDashboardSensorHistory,
     readDashboardSensorLatest,
     readLatestDashboardSnapshot,
-    readDashboardTimeStatus
+    readDashboardTimeStatus,
+    persistDashboardSnapshot,
+    prepareDashboardSnapshot
 } = require("../services/dashboardService");
 const {
     bindDeviceToGateway,
     requireGatewayAuth
 } = require("../services/gatewayAuthService");
+const {
+    PRIORITY_HIGH,
+    enqueuePersistenceJob
+} = require("../services/persistenceQueue");
 
 function dashboardEnvelope(data, nowMs = Date.now()) {
     return {
@@ -49,9 +55,13 @@ function createDashboardRouter(options) {
     const dbRun = options.dbRun;
     const dbAll = options.dbAll;
     const logger = options.logger || console;
+    const runtimeCache = options.runtimeCache;
+    const persistenceWorker = options.persistenceWorker;
     const gatewayContext = {
         dbRun,
-        dbAll
+        dbAll,
+        enqueuePersistenceJob,
+        persistenceWorker
     };
     const gatewayOnly = requireGatewayAuth(gatewayContext);
 
@@ -68,7 +78,10 @@ function createDashboardRouter(options) {
     }
 
     router.get("/overview", route(
-        req => readDashboardOverview(dbAll, req.query),
+        req => readDashboardOverview(dbAll, req.query, {
+            logger,
+            runtimeCache
+        }),
         "DASHBOARD_OVERVIEW_READ_FAILED"
     ));
 
@@ -76,9 +89,7 @@ function createDashboardRouter(options) {
         const serverRecvMs = Date.now();
         const gatewayId = req.gatewayAuth?.gateway_id || "";
         try {
-            const result = await ingestDashboardSnapshot(req.body, {
-                dbRun,
-                dbAll,
+            const result = prepareDashboardSnapshot(req.body, {
                 headers: req.headers,
                 serverRecvMs,
                 trustedGatewayId: gatewayId
@@ -86,9 +97,21 @@ function createDashboardRouter(options) {
             if (!result.ok) {
                 return sendDashboardError(res, result.status || 400, result.code || "INVALID_DASHBOARD_SNAPSHOT", result.error || "invalid dashboard snapshot");
             }
-            for (const deviceId of result.data.bound_device_ids || []) {
-                await bindDeviceToGateway(dbRun, gatewayId, deviceId, "dashboard_snapshot", serverRecvMs, dbAll);
-            }
+            runtimeCache?.updateDashboardSnapshot?.(result.snapshot, {
+                serverRecvMs
+            });
+            const queued = enqueuePersistenceJob({
+                type: "gateway.dashboard_snapshot",
+                priority: PRIORITY_HIGH,
+                run: async () => {
+                    await persistDashboardSnapshot(dbRun, dbAll, result);
+                    for (const deviceId of result.data.bound_device_ids || []) {
+                        await bindDeviceToGateway(dbRun, gatewayId, deviceId, "dashboard_snapshot", serverRecvMs, dbAll);
+                    }
+                }
+            });
+            persistenceWorker?.scheduleImmediateFlushIfNeeded?.();
+            logger.log(`[dashboard-v1] snapshot queued gateway_id=${result.data.gateway_id || "-"} job_id=${queued.job_id}`);
 
             return res.status(result.status || 202).json(dashboardEnvelope(result.data, serverRecvMs));
         } catch (error) {
@@ -125,13 +148,15 @@ function createDashboardRouter(options) {
     ));
 
     router.get("/sensors/history", async (req, res) => {
-        const limit = readDashboardLimit(req.query.limit);
-        if (!limit.ok) {
-            return sendDashboardError(res, 400, limit.code, limit.message);
+        const historyQuery = readDashboardSensorHistoryQuery(req.query);
+        if (!historyQuery.ok) {
+            return sendDashboardError(res, 400, historyQuery.code, historyQuery.message);
         }
 
         try {
-            const data = await readDashboardSensorHistory(dbAll, req.query);
+            const data = await readDashboardSensorHistory(dbAll, req.query, {
+                historyQuery
+            });
             return res.json(dashboardEnvelope(data));
         } catch (error) {
             logger.error(`[dashboard-v1] DASHBOARD_SENSOR_HISTORY_READ_FAILED ${error?.message || error}`);
@@ -155,15 +180,17 @@ function createDashboardRouter(options) {
     });
 
     router.get("/devices/:device_id/history", async (req, res) => {
-        const limit = readDashboardLimit(req.query.limit);
-        if (!limit.ok) {
-            return sendDashboardError(res, 400, limit.code, limit.message);
+        const historyQuery = readDashboardSensorHistoryQuery(req.query);
+        if (!historyQuery.ok) {
+            return sendDashboardError(res, 400, historyQuery.code, historyQuery.message);
         }
 
         try {
             const data = await readDashboardSensorHistory(dbAll, {
                 ...req.query,
                 device_id: req.params.device_id
+            }, {
+                historyQuery
             });
             return res.json(dashboardEnvelope(data));
         } catch (error) {

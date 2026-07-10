@@ -7,7 +7,8 @@ const {
 } = require("./server-time-sync/timeSync");
 const {
     createDatabase,
-    createDbHelpers
+    createDbHelpers,
+    configureDatabase
 } = require("./src/db/sqlite");
 const {
     ensureRecordTables
@@ -91,12 +92,39 @@ const {
 const {
     recordEvent
 } = require("./src/services/eventLogService");
+const runtimeStateCache = require("./src/services/runtimeStateCache");
+const {
+    createPersistenceWorker
+} = require("./src/services/persistenceWorker");
 
 const app = express();
 
 // 数据库连接
 const db = createDatabase(__dirname);
 const { dbRun, dbAll } = createDbHelpers(db);
+const persistenceWorker = createPersistenceWorker({
+    dbRun,
+    logger: console
+});
+
+app.use((req, res, next) => {
+    const startNs = process.hrtime.bigint();
+    res.on("finish", () => {
+        if (!isMachineApiPath(req.path)) {
+            return;
+        }
+
+        const durationMs = Number(process.hrtime.bigint() - startNs) / 1e6;
+        const roundedDurationMs = Math.round(durationMs * 100) / 100;
+        const line = `[API_LATENCY] path=${req.path} method=${req.method} status=${res.statusCode} duration_ms=${roundedDurationMs}`;
+        if (roundedDurationMs > 500) {
+            console.warn(line);
+        } else {
+            console.info(line);
+        }
+    });
+    next();
+});
 
 app.use(createVoiceRouter({ dbRun, dbAll }));
 app.use(express.json());
@@ -126,8 +154,18 @@ app.get("/dashboard", (req, res) => {
 app.use(createLlmTextRouter({ dbRun, dbAll }));
 app.use(createStructuredLlmRouter({ dbRun, dbAll }));
 app.use(createCommandRouter({ dbRun, dbAll }));
-app.use(createDeviceRouter({ dbRun, dbAll }));
-app.use("/api/dashboard/v1", createDashboardRouter({ dbRun, dbAll }));
+app.use(createDeviceRouter({
+    dbRun,
+    dbAll,
+    persistenceWorker,
+    runtimeCache: runtimeStateCache
+}));
+app.use("/api/dashboard/v1", createDashboardRouter({
+    dbRun,
+    dbAll,
+    persistenceWorker,
+    runtimeCache: runtimeStateCache
+}));
 app.use(createSmartHomeRouter({ dbRun, dbAll }));
 app.use(createEventRouter({ dbRun, dbAll }));
 app.use(createMemoryRouter({ dbRun, dbAll }));
@@ -147,7 +185,9 @@ function isMachineApiPath(pathname) {
         pathname === "/asr" ||
         pathname.startsWith("/asr/") ||
         pathname === "/llm" ||
-        pathname.startsWith("/llm/");
+        pathname.startsWith("/llm/") ||
+        pathname === "/kernel" ||
+        pathname.startsWith("/kernel/");
 }
 
 app.use((req, res, next) => {
@@ -218,11 +258,16 @@ async function shutdown(signal) {
     shuttingDown = true;
     console.log(`[server] shutting down signal=${signal}`);
     await closeHttpServer();
+    await persistenceWorker.stop({
+        drain: true
+    });
     await closeDatabase();
     process.exit(0);
 }
 
 async function startServer() {
+    await configureDatabase(dbRun);
+    runtimeStateCache.initRuntimeStateCache();
     await ensureRecordTables(dbRun, dbAll);
     await ensureSensorTimingColumns(dbRun, dbAll);
     await ensureDeviceStatusTables(dbRun, dbAll);
@@ -261,6 +306,7 @@ async function startServer() {
         source: "server_startup",
         server_recv_ms: Date.now()
     });
+    persistenceWorker.start();
 
     httpServer = app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);

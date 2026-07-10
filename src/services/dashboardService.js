@@ -5,7 +5,8 @@ const {
     readDeviceStatuses,
     readDeviceStatus,
     readModuleStatuses,
-    refreshDeviceActivity
+    refreshDeviceActivity,
+    updateChildStatusFromGatewaySnapshot
 } = require("./deviceStatusService");
 const {
     readDeviceMetadata,
@@ -25,9 +26,21 @@ const {
 
 const DASHBOARD_HISTORY_DEFAULT_LIMIT = 50;
 const DASHBOARD_HISTORY_MAX_LIMIT = 500;
+const DASHBOARD_SENSOR_HISTORY_DEFAULT_TARGET_POINTS = 300;
+const DASHBOARD_SENSOR_HISTORY_MIN_TARGET_POINTS = 100;
+const DASHBOARD_SENSOR_HISTORY_DEFAULT_RANGE = "7d";
+const DASHBOARD_SENSOR_HISTORY_RANGE_MS = Object.freeze({
+    "5m": 5 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+    "24h": 24 * 60 * 60 * 1000,
+    "7d": 7 * 24 * 60 * 60 * 1000
+});
+const DASHBOARD_SENSOR_HISTORY_MAX_SPAN_MS = DASHBOARD_SENSOR_HISTORY_RANGE_MS["7d"];
+const SENSOR_HISTORY_TIME_SQL = "COALESCE(NULLIF(server_recv_ms, 0), NULLIF(timestamp, 0))";
 const DASHBOARD_SNAPSHOT_PAYLOAD_TYPE = "gateway.dashboard_snapshot";
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
 const CSI_STATES = new Set(["IDLE", "MOTION", "HOLD"]);
+const MIN_PLAUSIBLE_UNIX_MS = Date.UTC(2000, 0, 1);
 const DASHBOARD_DEVICE_ID_ALIASES = Object.freeze({
     S3: "sensair_s3_gateway_01",
     s3: "sensair_s3_gateway_01",
@@ -94,6 +107,136 @@ function readDashboardLimit(value) {
     return {
         ok: true,
         limit: Math.min(numeric, DASHBOARD_HISTORY_MAX_LIMIT)
+    };
+}
+
+function queryText(value) {
+    const raw = Array.isArray(value) ? value[0] : value;
+    if (raw === undefined || raw === null) {
+        return "";
+    }
+
+    return String(raw).trim();
+}
+
+function hasQueryValue(query = {}, key) {
+    return queryText(query[key]) !== "";
+}
+
+function parseEpochMsParam(query = {}, key) {
+    const text = queryText(query[key]);
+    if (!/^\d+$/.test(text)) {
+        return {
+            ok: false,
+            code: "DASHBOARD_BAD_TIME_RANGE",
+            message: `${key} must be unix epoch milliseconds`
+        };
+    }
+
+    const value = Number.parseInt(text, 10);
+    if (!Number.isSafeInteger(value) || value < 0) {
+        return {
+            ok: false,
+            code: "DASHBOARD_BAD_TIME_RANGE",
+            message: `${key} must be unix epoch milliseconds`
+        };
+    }
+
+    return {
+        ok: true,
+        value
+    };
+}
+
+function sensorHistoryTargetPoints(limitValue) {
+    const limitResult = readDashboardLimit(limitValue);
+    if (!limitResult.ok) {
+        return limitResult;
+    }
+
+    if (queryText(limitValue) === "") {
+        return {
+            ok: true,
+            limit: DASHBOARD_SENSOR_HISTORY_DEFAULT_TARGET_POINTS
+        };
+    }
+
+    return {
+        ok: true,
+        limit: Math.max(DASHBOARD_SENSOR_HISTORY_MIN_TARGET_POINTS, limitResult.limit)
+    };
+}
+
+function readDashboardSensorHistoryQuery(query = {}, nowMs = Date.now()) {
+    const targetResult = sensorHistoryTargetPoints(query.limit);
+    if (!targetResult.ok) {
+        return targetResult;
+    }
+
+    const hasFrom = hasQueryValue(query, "from_ms");
+    const hasTo = hasQueryValue(query, "to_ms");
+    let range = queryText(query.range) || DASHBOARD_SENSOR_HISTORY_DEFAULT_RANGE;
+    let fromMs;
+    let toMs;
+
+    if (hasFrom || hasTo) {
+        if (!hasFrom || !hasTo) {
+            return {
+                ok: false,
+                code: "DASHBOARD_BAD_TIME_RANGE",
+                message: "from_ms and to_ms must be provided together"
+            };
+        }
+
+        const parsedFrom = parseEpochMsParam(query, "from_ms");
+        if (!parsedFrom.ok) {
+            return parsedFrom;
+        }
+        const parsedTo = parseEpochMsParam(query, "to_ms");
+        if (!parsedTo.ok) {
+            return parsedTo;
+        }
+
+        fromMs = parsedFrom.value;
+        toMs = parsedTo.value;
+        range = null;
+    } else {
+        if (!Object.prototype.hasOwnProperty.call(DASHBOARD_SENSOR_HISTORY_RANGE_MS, range)) {
+            return {
+                ok: false,
+                code: "DASHBOARD_BAD_RANGE",
+                message: "range must be one of 5m, 1h, 24h, 7d"
+            };
+        }
+
+        toMs = nowMs;
+        fromMs = toMs - DASHBOARD_SENSOR_HISTORY_RANGE_MS[range];
+    }
+
+    if (fromMs > toMs) {
+        return {
+            ok: false,
+            code: "DASHBOARD_BAD_TIME_RANGE",
+            message: "from_ms must be less than or equal to to_ms"
+        };
+    }
+
+    const spanMs = toMs - fromMs;
+    if (spanMs <= 0 || spanMs > DASHBOARD_SENSOR_HISTORY_MAX_SPAN_MS) {
+        return {
+            ok: false,
+            code: "DASHBOARD_BAD_TIME_RANGE",
+            message: "time span must be greater than 0 and no more than 7d"
+        };
+    }
+
+    return {
+        ok: true,
+        range,
+        from_ms: fromMs,
+        to_ms: toMs,
+        span_ms: spanMs,
+        target_points: targetResult.limit
     };
 }
 
@@ -218,6 +361,24 @@ function normalizeSnapshotGateway(gateway, serverRecvMs) {
     };
 }
 
+function projectChildLastSeenMs(childLastSeenMs, gatewayTimestampMs, serverRecvMs) {
+    const childTimestamp = integerOrNull(childLastSeenMs);
+    if (childTimestamp === null) {
+        return null;
+    }
+    if (childTimestamp >= MIN_PLAUSIBLE_UNIX_MS) {
+        return childTimestamp;
+    }
+
+    const gatewayTimestamp = integerOrNull(gatewayTimestampMs);
+    if (gatewayTimestamp === null || gatewayTimestamp >= MIN_PLAUSIBLE_UNIX_MS) {
+        return serverRecvMs;
+    }
+
+    const ageMs = Math.max(0, gatewayTimestamp - childTimestamp);
+    return Math.max(0, serverRecvMs - ageMs);
+}
+
 function applyTrustedGatewayId(snapshot, trustedGatewayId) {
     const gatewayId = trimText(trustedGatewayId, 128);
     if (!gatewayId || !snapshot?.gateway) {
@@ -291,7 +452,7 @@ function normalizeSnapshotCsi(csi, serverRecvMs, options = {}) {
     };
 }
 
-function normalizeSnapshotDevice(device, serverRecvMs) {
+function normalizeSnapshotDevice(device, serverRecvMs, gatewayTimestampMs) {
     if (!isPlainObject(device)) {
         return null;
     }
@@ -304,6 +465,10 @@ function normalizeSnapshotDevice(device, serverRecvMs) {
         return null;
     }
 
+    const online = booleanValue(device.online, false);
+    const childLastSeenMs = integerOrNull(device.child_last_seen_ms ?? device.last_seen_ms);
+    const lastSeenMs = projectChildLastSeenMs(childLastSeenMs, gatewayTimestampMs, serverRecvMs);
+
     return {
         device_id: deviceId,
         local_id: integerOrNull(device.local_id),
@@ -311,7 +476,18 @@ function normalizeSnapshotDevice(device, serverRecvMs) {
         name: trimText(device.name || device.alias, 128),
         room_id: trimText(device.room_id, 128),
         room_name: trimText(device.room_name || device.room_id || "unassigned", 128),
-        online: booleanValue(device.online, false),
+        // C5 online state is decided by ESPS3 child_registry. Preserve it verbatim;
+        // the server must not infer it from receipt, network, or upload health.
+        online,
+        status: trimText(device.status, 40) || (online ? "online" : "offline"),
+        offline_reason: trimText(device.offline_reason, 128) || null,
+        link_lost: booleanValue(device.link_lost, false),
+        voice_busy: booleanValue(device.voice_busy, false),
+        child_last_seen_ms: childLastSeenMs,
+        server_received_ms: serverRecvMs,
+        // Public status timestamps stay in Server epoch time. child_last_seen_ms
+        // retains the raw S3 monotonic clock for diagnostics.
+        last_seen_ms: lastSeenMs,
         wifi_rssi: integerOrNull(device.wifi_rssi),
         timestamp: integerOrNull(device.timestamp) || serverRecvMs,
         sensors: normalizeSnapshotSensors(device.sensors),
@@ -478,8 +654,9 @@ function normalizeGatewaySnapshot(body, serverRecvMs = Date.now()) {
         };
     }
 
+    const gateway = normalizeSnapshotGateway(body.gateway, serverRecvMs);
     const devices = (Array.isArray(body.devices) ? body.devices : [])
-        .map(device => normalizeSnapshotDevice(device, serverRecvMs))
+        .map(device => normalizeSnapshotDevice(device, serverRecvMs, gateway.timestamp))
         .filter(Boolean);
     const history = (Array.isArray(body.history) ? body.history : [])
         .map(item => normalizeSnapshotHistoryItem(item, serverRecvMs))
@@ -494,7 +671,7 @@ function normalizeGatewaySnapshot(body, serverRecvMs = Date.now()) {
     return {
         ok: true,
         snapshot: {
-            gateway: normalizeSnapshotGateway(body.gateway, serverRecvMs),
+            gateway,
             devices,
             home_summary: normalizeHomeSummary(body.home_summary, devices),
             csi: normalizeSnapshotCsi(body.csi, serverRecvMs, {
@@ -557,10 +734,12 @@ function mergeCsiMotionIntoSnapshot(snapshot) {
     return snapshot;
 }
 
-function filterSnapshotForQuery(snapshot, query = {}) {
+function filterSnapshotForQuery(snapshot, query = {}, options = {}) {
     const deviceId = normalizeDashboardDeviceId(query.device_id);
     const cloned = cloneJson(snapshot);
-    mergeCsiMotionIntoSnapshot(cloned, deviceId);
+    if (options.mergeCsi !== false) {
+        mergeCsiMotionIntoSnapshot(cloned, deviceId);
+    }
     if (!deviceId) {
         return cloned;
     }
@@ -657,7 +836,7 @@ function recordCsiMotion(record, options = {}) {
     return cloneJson(normalized);
 }
 
-async function ingestDashboardSnapshot(body, options = {}) {
+function prepareDashboardSnapshot(body, options = {}) {
     const serverRecvMs = Number.isFinite(options.serverRecvMs) ? options.serverRecvMs : Date.now();
     const validation = normalizeGatewaySnapshot(body, serverRecvMs);
     if (!validation.ok) {
@@ -670,106 +849,21 @@ async function ingestDashboardSnapshot(body, options = {}) {
     }
 
     latestDashboardSnapshot = applyTrustedGatewayId(validation.snapshot, options.trustedGatewayId);
-    const dbRun = options.dbRun;
-    const dbAll = options.dbAll;
     const gatewayId = latestDashboardSnapshot.gateway.gateway_id;
     const snapshotId = makeSnapshotId(gatewayId, serverRecvMs);
 
-    if (typeof dbRun === "function") {
-        await dbRun(
-            `INSERT INTO dashboard_snapshots
-            (snapshot_id,gateway_id,server_recv_ms,payload_json,schema_version,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?)`,
-            [
-                snapshotId,
-                gatewayId,
-                serverRecvMs,
-                JSON.stringify(stripMockAppliancesForStorage(latestDashboardSnapshot)),
-                Number(body.schema_version) || 2,
-                new Date(serverRecvMs).toISOString(),
-                new Date(serverRecvMs).toISOString()
-            ]
-        );
-
-        const gatewayMetadata = readDeviceMetadata({
-            body: {
-                device_id: gatewayId,
-                device_type: "S3",
-                room_id: body.gateway?.room_id || body.room_id,
-                room_name: body.gateway?.room_name || body.room_name,
-                payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
-                esp_time_ms: body.gateway?.timestamp || body.timestamp,
-                esp_uptime_ms: body.gateway?.esp_uptime_ms
-            },
-            headers: options.headers,
-            payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
-            serverRecvMs
-        });
-        await refreshDeviceActivity(dbRun, dbAll, gatewayMetadata, DASHBOARD_SNAPSHOT_PAYLOAD_TYPE);
-
-        for (const device of latestDashboardSnapshot.devices) {
-            const metadata = readDeviceMetadata({
-                body: {
-                    device_id: device.device_id,
-                    device_type: device.device_type || "C5",
-                    room_id: device.room_id,
-                    room_name: device.room_name,
-                    payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
-                    timestamp: device.timestamp
-                },
-                headers: options.headers,
-                payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
-                serverRecvMs
-            });
-            await refreshDeviceActivity(dbRun, dbAll, metadata, DASHBOARD_SNAPSHOT_PAYLOAD_TYPE);
-        }
-
-        await recordEvent(dbRun, {
-            event_type: "system",
-            event_name: "dashboard_snapshot_updated",
-            device_id: gatewayId,
-            severity: "info",
-            message: "dashboard snapshot updated",
-            payload: {
-                snapshot_id: snapshotId,
-                gateway_id: gatewayId,
-                device_count: latestDashboardSnapshot.devices.length,
-                history_count: latestDashboardSnapshot.history.length
-            },
-            source: "dashboard_snapshot",
-            server_recv_ms: serverRecvMs
-        });
-
-        for (const voiceEvent of latestDashboardSnapshot.recent_voice_events || []) {
-            await recordEvent(dbRun, {
-                event_type: "voice",
-                event_name: "voice_event_created",
-                device_id: voiceEvent.device_id,
-                severity: "info",
-                message: voiceEvent.event || "voice event",
-                payload: voiceEvent,
-                source: "dashboard_snapshot",
-                server_recv_ms: serverRecvMs
-            });
-        }
-
-        for (const commandEvent of latestDashboardSnapshot.recent_commands || []) {
-            await recordEvent(dbRun, {
-                event_type: "command",
-                event_name: "command_created",
-                device_id: commandEvent.device_id,
-                severity: "info",
-                message: commandEvent.status || "command event",
-                payload: commandEvent,
-                source: "dashboard_snapshot",
-                server_recv_ms: serverRecvMs
-            });
-        }
-    }
+    console.info(`[dashboard_snapshot] gateway_status_source=server gateway_id=${gatewayId}`);
+    console.info(`[dashboard_snapshot] child_status_source=s3 child_count=${latestDashboardSnapshot.devices.length}`);
 
     return {
         ok: true,
         status: 202,
+        body,
+        headers: options.headers,
+        snapshot: latestDashboardSnapshot,
+        snapshotId,
+        gatewayId,
+        serverRecvMs,
         data: {
             snapshot_id: snapshotId,
             payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
@@ -779,6 +873,124 @@ async function ingestDashboardSnapshot(body, options = {}) {
             bound_device_ids: latestDashboardSnapshot.devices.map(device => device.device_id).filter(Boolean),
             received_at_ms: latestDashboardSnapshot.received_at_ms
         }
+    };
+}
+
+async function persistDashboardSnapshot(dbRun, dbAll, prepared) {
+    if (!prepared?.ok) {
+        return null;
+    }
+
+    const body = prepared.body;
+    const snapshot = prepared.snapshot;
+    const serverRecvMs = prepared.serverRecvMs;
+    const gatewayId = prepared.gatewayId;
+    const snapshotId = prepared.snapshotId;
+    const nowIso = new Date(serverRecvMs).toISOString();
+
+    await dbRun(
+        `INSERT INTO dashboard_snapshots
+        (snapshot_id,gateway_id,server_recv_ms,payload_json,schema_version,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?)`,
+        [
+            snapshotId,
+            gatewayId,
+            serverRecvMs,
+            JSON.stringify(stripMockAppliancesForStorage(snapshot)),
+            Number(body.schema_version) || 2,
+            nowIso,
+            nowIso
+        ]
+    );
+
+    const gatewayMetadata = readDeviceMetadata({
+        body: {
+            device_id: gatewayId,
+            device_type: "S3",
+            room_id: body.gateway?.room_id || body.room_id,
+            room_name: body.gateway?.room_name || body.room_name,
+            payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
+            esp_time_ms: body.gateway?.timestamp || body.timestamp,
+            esp_uptime_ms: body.gateway?.esp_uptime_ms
+        },
+        headers: prepared.headers,
+        payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
+        serverRecvMs
+    });
+    await refreshDeviceActivity(dbRun, dbAll, gatewayMetadata, DASHBOARD_SNAPSHOT_PAYLOAD_TYPE);
+
+    for (const device of snapshot.devices) {
+        // C5 status is stored exactly as S3 reported it; never infer it from
+        // this server receiving a dashboard snapshot.
+        await updateChildStatusFromGatewaySnapshot(dbRun, dbAll, device, {
+            payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
+            serverReceivedMs: serverRecvMs
+        });
+    }
+
+    await recordEvent(dbRun, {
+        event_type: "system",
+        event_name: "dashboard_snapshot_updated",
+        device_id: gatewayId,
+        severity: "info",
+        message: "dashboard snapshot updated",
+        payload: {
+            snapshot_id: snapshotId,
+            gateway_id: gatewayId,
+            device_count: snapshot.devices.length,
+            history_count: snapshot.history.length
+        },
+        source: "dashboard_snapshot",
+        server_recv_ms: serverRecvMs
+    });
+
+    for (const voiceEvent of snapshot.recent_voice_events || []) {
+        await recordEvent(dbRun, {
+            event_type: "voice",
+            event_name: "voice_event_created",
+            device_id: voiceEvent.device_id,
+            severity: "info",
+            message: voiceEvent.event || "voice event",
+            payload: voiceEvent,
+            source: "dashboard_snapshot",
+            server_recv_ms: serverRecvMs
+        });
+    }
+
+    for (const commandEvent of snapshot.recent_commands || []) {
+        await recordEvent(dbRun, {
+            event_type: "command",
+            event_name: "command_created",
+            device_id: commandEvent.device_id,
+            severity: "info",
+            message: commandEvent.status || "command event",
+            payload: commandEvent,
+            source: "dashboard_snapshot",
+            server_recv_ms: serverRecvMs
+        });
+    }
+
+    return {
+        ok: true,
+        status: 202,
+        data: prepared.data
+    };
+}
+
+async function ingestDashboardSnapshot(body, options = {}) {
+    const prepared = prepareDashboardSnapshot(body, options);
+    if (!prepared.ok) {
+        return prepared;
+    }
+
+    if (typeof options.dbRun === "function") {
+        await persistDashboardSnapshot(options.dbRun, options.dbAll, prepared);
+    }
+
+    return {
+        ok: true,
+        status: 202,
+        data: prepared.data
     };
 }
 
@@ -808,6 +1020,13 @@ function mapDashboardDeviceStatus(status, fallbackDeviceId = "") {
         device_id: status?.device_id || fallbackDeviceId || null,
         online: Boolean(status?.online),
         device_online: Boolean(status?.device_online),
+        status: textOrNull(status?.status),
+        status_source: textOrNull(status?.status_source),
+        offline_reason: textOrNull(status?.offline_reason),
+        link_lost: Boolean(status?.link_lost),
+        voice_busy: Boolean(status?.voice_busy),
+        child_last_seen_ms: status?.child_last_seen_ms ?? null,
+        server_received_ms: status?.server_received_ms ?? null,
         last_seen_ms: status?.last_seen_ms ?? null,
         last_seen_iso: textOrNull(status?.last_seen_iso),
         last_seen_age_ms: status?.last_seen_age_ms ?? null,
@@ -908,6 +1127,7 @@ function adaptGatewayForOverview(snapshot, statuses) {
         ...gateway,
         gateway_id: gateway.gateway_id || "sensair_s3_gateway_01",
         online: Boolean(gatewayStatus?.online ?? gateway.online),
+        status_source: "server",
         lastSeen,
         sta_connected: Boolean(gateway.sta_connected),
         softap_enabled: Boolean(gateway.softap_enabled ?? gateway.softap_ready),
@@ -919,20 +1139,31 @@ function adaptGatewayForOverview(snapshot, statuses) {
 }
 
 function adaptDeviceForOverview(device, statuses, modules) {
-    const status = statuses.find(item => item.device_id === device.device_id);
+    const serverStatus = statuses.find(item => item.device_id === device.device_id);
     const sensors = device.sensors || {};
     const voiceModule = modules.find(module => module.device_id === device.device_id && (module.module_type === "voice.turn" || module.module_type === "voice.prompt"));
-    const lastSeen = status?.last_seen_ms ?? integerOrNull(device.timestamp);
+    const childLastSeenMs = integerOrNull(device.child_last_seen_ms);
+    const lastSeenMs = integerOrNull(device.last_seen_ms);
+    const serverReceivedMs = integerOrNull(device.server_received_ms);
+    const online = Boolean(device.online);
 
     return {
         ...device,
         device_id: device.device_id,
-        device_type: status?.device_type || device.device_type || "C5",
-        room_id: status?.room_id || device.room_id || "",
-        room_name: status?.room_name || device.room_name || "",
-        online: Boolean(status?.online ?? device.online),
-        lastSeen,
-        last_seen_ms: lastSeen,
+        device_type: serverStatus?.device_type || device.device_type || "C5",
+        room_id: serverStatus?.room_id || device.room_id || "",
+        room_name: serverStatus?.room_name || device.room_name || "",
+        // S3 snapshot status wins over every cached server device_status field.
+        online,
+        status: device.status || (online ? "online" : "offline"),
+        status_source: "s3",
+        offline_reason: device.offline_reason ?? null,
+        link_lost: Boolean(device.link_lost),
+        voice_busy: Boolean(device.voice_busy),
+        child_last_seen_ms: childLastSeenMs,
+        server_received_ms: serverReceivedMs,
+        lastSeen: lastSeenMs,
+        last_seen_ms: lastSeenMs,
         air_quality_score: integerOrNull(sensors.air_quality_score),
         air_quality_level: sensors.air_quality_level || "unknown",
         temperature_c: numberValueOrNull(sensors.temperature ?? sensors.temperature_c),
@@ -997,6 +1228,40 @@ async function attachUnifiedOverview(dbAll, snapshot, query = {}) {
     return filteredSnapshot;
 }
 
+function attachRuntimeOverview(snapshot, query = {}) {
+    const deviceId = normalizeDashboardDeviceId(query.device_id);
+    const filteredSnapshot = filterSnapshotForQuery(snapshot, query, {
+        mergeCsi: false
+    });
+    const gatewayId = filteredSnapshot.gateway?.gateway_id || "sensair_s3_gateway_01";
+    const gatewayStatuses = [{
+        device_id: gatewayId,
+        online: Boolean(filteredSnapshot.gateway?.online),
+        last_seen_ms: filteredSnapshot.received_at_ms || Date.now()
+    }];
+
+    filteredSnapshot.gateway = adaptGatewayForOverview(filteredSnapshot, gatewayStatuses);
+    filteredSnapshot.modules = buildModuleSummary(filteredSnapshot, []);
+    filteredSnapshot.devices = filteredSnapshot.devices.map(device => adaptDeviceForOverview(device, [], []));
+    filteredSnapshot.csi = normalizeSnapshotCsi(filteredSnapshot.csi, filteredSnapshot.received_at_ms || Date.now(), {
+        availableDefault: Boolean(filteredSnapshot.csi?.available)
+    });
+    filteredSnapshot.home_summary = computeHomeSummary(filteredSnapshot.devices);
+    filteredSnapshot.alarms = Array.isArray(filteredSnapshot.alarms) ? filteredSnapshot.alarms : [];
+    filteredSnapshot.recent_commands = Array.isArray(filteredSnapshot.recent_commands) ? filteredSnapshot.recent_commands : [];
+    filteredSnapshot.recent_voice_events = Array.isArray(filteredSnapshot.recent_voice_events) ? filteredSnapshot.recent_voice_events : [];
+    filteredSnapshot.system_logs = Array.isArray(filteredSnapshot.system_logs) ? filteredSnapshot.system_logs : [];
+
+    if (deviceId) {
+        filteredSnapshot.recent_commands = filteredSnapshot.recent_commands.filter(item => !item.device_id || item.device_id === deviceId);
+        filteredSnapshot.recent_voice_events = filteredSnapshot.recent_voice_events.filter(item => !item.device_id || item.device_id === deviceId);
+        filteredSnapshot.system_logs = filteredSnapshot.system_logs.filter(item => !item.device_id || item.device_id === deviceId);
+        filteredSnapshot.alarms = filteredSnapshot.alarms.filter(item => !item.device_id || item.device_id === deviceId);
+    }
+
+    return filteredSnapshot;
+}
+
 function pickSensorDelay(row, deviceStatus, moduleStatus) {
     return {
         latest_upload_delay_ms: moduleStatus?.latest_upload_delay_ms ?? deviceStatus?.latest_upload_delay_ms ?? integerOrNull(row?.upload_delay_ms),
@@ -1017,7 +1282,7 @@ function mapDashboardSensor(row, deviceStatus = null, moduleStatus = null, optio
 
     return {
         id: row.id,
-        timestamp: integerOrNull(row.timestamp),
+        timestamp: integerOrNull(row.history_time_ms) ?? integerOrNull(row.timestamp),
         temperature: numberOrNull(row.temperature),
         humidity: numberOrNull(row.humidity),
         pressure: numberOrNull(row.pressure),
@@ -1095,11 +1360,11 @@ async function readDashboardSensorLatest(dbAll, query = {}) {
     });
 }
 
-async function readDashboardSensorHistory(dbAll, query = {}) {
+async function readDashboardSensorHistory(dbAll, query = {}, options = {}) {
     const deviceId = normalizeDashboardDeviceId(query.device_id);
-    const limitResult = readDashboardLimit(query.limit);
-    if (!limitResult.ok) {
-        return limitResult;
+    const historyQuery = options.historyQuery || readDashboardSensorHistoryQuery(query);
+    if (!historyQuery.ok) {
+        return historyQuery;
     }
 
     const params = [];
@@ -1108,16 +1373,43 @@ async function readDashboardSensorHistory(dbAll, query = {}) {
         where += " AND device_id=?";
         params.push(deviceId);
     }
-    params.push(limitResult.limit);
+    where += ` AND ${SENSOR_HISTORY_TIME_SQL} IS NOT NULL AND ${SENSOR_HISTORY_TIME_SQL} >= ? AND ${SENSOR_HISTORY_TIME_SQL} <= ?`;
+    params.push(historyQuery.from_ms, historyQuery.to_ms);
+
+    const countRows = await dbAll(
+        `SELECT COUNT(*) AS count FROM sensor_records ${where}`,
+        params
+    );
+    const totalCount = integerOrNull(rowFirst(countRows)?.count) || 0;
+    if (totalCount <= 0) {
+        return [];
+    }
+
+    let sampleStep = 1;
+    if (totalCount > DASHBOARD_HISTORY_MAX_LIMIT) {
+        sampleStep = Math.max(2, Math.floor((totalCount - 1) / Math.max(1, historyQuery.target_points - 1)));
+        const estimatedSampleCount = Math.ceil((totalCount - 1) / sampleStep) + 1;
+        if (estimatedSampleCount > DASHBOARD_HISTORY_MAX_LIMIT) {
+            sampleStep += 1;
+        }
+    }
 
     const rows = await dbAll(
-        `SELECT * FROM (
-            SELECT * FROM sensor_records
+        `WITH matched AS (
+            SELECT *, ${SENSOR_HISTORY_TIME_SQL} AS history_time_ms
+            FROM sensor_records
             ${where}
-            ORDER BY COALESCE(server_recv_ms, timestamp, id) DESC, id DESC
-            LIMIT ?
-        ) ORDER BY COALESCE(server_recv_ms, timestamp, id) ASC, id ASC`,
-        params
+        ),
+        numbered AS (
+            SELECT *,
+                ROW_NUMBER() OVER (ORDER BY history_time_ms ASC, id ASC) AS history_row_number
+            FROM matched
+        )
+        SELECT *
+        FROM numbered
+        WHERE (? = 1 OR ((history_row_number - 1) % ?) = 0 OR history_row_number = ?)
+        ORDER BY history_time_ms ASC, id ASC`,
+        [...params, sampleStep, sampleStep, totalCount]
     );
 
     return (rows || []).map(row => mapDashboardSensor(row, null, null, {
@@ -1210,7 +1502,15 @@ async function readDashboardModulesStatus(dbAll, query = {}) {
     };
 }
 
-async function readDashboardOverview(dbAll, query = {}) {
+async function readDashboardOverview(dbAll, query = {}, options = {}) {
+    const runtimeSnapshot = options.runtimeCache?.readDashboardOverviewSnapshot?.();
+    const logger = options.logger || console;
+    if (runtimeSnapshot) {
+        logger.info("[CACHE_HIT] path=/api/dashboard/v1/overview source=runtimeStateCache");
+        return attachRuntimeOverview(runtimeSnapshot, query);
+    }
+
+    logger.info("[CACHE_MISS] path=/api/dashboard/v1/overview source=runtimeStateCache fallback=sqlite");
     const restoredSnapshot = await readLatestDashboardSnapshot(dbAll);
     if (restoredSnapshot) {
         return attachUnifiedOverview(dbAll, restoredSnapshot, query);
@@ -1301,6 +1601,8 @@ module.exports = {
     ingestDashboardSnapshot,
     mapDashboardSensor,
     normalizeSnapshotCsi,
+    persistDashboardSnapshot,
+    prepareDashboardSnapshot,
     recordCsiMotion,
     readDashboardCsiHistory,
     readDashboardSnapshotHistory,
@@ -1311,6 +1613,7 @@ module.exports = {
     readDashboardLlmLatest,
     readDashboardModulesStatus,
     readDashboardOverview,
+    readDashboardSensorHistoryQuery,
     readDashboardSensorHistory,
     readDashboardSensorLatest,
     readDashboardTimeStatus

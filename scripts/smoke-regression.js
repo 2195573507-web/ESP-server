@@ -2748,6 +2748,8 @@ async function run() {
             limit: "5"
         }).toString();
 
+        const gatewaySnapshotUptimeMs = 600000;
+        const childLastSeenUptimeMs = 595500;
         const dashboardSnapshot = {
             schema_version: 2,
             payload_type: "gateway.dashboard_snapshot",
@@ -2760,7 +2762,7 @@ async function run() {
                 server_available: true,
                 voice_busy: false,
                 last_error: "",
-                timestamp: Date.now()
+                timestamp: gatewaySnapshotUptimeMs
             },
             devices: [{
                 device_id: bmeDeviceId,
@@ -2768,6 +2770,11 @@ async function run() {
                 name: "SensaiShuttle",
                 room_name: "living_room",
                 online: true,
+                status: "online",
+                offline_reason: null,
+                last_seen_ms: childLastSeenUptimeMs,
+                link_lost: false,
+                voice_busy: false,
                 wifi_rssi: -58,
                 timestamp: Date.now(),
                 sensors: {
@@ -2835,6 +2842,25 @@ async function run() {
         const persistedSnapshot = JSON.parse(persistedSnapshotRows[0].payload_json);
         assert.equal(persistedSnapshot.mock_persistence, "stripped");
         assert.deepEqual(persistedSnapshot.devices[0].appliances, {});
+        const projectedChildLastSeenMs = result.body.server_recv_ms -
+            (gatewaySnapshotUptimeMs - childLastSeenUptimeMs);
+        assert.equal(persistedSnapshot.devices[0].child_last_seen_ms, childLastSeenUptimeMs);
+        assert.equal(persistedSnapshot.devices[0].last_seen_ms, projectedChildLastSeenMs);
+
+        let s3StatusRows = await dbAll(dbPath, "SELECT * FROM device_status WHERE device_id=? LIMIT 1", [bmeDeviceId]);
+        assert.equal(s3StatusRows.length, 1);
+        assert.equal(s3StatusRows[0].status_source, "s3");
+        assert.equal(s3StatusRows[0].child_last_seen_ms, childLastSeenUptimeMs);
+        assert.equal(s3StatusRows[0].last_seen_ms, projectedChildLastSeenMs);
+        assert.equal(s3StatusRows[0].last_seen_iso, new Date(projectedChildLastSeenMs).toISOString());
+
+        result = await request(baseUrl, "GET", `/api/device/v1/status?${dashboardDeviceQuery}`);
+        assert.equal(result.body.status.status_source, "s3");
+        assert.equal(result.body.status.online, true);
+        assert.equal(result.body.status.child_last_seen_ms, childLastSeenUptimeMs);
+        assert.equal(result.body.status.last_seen_ms, projectedChildLastSeenMs);
+        assert.ok(result.body.status.last_seen_age_ms >= gatewaySnapshotUptimeMs - childLastSeenUptimeMs);
+        assert.ok(result.body.status.last_seen_age_ms < 10000);
 
         const dashboardEndpoints = [
             `/api/dashboard/v1/overview?${dashboardDeviceQuery}`,
@@ -2954,6 +2980,76 @@ async function run() {
         assert.equal(hasOwn(result.body, "status"), true);
         assertDashboardEnvelope(result.body, true);
         assert.ok(Array.isArray(result.body.data.devices));
+
+        const offlineGatewayUptimeMs = 610000;
+        const offlineChildLastSeenUptimeMs = 604000;
+        const offlineSnapshot = {
+            ...dashboardSnapshot,
+            gateway: {
+                ...dashboardSnapshot.gateway,
+                timestamp: offlineGatewayUptimeMs
+            },
+            devices: [{
+                ...dashboardSnapshot.devices[0],
+                online: false,
+                status: "offline",
+                offline_reason: "heartbeat_timeout",
+                last_seen_ms: offlineChildLastSeenUptimeMs
+            }],
+            home_summary: {
+                ...dashboardSnapshot.home_summary,
+                online_device_count: 0,
+                offline_device_count: 1
+            }
+        };
+        result = await request(baseUrl, "POST", "/api/device/v1/gateway-state", offlineSnapshot);
+        assert.equal(result.response.status, 202);
+        const offlineServerReceivedMs = result.body.server_recv_ms;
+        const offlineProjectedLastSeenMs = offlineServerReceivedMs -
+            (offlineGatewayUptimeMs - offlineChildLastSeenUptimeMs);
+
+        result = await request(baseUrl, "GET", `/api/device/v1/status?${dashboardDeviceQuery}`);
+        assert.equal(result.body.status.online, false);
+        assert.equal(result.body.status.status_source, "s3");
+        assert.equal(result.body.status.offline_reason, "heartbeat_timeout");
+        assert.equal(result.body.status.last_seen_ms, offlineProjectedLastSeenMs);
+
+        result = await request(baseUrl, "POST", "/api/device/v1/ingest", {
+            ...bmeEnvelope,
+            request_seq: 106,
+            firmware_version: "0.2.0-s3-authority",
+            esp_uptime_ms: 1234567,
+            esp_time_ms: Date.now() - 50,
+            time_synced: true
+        });
+        assert.equal(result.response.status, 201);
+        const telemetryServerRecvMs = result.body.server_recv_ms;
+
+        result = await request(baseUrl, "GET", `/api/device/v1/status?${dashboardDeviceQuery}`);
+        assert.equal(result.body.status.online, false);
+        assert.equal(result.body.status.status_source, "s3");
+        assert.equal(result.body.status.offline_reason, "heartbeat_timeout");
+        assert.equal(result.body.status.last_seen_ms, offlineProjectedLastSeenMs);
+        assert.equal(result.body.status.firmware_version, "0.2.0-s3-authority");
+        assert.equal(result.body.status.last_esp_uptime_ms, 1234567);
+        assert.equal(result.body.status.last_server_recv_ms, telemetryServerRecvMs);
+        assert.equal(result.body.status.last_payload_type, "sensor.bme690");
+        assert.ok(result.body.status.delay_sample_count >= 2);
+
+        s3StatusRows = await dbAll(dbPath, "SELECT * FROM device_status WHERE device_id=? LIMIT 1", [bmeDeviceId]);
+        assert.equal(s3StatusRows[0].online, 0);
+        assert.equal(s3StatusRows[0].status_source, "s3");
+        assert.equal(s3StatusRows[0].child_status, "offline");
+        assert.equal(s3StatusRows[0].child_last_seen_ms, offlineChildLastSeenUptimeMs);
+        assert.equal(s3StatusRows[0].last_seen_ms, offlineProjectedLastSeenMs);
+        assert.equal(s3StatusRows[0].last_seen_iso, new Date(offlineProjectedLastSeenMs).toISOString());
+        assert.equal(s3StatusRows[0].server_received_ms, offlineServerReceivedMs);
+        assert.equal(s3StatusRows[0].link_lost, 0);
+        assert.equal(s3StatusRows[0].voice_busy, 0);
+        assert.equal(s3StatusRows[0].firmware_version, "0.2.0-s3-authority");
+        assert.equal(s3StatusRows[0].last_esp_uptime_ms, 1234567);
+        assert.equal(s3StatusRows[0].time_synced, 1);
+        assert.ok(s3StatusRows[0].delay_sample_count >= 2);
 
         result = await request(baseUrl, "GET", "/api/not-found-for-smoke");
         assert.equal(result.response.status, 404);

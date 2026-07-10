@@ -5,7 +5,8 @@ const {
     readDeviceStatuses,
     readDeviceStatus,
     readModuleStatuses,
-    refreshDeviceActivity
+    refreshDeviceActivity,
+    updateChildStatusFromGatewaySnapshot
 } = require("./deviceStatusService");
 const {
     readDeviceMetadata,
@@ -28,6 +29,7 @@ const DASHBOARD_HISTORY_MAX_LIMIT = 500;
 const DASHBOARD_SNAPSHOT_PAYLOAD_TYPE = "gateway.dashboard_snapshot";
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
 const CSI_STATES = new Set(["IDLE", "MOTION", "HOLD"]);
+const MIN_PLAUSIBLE_UNIX_MS = Date.UTC(2000, 0, 1);
 const DASHBOARD_DEVICE_ID_ALIASES = Object.freeze({
     S3: "sensair_s3_gateway_01",
     s3: "sensair_s3_gateway_01",
@@ -218,6 +220,24 @@ function normalizeSnapshotGateway(gateway, serverRecvMs) {
     };
 }
 
+function projectChildLastSeenMs(childLastSeenMs, gatewayTimestampMs, serverRecvMs) {
+    const childTimestamp = integerOrNull(childLastSeenMs);
+    if (childTimestamp === null) {
+        return null;
+    }
+    if (childTimestamp >= MIN_PLAUSIBLE_UNIX_MS) {
+        return childTimestamp;
+    }
+
+    const gatewayTimestamp = integerOrNull(gatewayTimestampMs);
+    if (gatewayTimestamp === null || gatewayTimestamp >= MIN_PLAUSIBLE_UNIX_MS) {
+        return serverRecvMs;
+    }
+
+    const ageMs = Math.max(0, gatewayTimestamp - childTimestamp);
+    return Math.max(0, serverRecvMs - ageMs);
+}
+
 function applyTrustedGatewayId(snapshot, trustedGatewayId) {
     const gatewayId = trimText(trustedGatewayId, 128);
     if (!gatewayId || !snapshot?.gateway) {
@@ -291,7 +311,7 @@ function normalizeSnapshotCsi(csi, serverRecvMs, options = {}) {
     };
 }
 
-function normalizeSnapshotDevice(device, serverRecvMs) {
+function normalizeSnapshotDevice(device, serverRecvMs, gatewayTimestampMs) {
     if (!isPlainObject(device)) {
         return null;
     }
@@ -304,6 +324,10 @@ function normalizeSnapshotDevice(device, serverRecvMs) {
         return null;
     }
 
+    const online = booleanValue(device.online, false);
+    const childLastSeenMs = integerOrNull(device.child_last_seen_ms ?? device.last_seen_ms);
+    const lastSeenMs = projectChildLastSeenMs(childLastSeenMs, gatewayTimestampMs, serverRecvMs);
+
     return {
         device_id: deviceId,
         local_id: integerOrNull(device.local_id),
@@ -311,7 +335,18 @@ function normalizeSnapshotDevice(device, serverRecvMs) {
         name: trimText(device.name || device.alias, 128),
         room_id: trimText(device.room_id, 128),
         room_name: trimText(device.room_name || device.room_id || "unassigned", 128),
-        online: booleanValue(device.online, false),
+        // C5 online state is decided by ESPS3 child_registry. Preserve it verbatim;
+        // the server must not infer it from receipt, network, or upload health.
+        online,
+        status: trimText(device.status, 40) || (online ? "online" : "offline"),
+        offline_reason: trimText(device.offline_reason, 128) || null,
+        link_lost: booleanValue(device.link_lost, false),
+        voice_busy: booleanValue(device.voice_busy, false),
+        child_last_seen_ms: childLastSeenMs,
+        server_received_ms: serverRecvMs,
+        // Public status timestamps stay in Server epoch time. child_last_seen_ms
+        // retains the raw S3 monotonic clock for diagnostics.
+        last_seen_ms: lastSeenMs,
         wifi_rssi: integerOrNull(device.wifi_rssi),
         timestamp: integerOrNull(device.timestamp) || serverRecvMs,
         sensors: normalizeSnapshotSensors(device.sensors),
@@ -478,8 +513,9 @@ function normalizeGatewaySnapshot(body, serverRecvMs = Date.now()) {
         };
     }
 
+    const gateway = normalizeSnapshotGateway(body.gateway, serverRecvMs);
     const devices = (Array.isArray(body.devices) ? body.devices : [])
-        .map(device => normalizeSnapshotDevice(device, serverRecvMs))
+        .map(device => normalizeSnapshotDevice(device, serverRecvMs, gateway.timestamp))
         .filter(Boolean);
     const history = (Array.isArray(body.history) ? body.history : [])
         .map(item => normalizeSnapshotHistoryItem(item, serverRecvMs))
@@ -494,7 +530,7 @@ function normalizeGatewaySnapshot(body, serverRecvMs = Date.now()) {
     return {
         ok: true,
         snapshot: {
-            gateway: normalizeSnapshotGateway(body.gateway, serverRecvMs),
+            gateway,
             devices,
             home_summary: normalizeHomeSummary(body.home_summary, devices),
             csi: normalizeSnapshotCsi(body.csi, serverRecvMs, {
@@ -675,6 +711,9 @@ async function ingestDashboardSnapshot(body, options = {}) {
     const gatewayId = latestDashboardSnapshot.gateway.gateway_id;
     const snapshotId = makeSnapshotId(gatewayId, serverRecvMs);
 
+    console.info(`[dashboard_snapshot] gateway_status_source=server gateway_id=${gatewayId}`);
+    console.info(`[dashboard_snapshot] child_status_source=s3 child_count=${latestDashboardSnapshot.devices.length}`);
+
     if (typeof dbRun === "function") {
         await dbRun(
             `INSERT INTO dashboard_snapshots
@@ -708,20 +747,12 @@ async function ingestDashboardSnapshot(body, options = {}) {
         await refreshDeviceActivity(dbRun, dbAll, gatewayMetadata, DASHBOARD_SNAPSHOT_PAYLOAD_TYPE);
 
         for (const device of latestDashboardSnapshot.devices) {
-            const metadata = readDeviceMetadata({
-                body: {
-                    device_id: device.device_id,
-                    device_type: device.device_type || "C5",
-                    room_id: device.room_id,
-                    room_name: device.room_name,
-                    payload_type: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
-                    timestamp: device.timestamp
-                },
-                headers: options.headers,
+            // C5 status is stored exactly as S3 reported it; never infer it from
+            // this server receiving a dashboard snapshot.
+            await updateChildStatusFromGatewaySnapshot(dbRun, dbAll, device, {
                 payloadType: DASHBOARD_SNAPSHOT_PAYLOAD_TYPE,
-                serverRecvMs
+                serverReceivedMs: serverRecvMs
             });
-            await refreshDeviceActivity(dbRun, dbAll, metadata, DASHBOARD_SNAPSHOT_PAYLOAD_TYPE);
         }
 
         await recordEvent(dbRun, {
@@ -808,6 +839,13 @@ function mapDashboardDeviceStatus(status, fallbackDeviceId = "") {
         device_id: status?.device_id || fallbackDeviceId || null,
         online: Boolean(status?.online),
         device_online: Boolean(status?.device_online),
+        status: textOrNull(status?.status),
+        status_source: textOrNull(status?.status_source),
+        offline_reason: textOrNull(status?.offline_reason),
+        link_lost: Boolean(status?.link_lost),
+        voice_busy: Boolean(status?.voice_busy),
+        child_last_seen_ms: status?.child_last_seen_ms ?? null,
+        server_received_ms: status?.server_received_ms ?? null,
         last_seen_ms: status?.last_seen_ms ?? null,
         last_seen_iso: textOrNull(status?.last_seen_iso),
         last_seen_age_ms: status?.last_seen_age_ms ?? null,
@@ -908,6 +946,7 @@ function adaptGatewayForOverview(snapshot, statuses) {
         ...gateway,
         gateway_id: gateway.gateway_id || "sensair_s3_gateway_01",
         online: Boolean(gatewayStatus?.online ?? gateway.online),
+        status_source: "server",
         lastSeen,
         sta_connected: Boolean(gateway.sta_connected),
         softap_enabled: Boolean(gateway.softap_enabled ?? gateway.softap_ready),
@@ -919,20 +958,31 @@ function adaptGatewayForOverview(snapshot, statuses) {
 }
 
 function adaptDeviceForOverview(device, statuses, modules) {
-    const status = statuses.find(item => item.device_id === device.device_id);
+    const serverStatus = statuses.find(item => item.device_id === device.device_id);
     const sensors = device.sensors || {};
     const voiceModule = modules.find(module => module.device_id === device.device_id && (module.module_type === "voice.turn" || module.module_type === "voice.prompt"));
-    const lastSeen = status?.last_seen_ms ?? integerOrNull(device.timestamp);
+    const childLastSeenMs = integerOrNull(device.child_last_seen_ms);
+    const lastSeenMs = integerOrNull(device.last_seen_ms);
+    const serverReceivedMs = integerOrNull(device.server_received_ms);
+    const online = Boolean(device.online);
 
     return {
         ...device,
         device_id: device.device_id,
-        device_type: status?.device_type || device.device_type || "C5",
-        room_id: status?.room_id || device.room_id || "",
-        room_name: status?.room_name || device.room_name || "",
-        online: Boolean(status?.online ?? device.online),
-        lastSeen,
-        last_seen_ms: lastSeen,
+        device_type: serverStatus?.device_type || device.device_type || "C5",
+        room_id: serverStatus?.room_id || device.room_id || "",
+        room_name: serverStatus?.room_name || device.room_name || "",
+        // S3 snapshot status wins over every cached server device_status field.
+        online,
+        status: device.status || (online ? "online" : "offline"),
+        status_source: "s3",
+        offline_reason: device.offline_reason ?? null,
+        link_lost: Boolean(device.link_lost),
+        voice_busy: Boolean(device.voice_busy),
+        child_last_seen_ms: childLastSeenMs,
+        server_received_ms: serverReceivedMs,
+        lastSeen: lastSeenMs,
+        last_seen_ms: lastSeenMs,
         air_quality_score: integerOrNull(sensors.air_quality_score),
         air_quality_level: sensors.air_quality_level || "unknown",
         temperature_c: numberValueOrNull(sensors.temperature ?? sensors.temperature_c),

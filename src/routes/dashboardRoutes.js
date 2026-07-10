@@ -7,6 +7,7 @@ const {
     readDashboardLlmLatest,
     readDashboardModulesStatus,
     readDashboardOverview,
+    readDashboardSensorHistoryQuery,
     readDashboardSnapshotHistory,
     readDashboardSensorHistory,
     readDashboardSensorLatest,
@@ -147,13 +148,15 @@ function createDashboardRouter(options) {
     ));
 
     router.get("/sensors/history", async (req, res) => {
-        const limit = readDashboardLimit(req.query.limit);
-        if (!limit.ok) {
-            return sendDashboardError(res, 400, limit.code, limit.message);
+        const historyQuery = readDashboardSensorHistoryQuery(req.query);
+        if (!historyQuery.ok) {
+            return sendDashboardError(res, 400, historyQuery.code, historyQuery.message);
         }
 
         try {
-            const data = await readDashboardSensorHistory(dbAll, req.query);
+            const data = await readDashboardSensorHistory(dbAll, req.query, {
+                historyQuery
+            });
             return res.json(dashboardEnvelope(data));
         } catch (error) {
             logger.error(`[dashboard-v1] DASHBOARD_SENSOR_HISTORY_READ_FAILED ${error?.message || error}`);
@@ -177,15 +180,17 @@ function createDashboardRouter(options) {
     });
 
     router.get("/devices/:device_id/history", async (req, res) => {
-        const limit = readDashboardLimit(req.query.limit);
-        if (!limit.ok) {
-            return sendDashboardError(res, 400, limit.code, limit.message);
+        const historyQuery = readDashboardSensorHistoryQuery(req.query);
+        if (!historyQuery.ok) {
+            return sendDashboardError(res, 400, historyQuery.code, historyQuery.message);
         }
 
         try {
             const data = await readDashboardSensorHistory(dbAll, {
                 ...req.query,
                 device_id: req.params.device_id
+            }, {
+                historyQuery
             });
             return res.json(dashboardEnvelope(data));
         } catch (error) {

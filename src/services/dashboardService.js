@@ -26,6 +26,17 @@ const {
 
 const DASHBOARD_HISTORY_DEFAULT_LIMIT = 50;
 const DASHBOARD_HISTORY_MAX_LIMIT = 500;
+const DASHBOARD_SENSOR_HISTORY_DEFAULT_TARGET_POINTS = 300;
+const DASHBOARD_SENSOR_HISTORY_MIN_TARGET_POINTS = 100;
+const DASHBOARD_SENSOR_HISTORY_DEFAULT_RANGE = "7d";
+const DASHBOARD_SENSOR_HISTORY_RANGE_MS = Object.freeze({
+    "5m": 5 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+    "24h": 24 * 60 * 60 * 1000,
+    "7d": 7 * 24 * 60 * 60 * 1000
+});
+const DASHBOARD_SENSOR_HISTORY_MAX_SPAN_MS = DASHBOARD_SENSOR_HISTORY_RANGE_MS["7d"];
+const SENSOR_HISTORY_TIME_SQL = "COALESCE(NULLIF(server_recv_ms, 0), NULLIF(timestamp, 0))";
 const DASHBOARD_SNAPSHOT_PAYLOAD_TYPE = "gateway.dashboard_snapshot";
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
 const CSI_STATES = new Set(["IDLE", "MOTION", "HOLD"]);
@@ -96,6 +107,136 @@ function readDashboardLimit(value) {
     return {
         ok: true,
         limit: Math.min(numeric, DASHBOARD_HISTORY_MAX_LIMIT)
+    };
+}
+
+function queryText(value) {
+    const raw = Array.isArray(value) ? value[0] : value;
+    if (raw === undefined || raw === null) {
+        return "";
+    }
+
+    return String(raw).trim();
+}
+
+function hasQueryValue(query = {}, key) {
+    return queryText(query[key]) !== "";
+}
+
+function parseEpochMsParam(query = {}, key) {
+    const text = queryText(query[key]);
+    if (!/^\d+$/.test(text)) {
+        return {
+            ok: false,
+            code: "DASHBOARD_BAD_TIME_RANGE",
+            message: `${key} must be unix epoch milliseconds`
+        };
+    }
+
+    const value = Number.parseInt(text, 10);
+    if (!Number.isSafeInteger(value) || value < 0) {
+        return {
+            ok: false,
+            code: "DASHBOARD_BAD_TIME_RANGE",
+            message: `${key} must be unix epoch milliseconds`
+        };
+    }
+
+    return {
+        ok: true,
+        value
+    };
+}
+
+function sensorHistoryTargetPoints(limitValue) {
+    const limitResult = readDashboardLimit(limitValue);
+    if (!limitResult.ok) {
+        return limitResult;
+    }
+
+    if (queryText(limitValue) === "") {
+        return {
+            ok: true,
+            limit: DASHBOARD_SENSOR_HISTORY_DEFAULT_TARGET_POINTS
+        };
+    }
+
+    return {
+        ok: true,
+        limit: Math.max(DASHBOARD_SENSOR_HISTORY_MIN_TARGET_POINTS, limitResult.limit)
+    };
+}
+
+function readDashboardSensorHistoryQuery(query = {}, nowMs = Date.now()) {
+    const targetResult = sensorHistoryTargetPoints(query.limit);
+    if (!targetResult.ok) {
+        return targetResult;
+    }
+
+    const hasFrom = hasQueryValue(query, "from_ms");
+    const hasTo = hasQueryValue(query, "to_ms");
+    let range = queryText(query.range) || DASHBOARD_SENSOR_HISTORY_DEFAULT_RANGE;
+    let fromMs;
+    let toMs;
+
+    if (hasFrom || hasTo) {
+        if (!hasFrom || !hasTo) {
+            return {
+                ok: false,
+                code: "DASHBOARD_BAD_TIME_RANGE",
+                message: "from_ms and to_ms must be provided together"
+            };
+        }
+
+        const parsedFrom = parseEpochMsParam(query, "from_ms");
+        if (!parsedFrom.ok) {
+            return parsedFrom;
+        }
+        const parsedTo = parseEpochMsParam(query, "to_ms");
+        if (!parsedTo.ok) {
+            return parsedTo;
+        }
+
+        fromMs = parsedFrom.value;
+        toMs = parsedTo.value;
+        range = null;
+    } else {
+        if (!Object.prototype.hasOwnProperty.call(DASHBOARD_SENSOR_HISTORY_RANGE_MS, range)) {
+            return {
+                ok: false,
+                code: "DASHBOARD_BAD_RANGE",
+                message: "range must be one of 5m, 1h, 24h, 7d"
+            };
+        }
+
+        toMs = nowMs;
+        fromMs = toMs - DASHBOARD_SENSOR_HISTORY_RANGE_MS[range];
+    }
+
+    if (fromMs > toMs) {
+        return {
+            ok: false,
+            code: "DASHBOARD_BAD_TIME_RANGE",
+            message: "from_ms must be less than or equal to to_ms"
+        };
+    }
+
+    const spanMs = toMs - fromMs;
+    if (spanMs <= 0 || spanMs > DASHBOARD_SENSOR_HISTORY_MAX_SPAN_MS) {
+        return {
+            ok: false,
+            code: "DASHBOARD_BAD_TIME_RANGE",
+            message: "time span must be greater than 0 and no more than 7d"
+        };
+    }
+
+    return {
+        ok: true,
+        range,
+        from_ms: fromMs,
+        to_ms: toMs,
+        span_ms: spanMs,
+        target_points: targetResult.limit
     };
 }
 
@@ -1141,7 +1282,7 @@ function mapDashboardSensor(row, deviceStatus = null, moduleStatus = null, optio
 
     return {
         id: row.id,
-        timestamp: integerOrNull(row.timestamp),
+        timestamp: integerOrNull(row.history_time_ms) ?? integerOrNull(row.timestamp),
         temperature: numberOrNull(row.temperature),
         humidity: numberOrNull(row.humidity),
         pressure: numberOrNull(row.pressure),
@@ -1219,11 +1360,11 @@ async function readDashboardSensorLatest(dbAll, query = {}) {
     });
 }
 
-async function readDashboardSensorHistory(dbAll, query = {}) {
+async function readDashboardSensorHistory(dbAll, query = {}, options = {}) {
     const deviceId = normalizeDashboardDeviceId(query.device_id);
-    const limitResult = readDashboardLimit(query.limit);
-    if (!limitResult.ok) {
-        return limitResult;
+    const historyQuery = options.historyQuery || readDashboardSensorHistoryQuery(query);
+    if (!historyQuery.ok) {
+        return historyQuery;
     }
 
     const params = [];
@@ -1232,16 +1373,43 @@ async function readDashboardSensorHistory(dbAll, query = {}) {
         where += " AND device_id=?";
         params.push(deviceId);
     }
-    params.push(limitResult.limit);
+    where += ` AND ${SENSOR_HISTORY_TIME_SQL} IS NOT NULL AND ${SENSOR_HISTORY_TIME_SQL} >= ? AND ${SENSOR_HISTORY_TIME_SQL} <= ?`;
+    params.push(historyQuery.from_ms, historyQuery.to_ms);
+
+    const countRows = await dbAll(
+        `SELECT COUNT(*) AS count FROM sensor_records ${where}`,
+        params
+    );
+    const totalCount = integerOrNull(rowFirst(countRows)?.count) || 0;
+    if (totalCount <= 0) {
+        return [];
+    }
+
+    let sampleStep = 1;
+    if (totalCount > DASHBOARD_HISTORY_MAX_LIMIT) {
+        sampleStep = Math.max(2, Math.floor((totalCount - 1) / Math.max(1, historyQuery.target_points - 1)));
+        const estimatedSampleCount = Math.ceil((totalCount - 1) / sampleStep) + 1;
+        if (estimatedSampleCount > DASHBOARD_HISTORY_MAX_LIMIT) {
+            sampleStep += 1;
+        }
+    }
 
     const rows = await dbAll(
-        `SELECT * FROM (
-            SELECT * FROM sensor_records
+        `WITH matched AS (
+            SELECT *, ${SENSOR_HISTORY_TIME_SQL} AS history_time_ms
+            FROM sensor_records
             ${where}
-            ORDER BY COALESCE(server_recv_ms, timestamp, id) DESC, id DESC
-            LIMIT ?
-        ) ORDER BY COALESCE(server_recv_ms, timestamp, id) ASC, id ASC`,
-        params
+        ),
+        numbered AS (
+            SELECT *,
+                ROW_NUMBER() OVER (ORDER BY history_time_ms ASC, id ASC) AS history_row_number
+            FROM matched
+        )
+        SELECT *
+        FROM numbered
+        WHERE (? = 1 OR ((history_row_number - 1) % ?) = 0 OR history_row_number = ?)
+        ORDER BY history_time_ms ASC, id ASC`,
+        [...params, sampleStep, sampleStep, totalCount]
     );
 
     return (rows || []).map(row => mapDashboardSensor(row, null, null, {
@@ -1445,6 +1613,7 @@ module.exports = {
     readDashboardLlmLatest,
     readDashboardModulesStatus,
     readDashboardOverview,
+    readDashboardSensorHistoryQuery,
     readDashboardSensorHistory,
     readDashboardSensorLatest,
     readDashboardTimeStatus

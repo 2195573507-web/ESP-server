@@ -781,7 +781,8 @@ svg {
 
 .s3-status-grid {
     grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 12px;
+    width: 100%;
+    gap: 18px;
 }
 
 .s3-status-tile,
@@ -934,10 +935,27 @@ svg {
     gap: 18px;
 }
 
-.s3-sensor-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+.s3-device-card {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     align-items: stretch;
-    gap: 10px;
+    width: 100%;
+    gap: 16px;
+}
+
+.s3-device-card > .panel-header {
+    grid-column: 1 / -1;
+    margin-bottom: 0;
+}
+
+.s3-device-card > .s3-sensor-grid {
+    display: contents;
+}
+
+.s3-sensor-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: stretch;
+    gap: 16px;
 }
 
 .s3-sensor-metric {
@@ -946,6 +964,11 @@ svg {
     gap: 8px;
     min-height: 76px;
     padding: 13px;
+}
+
+.s3-device-card .s3-sensor-metric {
+    height: 100%;
+    text-align: left;
 }
 
 .s3-sensor-metric strong {
@@ -2738,6 +2761,10 @@ body[data-theme="light"] .command-modal {
     .s3-health-bar {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+
+    .s3-status-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
 }
 
 @media (max-width: 767px) {
@@ -2824,7 +2851,6 @@ body[data-theme="light"] .command-modal {
         grid-template-columns: 1fr;
     }
 
-    .s3-status-grid,
     .s3-summary-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
@@ -3022,6 +3048,14 @@ body[data-theme="light"] .command-modal {
     .s3-activity-grid {
         grid-template-columns: 1fr;
         gap: 12px;
+    }
+
+    .s3-status-grid {
+        gap: 16px;
+    }
+
+    .s3-device-card {
+        grid-template-columns: 1fr;
     }
 
     .s3-module-row {

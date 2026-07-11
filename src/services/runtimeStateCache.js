@@ -105,7 +105,8 @@ function sensorFromBmePrepared(prepared) {
         air_quality_score: airQuality.air_quality_score,
         air_quality_level: airQuality.air_quality_level,
         air_quality_confidence: airQuality.air_quality_confidence,
-        air_quality_source: airQuality.air_quality_source
+        air_quality_source: airQuality.air_quality_source,
+        air_quality: cloneJson(airQuality)
     };
 }
 

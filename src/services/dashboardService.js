@@ -380,14 +380,26 @@ function normalizeSnapshotSensors(sensors) {
         return null;
     }
 
+    const suppliedAirQuality = isPlainObject(sensors.air_quality)
+        ? cloneJson(sensors.air_quality)
+        : null;
+    const score = integerOrNull(sensors.air_quality_score ?? suppliedAirQuality?.air_quality_score ?? suppliedAirQuality?.score);
+    const level = trimText(sensors.air_quality_level ?? suppliedAirQuality?.air_quality_level ?? suppliedAirQuality?.level, 40) || "unknown";
+    const confidence = trimText(sensors.air_quality_confidence ?? suppliedAirQuality?.air_quality_confidence ?? suppliedAirQuality?.confidence, 40);
+    const source = trimText(sensors.air_quality_source ?? suppliedAirQuality?.air_quality_source ?? suppliedAirQuality?.source, 40) || "s3_mapped";
+
     return {
         temperature: numberValueOrNull(sensors.temperature ?? sensors.temperature_c),
         humidity: numberValueOrNull(sensors.humidity ?? sensors.humidity_percent),
         pressure: numberValueOrNull(sensors.pressure ?? sensors.pressure_hpa),
         gas_resistance: numberValueOrNull(sensors.gas_resistance ?? sensors.gas_resistance_ohm),
-        air_quality_score: integerOrNull(sensors.air_quality_score),
-        air_quality_level: trimText(sensors.air_quality_level, 40) || "unknown",
-        air_quality_source: trimText(sensors.air_quality_source, 40) || "s3_mapped"
+        air_quality_score: score,
+        air_quality_level: level,
+        air_quality_confidence: confidence,
+        air_quality_source: source,
+        ...(suppliedAirQuality ? {
+            air_quality: suppliedAirQuality
+        } : {})
     };
 }
 
@@ -1016,23 +1028,35 @@ async function ingestDashboardSnapshot(body, options = {}) {
 }
 
 function readAirQuality(row) {
-    const parsed = parseJsonObject(row?.air_quality_json, {});
-    const score = row?.air_quality_score ?? parsed.air_quality_score ?? null;
-    const level = row?.air_quality_level || parsed.air_quality_level || null;
-    const confidence = row?.air_quality_confidence || parsed.air_quality_confidence || null;
-    const source = row?.air_quality_source || parsed.air_quality_source || null;
+    const parsed = parseJsonObject(row?.air_quality_json, null);
+    const airQuality = isPlainObject(parsed) ? cloneJson(parsed) : null;
+    const score = row?.air_quality_score ?? airQuality?.air_quality_score ?? airQuality?.score ?? null;
+    const level = row?.air_quality_level || airQuality?.air_quality_level || airQuality?.level || null;
+    const confidence = row?.air_quality_confidence || airQuality?.air_quality_confidence || airQuality?.confidence || null;
+    const source = row?.air_quality_source || airQuality?.air_quality_source || airQuality?.source || null;
+    const algorithm = textOrNull(airQuality?.algorithm || row?.air_quality_algo_version);
+    const gasRatio = numberValueOrNull(row?.gas_ratio ?? airQuality?.gas_ratio);
+    const stabilityScore = numberValueOrNull(airQuality?.stability_score);
+    const sensorState = textOrNull(airQuality?.sensor_state);
+    const baselineReady = airQuality?.baseline_ready === undefined
+        ? null
+        : booleanValue(airQuality.baseline_ready, null);
 
     return {
-        air_quality: {
-            air_quality_score: score,
-            air_quality_level: level,
-            air_quality_confidence: confidence,
-            air_quality_source: source
-        },
+        air_quality: airQuality,
         air_quality_score: score,
         air_quality_level: level,
         air_quality_confidence: confidence,
-        air_quality_source: source
+        air_quality_source: source,
+        score,
+        level,
+        confidence,
+        source,
+        algorithm,
+        gas_ratio: gasRatio,
+        stability_score: stabilityScore,
+        sensor_state: sensorState,
+        baseline_ready: baselineReady
     };
 }
 
@@ -1187,6 +1211,8 @@ function adaptDeviceForOverview(device, statuses, modules) {
         last_seen_ms: lastSeenMs,
         air_quality_score: integerOrNull(sensors.air_quality_score),
         air_quality_level: sensors.air_quality_level || "unknown",
+        air_quality_confidence: sensors.air_quality_confidence || null,
+        air_quality: isPlainObject(sensors.air_quality) ? cloneJson(sensors.air_quality) : null,
         temperature_c: numberValueOrNull(sensors.temperature ?? sensors.temperature_c),
         humidity_percent: numberValueOrNull(sensors.humidity ?? sensors.humidity_percent),
         pressure_hpa: numberValueOrNull(sensors.pressure ?? sensors.pressure_hpa),
@@ -1568,7 +1594,9 @@ async function readDashboardOverview(dbAll, query = {}, options = {}) {
             gas_resistance: sensorLatest.gas_resistance,
             air_quality_score: sensorLatest.air_quality_score,
             air_quality_level: sensorLatest.air_quality_level,
-            air_quality_source: sensorLatest.air_quality_source
+            air_quality_confidence: sensorLatest.air_quality_confidence,
+            air_quality_source: sensorLatest.air_quality_source,
+            air_quality: sensorLatest.air_quality
         } : null,
         csi: normalizeSnapshotCsi(null, Date.now(), {
             availableDefault: false

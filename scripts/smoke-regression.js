@@ -58,8 +58,12 @@ const {
     resolveDeviceId
 } = require("../src/services/deviceIdResolver");
 const {
-    prepareDashboardSnapshot
+    prepareDashboardSnapshot,
+    readDashboardOverview
 } = require("../src/services/dashboardService");
+const {
+    prepareBme690Ingest
+} = require("../src/services/sensorBme690Service");
 const runtimeStateCache = require("../src/services/runtimeStateCache");
 
 const SERVER_START_TIMEOUT_MS = 15000;
@@ -925,10 +929,72 @@ function assertDeviceIdResolution() {
     runtimeStateCache.resetRuntimeStateCache();
 }
 
+async function assertAirQualityV3RuntimeFlow() {
+    const v3AirQuality = {
+        algorithm: "c5_bme690_air_quality_v3",
+        score: 84,
+        level: "good",
+        confidence: "high",
+        gas_ratio: 1.19,
+        stability_score: 93,
+        sensor_state: "stable",
+        baseline_ready: true,
+        future_v3_extension: "preserved"
+    };
+    const prepared = prepareBme690Ingest({
+        schema_version: 1,
+        device_id: "v3-runtime-device",
+        payload_type: "sensor.bme690",
+        payload: {
+            sensor_id: "bme690_01",
+            temperature_c: 25,
+            humidity_percent: 50,
+            pressure_hpa: 1012,
+            gas_resistance_ohm: 42000,
+            air_quality: v3AirQuality
+        }
+    }, {
+        serverRecvMs: 1700000000000,
+        logger: {
+            log: () => {},
+            warn: () => {}
+        }
+    });
+
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.airQuality.future_v3_extension, "preserved");
+    assert.equal(prepared.airQuality.air_quality_score, 84);
+
+    runtimeStateCache.resetRuntimeStateCache();
+    runtimeStateCache.updateBmeSensor(prepared, {
+        serverRecvMs: 1700000000000
+    });
+    const cached = runtimeStateCache.readDashboardOverviewSnapshot();
+    assert.deepEqual(cached.devices[0].sensors.air_quality, prepared.airQuality);
+    assert.equal(cached.devices[0].sensors.air_quality_score, 84);
+    assert.equal(cached.devices[0].sensors.air_quality_level, "good");
+    assert.equal(cached.devices[0].sensors.air_quality_confidence, "high");
+
+    const overview = await readDashboardOverview(async () => [], {}, {
+        runtimeCache: runtimeStateCache,
+        logger: {
+            info: () => {}
+        }
+    });
+    const device = overview.devices[0];
+    assert.equal(device.air_quality_score, 84);
+    assert.equal(device.air_quality_level, "good");
+    assert.equal(device.air_quality_confidence, "high");
+    assert.deepEqual(device.sensors.air_quality, prepared.airQuality);
+    assert.equal(device.air_quality.future_v3_extension, "preserved");
+    runtimeStateCache.resetRuntimeStateCache();
+}
+
 async function run() {
     assertTtsJsonPcmNormalization();
     assertLlmMetadataBounds();
     assertDeviceIdResolution();
+    await assertAirQualityV3RuntimeFlow();
     await assertUpsertRetryAfterInsertConflict();
     await assertPendingDispatchSkipsLostClaim();
     await assertDuplicateKeyUpserts();
@@ -3010,7 +3076,19 @@ async function run() {
                     gas_resistance: 35164,
                     air_quality_score: 72,
                     air_quality_level: "moderate",
-                    air_quality_source: "s3_mapped"
+                    air_quality_confidence: "low",
+                    air_quality_source: "s3_mapped",
+                    air_quality: {
+                        algorithm: "c5_bme690_air_quality_v3",
+                        score: 72,
+                        level: "moderate",
+                        confidence: "low",
+                        gas_ratio: 0.43,
+                        stability_score: 61,
+                        sensor_state: "warming",
+                        baseline_ready: false,
+                        future_v3_extension: "snapshot-preserved"
+                    }
                 },
                 appliances: {
                     air_conditioner: {
@@ -3072,6 +3150,20 @@ async function run() {
             (gatewaySnapshotUptimeMs - childLastSeenUptimeMs);
         assert.equal(persistedSnapshot.devices[0].child_last_seen_ms, childLastSeenUptimeMs);
         assert.equal(persistedSnapshot.devices[0].last_seen_ms, projectedChildLastSeenMs);
+        assert.equal(persistedSnapshot.devices[0].sensors.air_quality_score, 72);
+        assert.equal(persistedSnapshot.devices[0].sensors.air_quality_level, "moderate");
+        assert.equal(persistedSnapshot.devices[0].sensors.air_quality_confidence, "low");
+        assert.deepEqual(persistedSnapshot.devices[0].sensors.air_quality, {
+            algorithm: "c5_bme690_air_quality_v3",
+            score: 72,
+            level: "moderate",
+            confidence: "low",
+            gas_ratio: 0.43,
+            stability_score: 61,
+            sensor_state: "warming",
+            baseline_ready: false,
+            future_v3_extension: "snapshot-preserved"
+        });
 
         let s3StatusRows = await waitForDbRows(
             dbPath,
@@ -3159,6 +3251,18 @@ async function run() {
         assert.equal(result.body.data.devices[0].device_id, bmeDeviceId);
         assert.equal(result.body.data.devices[0].sensors.gas_resistance, 35164);
         assert.equal(result.body.data.devices[0].sensors.air_quality_score, 72);
+        assert.equal(result.body.data.devices[0].sensors.air_quality_level, "moderate");
+        assert.equal(result.body.data.devices[0].sensors.air_quality_confidence, "low");
+        assert.equal(result.body.data.devices[0].sensors.air_quality.algorithm, "c5_bme690_air_quality_v3");
+        assert.equal(result.body.data.devices[0].sensors.air_quality.score, 72);
+        assert.equal(result.body.data.devices[0].sensors.air_quality.level, "moderate");
+        assert.equal(result.body.data.devices[0].sensors.air_quality.confidence, "low");
+        assert.equal(result.body.data.devices[0].sensors.air_quality.gas_ratio, 0.43);
+        assert.equal(result.body.data.devices[0].sensors.air_quality.stability_score, 61);
+        assert.equal(result.body.data.devices[0].sensors.air_quality.sensor_state, "warming");
+        assert.equal(result.body.data.devices[0].sensors.air_quality.baseline_ready, false);
+        assert.equal(result.body.data.devices[0].sensors.air_quality.future_v3_extension, "snapshot-preserved");
+        assert.equal(result.body.data.devices[0].air_quality.algorithm, "c5_bme690_air_quality_v3");
         assert.equal(result.body.data.csi.state, "HOLD");
         assert.equal(result.body.data.csi.available, true);
         assert.equal(result.body.data.csi.motion_score, null);

@@ -14,7 +14,9 @@ const {
 const SENSOR_ID_MAX_LENGTH = 80;
 const AIR_QUALITY_LEVELS = new Set(["excellent", "good", "moderate", "poor", "bad", "unknown"]);
 const AIR_QUALITY_CONFIDENCE = new Set(["none", "low", "medium", "high"]);
+const V3_AIR_QUALITY_CONFIDENCE = new Set(["low", "medium", "high"]);
 const AIR_QUALITY_ALGO_VERSION = "esp-bme690-relative-v1";
+const C5_BME690_AIR_QUALITY_V3 = "c5_bme690_air_quality_v3";
 
 function clamp(value, min, max) {
     return Math.min(Math.max(value, min), max);
@@ -51,7 +53,106 @@ function levelForScore(score) {
     return "bad";
 }
 
-function normalizeAirQuality(payload, readings) {
+function readBooleanOrNull(value) {
+    if (typeof value === "boolean") {
+        return value;
+    }
+    if (typeof value === "number") {
+        return value === 1 ? true : (value === 0 ? false : null);
+    }
+    if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (["true", "1", "yes", "y"].includes(normalized)) {
+            return true;
+        }
+        if (["false", "0", "no", "n"].includes(normalized)) {
+            return false;
+        }
+    }
+    return null;
+}
+
+function logAirQualityDecision(logger, source, reason = "") {
+    const target = logger || console;
+    if (source === "fallback") {
+        const message = `[sensor.bme690] AIR_QUALITY_FALLBACK_USED reason=${reason || "invalid_or_missing_air_quality"}`;
+        if (typeof target.warn === "function") {
+            target.warn(message);
+        } else {
+            target.log(message);
+        }
+        return;
+    }
+
+    target.log(`[sensor.bme690] AIR_QUALITY_SOURCE=${source}`);
+}
+
+function normalizeV3AirQuality(payload) {
+    const input = payload.air_quality;
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+        return {
+            ok: false,
+            reason: "v3_air_quality_missing"
+        };
+    }
+
+    const algorithm = trimText(input.algorithm, 80);
+    const rawScore = toFiniteNumber(input.score);
+    const level = trimText(input.level, 40);
+    const confidence = trimText(input.confidence, 40);
+    const gasRatio = toFiniteNumber(input.gas_ratio);
+    const stabilityScore = toFiniteNumber(input.stability_score);
+    const sensorState = trimText(input.sensor_state, 80);
+    const baselineReady = readBooleanOrNull(input.baseline_ready);
+
+    if (algorithm !== C5_BME690_AIR_QUALITY_V3) {
+        return {
+            ok: false,
+            reason: "v3_algorithm_unsupported"
+        };
+    }
+    const score = rawScore !== null && rawScore >= 0 && rawScore <= 100
+        ? rawScore
+        : null;
+    const normalizedLevel = AIR_QUALITY_LEVELS.has(level) ? level : null;
+    const normalizedConfidence = V3_AIR_QUALITY_CONFIDENCE.has(confidence) ? confidence : null;
+
+    if (score === null && normalizedLevel === null && normalizedConfidence === null) {
+        return {
+            ok: false,
+            reason: "v3_core_fields_missing_or_invalid"
+        };
+    }
+
+    return {
+        ok: true,
+        airQuality: {
+            // Keep additive C5 v3 fields in air_quality_json for downstream cache/snapshot consumers.
+            ...input,
+            air_quality_score: score,
+            air_quality_level: normalizedLevel,
+            air_quality_confidence: normalizedConfidence,
+            air_quality_algo_version: algorithm,
+            air_quality_source: "v3",
+            gas_baseline_ohm: toFiniteNumber(payload.gas_baseline_ohm),
+            gas_ratio: gasRatio,
+            gas_score: roundOrNull(toFiniteNumber(payload.gas_score)),
+            humidity_score: roundOrNull(toFiniteNumber(payload.humidity_score)),
+            baseline_ready: baselineReady,
+            warmup_done: readBooleanOrNull(payload.warmup_done) === true,
+            sample_count: Number.isFinite(Number(payload.sample_count)) ? Math.trunc(Number(payload.sample_count)) : null,
+            algorithm,
+            score,
+            level: normalizedLevel,
+            confidence: normalizedConfidence,
+            source: "v3",
+            stability_score: stabilityScore,
+            sensor_state: sensorState
+        }
+    };
+}
+
+function normalizeLegacyAirQuality(payload) {
     const gasBaseline = toFiniteNumber(payload.gas_baseline_ohm);
     const gasRatio = toFiniteNumber(payload.gas_ratio);
     const gasScore = roundOrNull(toFiniteNumber(payload.gas_score));
@@ -67,20 +168,50 @@ function normalizeAirQuality(payload, readings) {
         AIR_QUALITY_LEVELS.has(espLevel) &&
         AIR_QUALITY_CONFIDENCE.has(espConfidence)) {
         return {
-            air_quality_score: espScore,
-            air_quality_level: espLevel,
-            air_quality_confidence: espConfidence,
-            air_quality_algo_version: trimText(payload.air_quality_algo_version, 80) || AIR_QUALITY_ALGO_VERSION,
-            air_quality_source: espSource === "server_fallback" ? "server_fallback" : "esp",
-            gas_baseline_ohm: gasBaseline,
-            gas_ratio: gasRatio,
-            gas_score: gasScore,
-            humidity_score: humidityScore,
-            baseline_ready: Boolean(payload.baseline_ready),
-            warmup_done: Boolean(payload.warmup_done),
-            sample_count: Number.isFinite(Number(payload.sample_count)) ? Math.trunc(Number(payload.sample_count)) : null
+            ok: true,
+            airQuality: {
+                air_quality_score: espScore,
+                air_quality_level: espLevel,
+                air_quality_confidence: espConfidence,
+                air_quality_algo_version: trimText(payload.air_quality_algo_version, 80) || AIR_QUALITY_ALGO_VERSION,
+                air_quality_source: espSource === "server_fallback" ? "server_fallback" : "esp",
+                gas_baseline_ohm: gasBaseline,
+                gas_ratio: gasRatio,
+                gas_score: gasScore,
+                humidity_score: humidityScore,
+                baseline_ready: Boolean(payload.baseline_ready),
+                warmup_done: Boolean(payload.warmup_done),
+                sample_count: Number.isFinite(Number(payload.sample_count)) ? Math.trunc(Number(payload.sample_count)) : null
+            }
         };
     }
+
+    if (rawScore === null) {
+        return {
+            ok: false,
+            reason: "legacy_score_missing"
+        };
+    }
+    if (!espScoreValid) {
+        return {
+            ok: false,
+            reason: "legacy_score_invalid"
+        };
+    }
+    if (!AIR_QUALITY_LEVELS.has(espLevel)) {
+        return {
+            ok: false,
+            reason: "legacy_level_invalid"
+        };
+    }
+    return {
+        ok: false,
+        reason: "legacy_confidence_invalid"
+    };
+}
+
+function buildFallbackAirQuality(payload, readings) {
+    const gasBaseline = toFiniteNumber(payload.gas_baseline_ohm);
 
     const fallbackBaseline = gasBaseline && gasBaseline > 0
         ? gasBaseline
@@ -122,6 +253,23 @@ function normalizeAirQuality(payload, readings) {
         warmup_done: false,
         sample_count: Number.isFinite(Number(payload.sample_count)) ? Math.trunc(Number(payload.sample_count)) : null
     };
+}
+
+function normalizeAirQuality(payload, readings, options = {}) {
+    const v3 = normalizeV3AirQuality(payload);
+    if (v3.ok) {
+        logAirQualityDecision(options.logger, "v3");
+        return v3.airQuality;
+    }
+
+    const legacy = normalizeLegacyAirQuality(payload);
+    if (legacy.ok) {
+        logAirQualityDecision(options.logger, "legacy");
+        return legacy.airQuality;
+    }
+
+    logAirQualityDecision(options.logger, "fallback", v3.reason !== "v3_air_quality_missing" ? v3.reason : legacy.reason);
+    return buildFallbackAirQuality(payload, readings);
 }
 
 function validateBmeEnvelope(body) {
@@ -210,7 +358,9 @@ function prepareBme690Ingest(body, options = {}) {
 
     const payload = body.payload;
     const sensorId = trimText(payload.sensor_id || payload.module_id || "bme690_01", SENSOR_ID_MAX_LENGTH);
-    const airQuality = normalizeAirQuality(payload, validation.readings);
+    const airQuality = normalizeAirQuality(payload, validation.readings, {
+        logger: options.logger
+    });
     const rawJson = JSON.stringify(body);
     const metadataJson = JSON.stringify(metadataForStorage(metadata));
     const airQualityJson = JSON.stringify(airQuality);

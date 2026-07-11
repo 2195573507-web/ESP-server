@@ -253,6 +253,12 @@ function createDeviceRouter(options) {
             });
             persistenceWorker?.scheduleImmediateFlushIfNeeded?.();
 
+            if (queued.csi?.dropped > 0 || queued.csi?.coalesced > 0) {
+                logger.warn(
+                    `[CSI_PERSIST_QUEUE] length=${queued.csi.length} dropped=${queued.csi.dropped} coalesced=${queued.csi.coalesced}`
+                );
+            }
+
             logger.log(
                 `[kernel-csi] queued trace_id=${result.data.trace_id} tick_id=${result.data.tick_id} state=${result.data.state} gateway_id=${boundGateway.gateway_id} job_id=${queued.job_id}`
             );

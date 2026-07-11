@@ -112,7 +112,7 @@ function normalizeCsiRecord(record, serverRecvMs = Date.now()) {
     }
 
     const stateText = trimText(record.state || record.fused_state || "IDLE", 16).toUpperCase() || "IDLE";
-    const confidence = numberOrNull(record.confidence ?? record.motion_score);
+    const confidence = numberOrNull(record.confidence);
     return {
         device_id: trimText(record.device_id, 128),
         link_id: trimText(record.link_id || "fused", 64),
@@ -123,7 +123,7 @@ function normalizeCsiRecord(record, serverRecvMs = Date.now()) {
         frame_energy: numberOrNull(record.frame_energy),
         variance: numberOrNull(record.variance),
         rssi: integerOrNull(record.rssi),
-        motion_score: numberOrNull(record.motion_score ?? record.confidence),
+        motion_score: numberOrNull(record.motion_score),
         confidence,
         timestamp: integerOrNull(record.timestamp ?? record.timestamp_ms) || serverRecvMs,
         server_recv_ms: integerOrNull(record.server_recv_ms) || serverRecvMs
@@ -302,6 +302,7 @@ function buildSnapshotFromCache() {
             variance: null,
             rssi: null,
             motion_score: null,
+            confidence: null,
             timestamp: null
         }),
         received_at_ms: Date.now(),

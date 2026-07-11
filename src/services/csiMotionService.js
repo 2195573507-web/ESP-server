@@ -122,7 +122,7 @@ function validateCanonicalCsiEventV2(body) {
             frame_energy: null,
             variance: null,
             rssi: null,
-            motion_score: confidence,
+            motion_score: null,
             confidence,
             timestamp: timestampMs,
             links
@@ -164,6 +164,7 @@ function prepareCanonicalCsiEventV2(body, options = {}) {
         variance: validation.csi.variance,
         rssi: validation.csi.rssi,
         motion_score: validation.csi.motion_score,
+        confidence: validation.csi.confidence,
         timestamp: validation.csi.timestamp,
         server_recv_ms: metadata.server_recv_ms,
         server_time_iso: metadata.server_time_iso,

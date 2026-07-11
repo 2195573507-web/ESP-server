@@ -42,6 +42,17 @@ const {
 const {
     upsertProfile
 } = require("../src/memory/store");
+const {
+    CSI_PERSISTENCE_QUEUE_MAX_LENGTH,
+    clearPersistenceQueue,
+    dequeuePersistenceBatch,
+    enqueuePersistenceJob,
+    getPersistenceQueueStats,
+    requeuePersistenceBatch
+} = require("../src/services/persistenceQueue");
+const {
+    createPersistenceWorker
+} = require("../src/services/persistenceWorker");
 
 const SERVER_START_TIMEOUT_MS = 15000;
 const SERVER_STOP_TIMEOUT_MS = 5000;
@@ -767,12 +778,104 @@ function assertLlmMetadataBounds() {
     assert.equal(parsed.sessionId, "s".repeat(LLM_METADATA_MAX_CHARS));
 }
 
+async function assertCsiPersistenceProtection() {
+    clearPersistenceQueue();
+    try {
+        enqueuePersistenceJob({
+            type: "gateway.dashboard_snapshot",
+            priority: "high",
+            run: async () => {}
+        });
+        for (let sequence = 0; sequence < CSI_PERSISTENCE_QUEUE_MAX_LENGTH; sequence++) {
+            enqueuePersistenceJob({
+                type: "csi.motion",
+                priority: "low",
+                sequence,
+                run: async () => {}
+            });
+        }
+
+        const latest = enqueuePersistenceJob({
+            type: "csi.motion",
+            priority: "low",
+            sequence: CSI_PERSISTENCE_QUEUE_MAX_LENGTH,
+            run: async () => {}
+        });
+        assert.deepEqual(latest.csi, {
+            length: 1,
+            dropped: CSI_PERSISTENCE_QUEUE_MAX_LENGTH,
+            coalesced: CSI_PERSISTENCE_QUEUE_MAX_LENGTH
+        });
+        assert.equal(getPersistenceQueueStats().csi, 1);
+
+        const protectedBatch = dequeuePersistenceBatch(10);
+        assert.equal(protectedBatch.length, 2);
+        assert.equal(protectedBatch[0].type, "gateway.dashboard_snapshot");
+        assert.equal(protectedBatch[1].sequence, CSI_PERSISTENCE_QUEUE_MAX_LENGTH);
+
+        for (let sequence = 0; sequence < CSI_PERSISTENCE_QUEUE_MAX_LENGTH; sequence++) {
+            enqueuePersistenceJob({
+                type: "csi.motion",
+                priority: "low",
+                sequence,
+                run: async () => {}
+            });
+        }
+        const requeued = requeuePersistenceBatch([{
+            id: Number.MAX_SAFE_INTEGER,
+            type: "csi.motion",
+            priority: "low",
+            queued_at_ms: Date.now() + 1,
+            sequence: "retry-latest",
+            run: async () => {}
+        }]);
+        assert.deepEqual(requeued.csi, {
+            length: 1,
+            dropped: CSI_PERSISTENCE_QUEUE_MAX_LENGTH,
+            coalesced: CSI_PERSISTENCE_QUEUE_MAX_LENGTH
+        });
+        const retriedBatch = dequeuePersistenceBatch(10);
+        assert.equal(retriedBatch.length, 1);
+        assert.equal(retriedBatch[0].sequence, "retry-latest");
+
+        const logs = [];
+        const logger = {
+            error: message => logs.push(message),
+            info: message => logs.push(message),
+            warn: message => logs.push(message)
+        };
+        const worker = createPersistenceWorker({
+            logger
+        });
+        enqueuePersistenceJob({
+            type: "csi.motion",
+            priority: "low",
+            run: async () => {}
+        });
+        await worker.flushOnce();
+        assert.ok(logs.some(message => /\[CSI_DB_WRITE\] batch_size=1 duration_ms=\d+ failed=false/.test(message)));
+
+        enqueuePersistenceJob({
+            type: "csi.motion",
+            priority: "low",
+            run: async () => {
+                throw new Error("expected CSI persistence failure");
+            }
+        });
+        await worker.flushOnce();
+        assert.ok(logs.some(message => /\[CSI_DB_WRITE\] batch_size=1 duration_ms=\d+ failed=true/.test(message)));
+    } finally {
+        clearPersistenceQueue();
+    }
+}
+
 async function run() {
     assertTtsJsonPcmNormalization();
     assertLlmMetadataBounds();
     await assertUpsertRetryAfterInsertConflict();
     await assertPendingDispatchSkipsLostClaim();
     await assertDuplicateKeyUpserts();
+    await assertCsiPersistenceProtection();
 
     const tempDir = makeTempDir();
     const dbPath = path.join(tempDir, "nested", "smoke.sqlite");
@@ -2497,7 +2600,8 @@ async function run() {
         assert.equal(result.body.data.state, "MOTION");
         assert.equal(result.body.data.frame_energy, null);
         assert.equal(result.body.data.variance, null);
-        assert.equal(result.body.data.motion_score, 0.73);
+        assert.equal(result.body.data.motion_score, null);
+        assert.equal(result.body.data.confidence, 0.73);
 
         result = await request(baseUrl, "POST", "/kernel/csi_event", {
             ...canonicalCsiEvent,
@@ -2543,6 +2647,8 @@ async function run() {
         assert.equal(csiRows[0].state, "MOTION");
         assert.equal(csiRows[0].link_id, "fused");
         assert.equal(csiRows[0].frame_energy, null);
+        assert.equal(csiRows[0].motion_score, null);
+        assert.equal(csiRows[0].confidence, 0.73);
         assert.equal(csiRows[1].state, "HOLD");
         assert.ok(csiRows[0].raw_json.includes("\"schema_version\":\"v2\""));
 
@@ -2564,7 +2670,7 @@ async function run() {
         assertDashboardEnvelope(result.body, true);
         assert.equal(result.body.data.csi.state, "HOLD");
         assert.equal(result.body.data.csi.available, true);
-        assert.equal(result.body.data.csi.motion_score, 0.11);
+        assert.equal(result.body.data.csi.motion_score, null);
         assert.equal(result.body.data.csi.frame_energy, null);
 
         result = await request(baseUrl, "GET", "/api/dashboard/v1/csi/history?limit=5");
@@ -2573,7 +2679,7 @@ async function run() {
         assert.equal(result.body.data.events.length, 2);
         assert.equal(result.body.data.events[0].state, "MOTION");
         assert.equal(result.body.data.events[1].state, "HOLD");
-        assert.equal(result.body.data.events[1].motion_score, 0.11);
+        assert.equal(result.body.data.events[1].motion_score, null);
 
         result = await request(baseUrl, "POST", "/kernel/csi_event", {
             ...canonicalCsiEvent,
@@ -2963,7 +3069,7 @@ async function run() {
         assert.equal(result.body.data.devices[0].sensors.air_quality_score, 72);
         assert.equal(result.body.data.csi.state, "HOLD");
         assert.equal(result.body.data.csi.available, true);
-        assert.equal(result.body.data.csi.motion_score, 0.11);
+        assert.equal(result.body.data.csi.motion_score, null);
         assert.equal(result.body.data.csi.frame_energy, null);
         assert.equal(result.body.data.devices[0].appliances.air_conditioner.source, "mock");
         assert.equal(result.body.data.devices[0].appliances.fan.mock, true);

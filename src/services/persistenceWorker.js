@@ -6,6 +6,29 @@ const {
 
 const DEFAULT_FLUSH_INTERVAL_MS = 500;
 const DEFAULT_BATCH_SIZE = 100;
+const CSI_PERSISTENCE_JOB_TYPE = "csi.motion";
+
+function csiBatchSize(batch) {
+    return batch.filter(job => job?.type === CSI_PERSISTENCE_JOB_TYPE).length;
+}
+
+function elapsedMs(startNs) {
+    return Math.round(Number(process.hrtime.bigint() - startNs) / 1e6);
+}
+
+function logCsiDbWrite(logger, batchSize, startNs, failed) {
+    if (batchSize === 0) {
+        return;
+    }
+    logger.info(`[CSI_DB_WRITE] batch_size=${batchSize} duration_ms=${elapsedMs(startNs)} failed=${failed}`);
+}
+
+function logCsiQueue(logger, csi) {
+    if (!csi || (csi.dropped === 0 && csi.coalesced === 0)) {
+        return;
+    }
+    logger.warn(`[CSI_PERSIST_QUEUE] length=${csi.length} dropped=${csi.dropped} coalesced=${csi.coalesced}`);
+}
 
 function createPersistenceWorker(options = {}) {
     const dbRun = options.dbRun;
@@ -25,11 +48,14 @@ function createPersistenceWorker(options = {}) {
             };
         }
 
-        if (typeof dbRun === "function") {
-            await dbRun("BEGIN IMMEDIATE TRANSACTION");
-        }
+        const csiJobs = csiBatchSize(batch);
+        const startNs = process.hrtime.bigint();
 
         try {
+            if (typeof dbRun === "function") {
+                await dbRun("BEGIN IMMEDIATE TRANSACTION");
+            }
+
             for (const job of batch) {
                 job.attempts = Math.max(0, Number(job.attempts) || 0) + 1;
                 await job.run();
@@ -40,6 +66,7 @@ function createPersistenceWorker(options = {}) {
             }
 
             logger.info(`[persistence_worker] persisted=${batch.length} queue=${JSON.stringify(getPersistenceQueueStats())}`);
+            logCsiDbWrite(logger, csiJobs, startNs, false);
             return {
                 persisted: batch.length
             };
@@ -52,7 +79,9 @@ function createPersistenceWorker(options = {}) {
                 }
             }
 
-            requeuePersistenceBatch(batch);
+            const requeued = requeuePersistenceBatch(batch);
+            logCsiQueue(logger, requeued.csi);
+            logCsiDbWrite(logger, csiJobs, startNs, true);
             logger.error(`[persistence_worker] batch failed requeued=${batch.length} error=${error?.message || error}`);
             return {
                 persisted: 0,

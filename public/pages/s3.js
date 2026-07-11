@@ -228,16 +228,20 @@
         const gateway = isPlainObject(rawGateway) ? rawGateway : {};
         const hasDeviceStatus = Boolean(deviceStatus?._hasData);
         const hasGatewaySnapshot = gateway.last_error !== "no_gateway_snapshot";
-        const online = hasGatewaySnapshot && typeof gateway.online === "boolean" ? gateway.online : null;
+        const online = typeof gateway.online === "boolean"
+            ? gateway.online
+            : (typeof gateway.onlin === "boolean" ? gateway.onlin : null);
         const cloudConnected = hasGatewaySnapshot && typeof gateway.cloud_connected === "boolean"
             ? gateway.cloud_connected
-            : (hasGatewaySnapshot && typeof gateway.server_available === "boolean" ? gateway.server_available : null);
+            : (typeof gateway.server_available === "boolean"
+                ? gateway.server_available
+                : (hasGatewaySnapshot && typeof deviceStatus?.online === "boolean" ? deviceStatus.online : null));
         const latency = Number.isFinite(Number(gateway.latency_ms))
             ? Number(gateway.latency_ms)
             : (hasDeviceStatus && Number.isFinite(Number(deviceStatus?.latest_upload_delay_ms)) ? Number(deviceStatus.latest_upload_delay_ms) : null);
-        const localDegraded = hasGatewaySnapshot && typeof gateway.local_degraded === "boolean"
+        const localDegraded = typeof gateway.local_degraded === "boolean"
             ? gateway.local_degraded
-            : (hasGatewaySnapshot && typeof gateway.server_available === "boolean"
+            : (typeof gateway.server_available === "boolean"
                 ? !gateway.server_available
                 : (hasDeviceStatus && typeof deviceStatus?.time_synced === "boolean" ? !deviceStatus.time_synced : null));
         return {
@@ -271,7 +275,9 @@
             online: typeof status.online === "boolean"
                 ? status.online
                 : (typeof status.device_online === "boolean" ? status.device_online : null),
-            device_online: typeof status.device_online === "boolean" ? status.device_online : null,
+            device_online: typeof status.device_online === "boolean"
+                ? status.device_online
+                : (typeof status.online === "boolean" ? status.online : null),
             latest_upload_delay_ms: latestUploadDelay,
             last_seen_ms: lastSeenMs,
             last_seen_age_ms: lastSeenAgeMs,
@@ -545,7 +551,9 @@
             if (!status) return device;
             return {
                 ...device,
-                online: typeof status.online === "boolean" ? status.online : device.online,
+                online: typeof status.online === "boolean"
+                    ? status.online
+                    : (typeof status.device_online === "boolean" ? status.device_online : device.online),
                 timestamp: status.last_seen_ms ?? device.timestamp
             };
         });

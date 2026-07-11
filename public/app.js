@@ -1192,7 +1192,10 @@ function normalizeSmartHomeDevice(key, rawDevice) {
         icon: "chip"
     };
     const status = normalizeSmartHomeStatusValue(rawDevice);
-    const disabled = rawDevice.online === false || status === null;
+    const deviceOnline = typeof rawDevice.online === "boolean"
+        ? rawDevice.online
+        : (typeof rawDevice.device_online === "boolean" ? rawDevice.device_online : null);
+    const disabled = deviceOnline === false || status === null;
     return {
         id: key,
         name: rawDevice.name || definition.name,
@@ -1268,7 +1271,7 @@ function getEspStatus(deviceStatus) {
         };
     }
 
-    if (typeof deviceStatus.online !== "boolean") {
+    if (typeof deviceStatus.online !== "boolean" && typeof deviceStatus.device_online !== "boolean") {
         return {
             value: UNKNOWN_TEXT,
             latency: deviceStatus.latestUploadDelayMs ?? null,
@@ -1278,10 +1281,10 @@ function getEspStatus(deviceStatus) {
     }
 
     return {
-        value: deviceStatus.online ? "在线" : OFFLINE_TEXT,
+        value: (deviceStatus.online ?? deviceStatus.device_online) ? "在线" : OFFLINE_TEXT,
         latency: null,
-        level: deviceStatus.online ? "normal" : "danger",
-        note: deviceStatus.online ? "设备在线" : "设备离线",
+        level: (deviceStatus.online ?? deviceStatus.device_online) ? "normal" : "danger",
+        note: (deviceStatus.online ?? deviceStatus.device_online) ? "设备在线" : "设备离线",
         source: deviceStatus.source
     };
 }

@@ -105,8 +105,14 @@ const DASHBOARD_REFRESH_INTERVAL_MS = 3000;
 const S3_DASHBOARD_REFRESH_INTERVAL_MS = 3000;
 const ESP_DELAY_REFRESH_INTERVAL_MS = 1000;
 const ACTIVITY_TREND_WINDOW_MS = 30 * 60 * 1000;
-const CHART_RANGE_OPTIONS = [12, 24, 36, 48];
-const DEFAULT_CHART_RANGE_HOURS = 24;
+const CHART_RANGE_OPTIONS = ["5m", "1h", "24h", "7d"];
+const DEFAULT_CHART_RANGE = "24h";
+const CHART_RANGE_LABELS = {
+    "5m": "最近 5 分钟",
+    "1h": "最近 1 小时",
+    "24h": "最近 24 小时",
+    "7d": "最近 7 天"
+};
 const ALERT_LOG_PREVIEW_LIMIT = 4;
 const SYSTEM_LOG_PREVIEW_LIMIT = 4;
 const OPERATION_LOG_PREVIEW_LIMIT = 5;
@@ -118,7 +124,12 @@ let dashboardRefreshTimer = null;
 let espDelayRefreshTimer = null;
 let s3DashboardRefreshTimer = null;
 let realtimeClockTimer = null;
-let selectedChartRangeHours = DEFAULT_CHART_RANGE_HOURS;
+let selectedChartRange = DEFAULT_CHART_RANGE;
+let historyRequestSequence = 0;
+const chartHistoryRequestState = {
+    status: "idle",
+    error: null
+};
 let activeLogModalType = null;
 let pendingConfirmAction = null;
 let activeDashboardPage = "c51";
@@ -371,12 +382,12 @@ window.DashboardRealtime = {
     escapeHtml
 };
 
-// 曲线时间范围：格式化横轴标签，36/48 小时时显示日期，避免跨天数据看不清。
+// 曲线时间范围：格式化横轴标签，7 天范围显示日期，避免跨天数据看不清。
 function formatChartTime(timestamp) {
     const date = parseTimestamp(timestamp);
     if (!date) return EMPTY_TEXT;
 
-    const options = selectedChartRangeHours > 24
+    const options = selectedChartRange === "7d"
         ? { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }
         : { hour: "2-digit", minute: "2-digit", hour12: false };
     return date.toLocaleString("zh-CN", options);
@@ -633,30 +644,12 @@ function getLatestSensorChartPoint() {
     };
 }
 
-// 曲线时间范围：按当前下拉选中的小时数筛选真实时间戳数据，时间戳无效的数据会被跳过。
+// 曲线时间范围：直接绘制后端按 range 返回的数据，时间戳无效的数据会被跳过。
 function getFilteredChartData() {
-    const rangeMs = selectedChartRangeHours * 60 * 60 * 1000;
-    const now = Date.now();
     const history = Array.isArray(dashboardState.history) ? dashboardState.history : [];
-    const points = history
+    return history
         .map(normalizeHistoryPoint)
-        .filter(Boolean);
-    const latestPoint = getLatestSensorChartPoint();
-
-    if (latestPoint) {
-        const duplicateIndex = points.findIndex(point => point.timestamp.getTime() === latestPoint.timestamp.getTime());
-        if (duplicateIndex >= 0) {
-            points[duplicateIndex] = latestPoint;
-        } else {
-            points.push(latestPoint);
-        }
-    }
-
-    return points
-        .filter(point => {
-            const timestamp = point.timestamp.getTime();
-            return Number.isFinite(timestamp) && timestamp <= now && now - timestamp <= rangeMs;
-        })
+        .filter(Boolean)
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
 }
 
@@ -666,20 +659,54 @@ function updateChartRangeSelector() {
     const button = document.getElementById("chartRangeButton");
 
     if (label) {
-        label.textContent = `最近 ${selectedChartRangeHours} 小时`;
+        label.textContent = CHART_RANGE_LABELS[selectedChartRange] || CHART_RANGE_LABELS[DEFAULT_CHART_RANGE];
     }
 
-    document.querySelectorAll("[data-range-hours]").forEach(option => {
-        const selected = Number(option.dataset.rangeHours) === selectedChartRangeHours;
+    document.querySelectorAll("[data-range]").forEach(option => {
+        const selected = option.dataset.range === selectedChartRange;
         option.setAttribute("aria-selected", selected ? "true" : "false");
     });
 
     if (button) {
-        button.setAttribute("aria-label", `当前显示最近 ${selectedChartRangeHours} 小时数据`);
+        const currentLabel = CHART_RANGE_LABELS[selectedChartRange] || CHART_RANGE_LABELS[DEFAULT_CHART_RANGE];
+        button.setAttribute("aria-label", `当前显示${currentLabel}数据`);
     }
 }
 
-// 曲线时间范围：初始化自定义下拉菜单，点击选项后只改变前端筛选范围并重绘图表。
+function isCurrentHistoryResult(historyResult) {
+    return Boolean(historyResult) &&
+        historyResult.requestId === historyRequestSequence &&
+        historyResult.range === selectedChartRange &&
+        isCurrentCDeviceRequest(historyResult.deviceId);
+}
+
+function applyHistoryResult(historyResult) {
+    if (!isCurrentHistoryResult(historyResult)) return false;
+
+    const historyData = Array.isArray(historyResult.data) ? historyResult.data : [];
+    dashboardState.history = historyData;
+    dashboardState.sources.history = historyResult.source;
+    chartHistoryRequestState.status = historyResult.ok
+        ? (historyData.length > 0 ? "ready" : "empty")
+        : "error";
+    chartHistoryRequestState.error = historyResult.error || null;
+    return true;
+}
+
+async function reloadChartHistory() {
+    const deviceId = getActiveDeviceId();
+    chartHistoryRequestState.status = "loading";
+    chartHistoryRequestState.error = null;
+    dashboardState.sources.history = "loading";
+    renderMainChart();
+
+    const historyResult = await fetchHistoryData(deviceId, selectedChartRange);
+    if (applyHistoryResult(historyResult)) {
+        renderMainChart();
+    }
+}
+
+// 曲线时间范围：初始化自定义下拉菜单，点击选项后重新请求后端 range 数据并重绘图表。
 function initChartRangeSelector() {
     const selector = document.querySelector("[data-range-selector]");
     const button = document.getElementById("chartRangeButton");
@@ -709,13 +736,13 @@ function initChartRangeSelector() {
         }
     });
 
-    menu.querySelectorAll("[data-range-hours]").forEach(option => {
+    menu.querySelectorAll("[data-range]").forEach(option => {
         option.addEventListener("click", () => {
-            const nextHours = Number(option.dataset.rangeHours);
-            if (CHART_RANGE_OPTIONS.includes(nextHours)) {
-                selectedChartRangeHours = nextHours;
+            const nextRange = option.dataset.range;
+            if (CHART_RANGE_OPTIONS.includes(nextRange)) {
+                selectedChartRange = nextRange;
                 updateChartRangeSelector();
-                renderMainChart();
+                reloadChartHistory();
             }
             closeMenu();
         });
@@ -851,16 +878,20 @@ async function fetchLatestLLM(deviceId = getActiveDeviceId()) {
     return readEndpoint("/api/dashboard/v1/llm/latest", "LLM");
 }
 
-async function fetchHistoryData(deviceId = getActiveDeviceId()) {
+async function fetchHistoryData(deviceId = getActiveDeviceId(), range = selectedChartRange) {
+    const requestId = ++historyRequestSequence;
     const result = await readEndpoint(
         buildUrl("/api/dashboard/v1/sensors/history", {
             device_id: deviceId,
-            limit: 500
+            range
         }),
-        `History ${deviceId}`
+        `History ${deviceId} ${range}`
     );
     return {
         ...result,
+        requestId,
+        deviceId,
+        range,
         data: Array.isArray(result.data) ? result.data : []
     };
 }
@@ -1161,7 +1192,10 @@ function normalizeSmartHomeDevice(key, rawDevice) {
         icon: "chip"
     };
     const status = normalizeSmartHomeStatusValue(rawDevice);
-    const disabled = rawDevice.online === false || status === null;
+    const deviceOnline = typeof rawDevice.online === "boolean"
+        ? rawDevice.online
+        : (typeof rawDevice.device_online === "boolean" ? rawDevice.device_online : null);
+    const disabled = deviceOnline === false || status === null;
     return {
         id: key,
         name: rawDevice.name || definition.name,
@@ -1237,7 +1271,7 @@ function getEspStatus(deviceStatus) {
         };
     }
 
-    if (typeof deviceStatus.online !== "boolean") {
+    if (typeof deviceStatus.online !== "boolean" && typeof deviceStatus.device_online !== "boolean") {
         return {
             value: UNKNOWN_TEXT,
             latency: deviceStatus.latestUploadDelayMs ?? null,
@@ -1247,10 +1281,10 @@ function getEspStatus(deviceStatus) {
     }
 
     return {
-        value: deviceStatus.online ? "在线" : OFFLINE_TEXT,
+        value: (deviceStatus.online ?? deviceStatus.device_online) ? "在线" : OFFLINE_TEXT,
         latency: null,
-        level: deviceStatus.online ? "normal" : "danger",
-        note: deviceStatus.online ? "设备在线" : "设备离线",
+        level: (deviceStatus.online ?? deviceStatus.device_online) ? "normal" : "danger",
+        note: (deviceStatus.online ?? deviceStatus.device_online) ? "设备在线" : "设备离线",
         source: deviceStatus.source
     };
 }
@@ -1357,6 +1391,8 @@ function setDashboardLoadingState(deviceId) {
     dashboardState.operationLogs = [];
     dashboardState.activity = createEmptyActivityState();
     dashboardState.activityHistory = [];
+    chartHistoryRequestState.status = "loading";
+    chartHistoryRequestState.error = null;
     dashboardState.sources = {
         sensor: "loading",
         deviceStatus: "loading",
@@ -1579,7 +1615,7 @@ function renderMainChart() {
     const padding = { top: 22, right: 26, bottom: 42, left: 52 };
     const width = rect.width - padding.left - padding.right;
     const height = rect.height - padding.top - padding.bottom;
-    const data = getFilteredChartData().slice(-100);
+    const data = getFilteredChartData();
     const chartColors = {
         grid: readThemeColor("--chart-grid", "#dfe7f3"),
         label: readThemeColor("--chart-label", "#33537f"),
@@ -1588,6 +1624,19 @@ function renderMainChart() {
         humidity: readThemeColor("--chart-humidity", "#10b981"),
         air: readThemeColor("--chart-air", "#7c3aed")
     };
+    const drawChartMessage = message => {
+        context.fillStyle = chartColors.axisLabel;
+        context.font = "15px Avenir Next, PingFang SC, sans-serif";
+        context.textAlign = "center";
+        context.fillText(message, rect.width / 2, padding.top + height / 2);
+        context.textAlign = "left";
+    };
+
+    if (chartHistoryRequestState.status === "loading" || dashboardState.sources.history === "loading") {
+        drawChartMessage("正在加载历史数据...");
+        return;
+    }
+
     const chartFields = [
         { field: "temperature", color: chartColors.temperature },
         { field: "humidity", color: chartColors.humidity }
@@ -1599,11 +1648,10 @@ function renderMainChart() {
         .map(item => toNumber(point[item.field]))
         .filter(value => value !== null));
     if (data.length === 0 || allValues.length === 0) {
-        context.fillStyle = chartColors.axisLabel;
-        context.font = "15px Avenir Next, PingFang SC, sans-serif";
-        context.textAlign = "center";
-        context.fillText("暂无数据", rect.width / 2, padding.top + height / 2);
-        context.textAlign = "left";
+        const emptyMessage = chartHistoryRequestState.status === "error" || dashboardState.sources.history === "error"
+            ? "历史数据加载失败"
+            : "该时间范围暂无数据";
+        drawChartMessage(emptyMessage);
         return;
     }
 
@@ -2356,7 +2404,7 @@ async function fetchCDeviceDashboardData(deviceId) {
         fetchDeviceStatus(deviceId),
         fetchLatestASR(deviceId),
         fetchLatestLLM(deviceId),
-        fetchHistoryData(deviceId),
+        fetchHistoryData(deviceId, selectedChartRange),
         fetchAlertLogs(deviceId),
         fetchSystemLogs(deviceId),
         fetchCommandLogs(deviceId),
@@ -2416,19 +2464,22 @@ async function updateDashboard() {
     dashboardState.hasLoaded = true;
     dashboardState.asr = asrResult.ok && !asrResult.empty ? asrResult.data : null;
     dashboardState.llm = llmResult.ok && !llmResult.empty ? llmResult.data : null;
+    const historySource = isCurrentHistoryResult(historyResult)
+        ? historyResult.source
+        : dashboardState.sources.history;
     dashboardState.sources = {
         sensor: sensorResult.source,
         deviceStatus: deviceStatusResult.source,
         asr: asrResult.source,
         llm: llmResult.source,
-        history: historyResult.source,
+        history: historySource,
         alerts: alertResult.source,
         logs: systemResult.source,
         commands: commandResult.source,
         smartHome: smartHomeResult.source
     };
     dashboardState.metrics = buildMetrics(sensor, deviceStatus);
-    dashboardState.history = Array.isArray(historyResult.data) ? historyResult.data : [];
+    applyHistoryResult(historyResult);
     dashboardState.alertLogs = Array.isArray(alertResult.data) ? alertResult.data.map(normalizeAlertLog) : [];
     dashboardState.systemLogs = Array.isArray(systemResult.data) ? systemResult.data.map(normalizeSystemLog) : [];
     dashboardState.operationLogs = Array.isArray(commandResult.data) ? commandResult.data : [];

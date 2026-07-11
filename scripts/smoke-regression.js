@@ -53,6 +53,14 @@ const {
 const {
     createPersistenceWorker
 } = require("../src/services/persistenceWorker");
+const {
+    normalizeDeviceId,
+    resolveDeviceId
+} = require("../src/services/deviceIdResolver");
+const {
+    prepareDashboardSnapshot
+} = require("../src/services/dashboardService");
+const runtimeStateCache = require("../src/services/runtimeStateCache");
 
 const SERVER_START_TIMEOUT_MS = 15000;
 const SERVER_STOP_TIMEOUT_MS = 5000;
@@ -869,9 +877,58 @@ async function assertCsiPersistenceProtection() {
     }
 }
 
+function assertDeviceIdResolution() {
+    assert.equal(normalizeDeviceId(" C51 "), "C51");
+    assert.equal(resolveDeviceId("C51"), "sensair_shuttle_01");
+    assert.equal(resolveDeviceId("c52"), "sensair_shuttle_02");
+    assert.equal(resolveDeviceId(" S3 "), "sensair_s3_gateway_01");
+    assert.equal(resolveDeviceId("custom-device"), "custom-device");
+
+    const prepared = prepareDashboardSnapshot({
+        schema_version: 2,
+        payload_type: "gateway.dashboard_snapshot",
+        gateway: {
+            gateway_id: "S3"
+        },
+        devices: [{
+            device_id: "C51",
+            online: true
+        }],
+        history: [{
+            device_id: "C51"
+        }]
+    }, {
+        serverRecvMs: Date.now()
+    });
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.snapshot.gateway.gateway_id, "sensair_s3_gateway_01");
+    assert.equal(prepared.snapshot.devices[0].device_id, "sensair_shuttle_01");
+    assert.equal(prepared.snapshot.history[0].device_id, "sensair_shuttle_01");
+
+    runtimeStateCache.resetRuntimeStateCache();
+    runtimeStateCache.updateDashboardSnapshot({
+        gateway: {
+            gateway_id: "S3"
+        },
+        devices: [{
+            device_id: "C52",
+            online: true
+        }],
+        history: [{
+            device_id: "C52"
+        }]
+    });
+    const cached = runtimeStateCache.readDashboardOverviewSnapshot();
+    assert.equal(cached.gateway.gateway_id, "sensair_s3_gateway_01");
+    assert.equal(cached.devices[0].device_id, "sensair_shuttle_02");
+    assert.equal(cached.history[0].device_id, "sensair_shuttle_02");
+    runtimeStateCache.resetRuntimeStateCache();
+}
+
 async function run() {
     assertTtsJsonPcmNormalization();
     assertLlmMetadataBounds();
+    assertDeviceIdResolution();
     await assertUpsertRetryAfterInsertConflict();
     await assertPendingDispatchSkipsLostClaim();
     await assertDuplicateKeyUpserts();
@@ -913,7 +970,42 @@ async function run() {
 
         const deviceId = "esp smoke+c5&测试";
 
-        let result = await request(baseUrl, "GET", "/api/commands/whitelist");
+        let result = await request(baseUrl, "POST", "/sensor", {
+            device_id: "C51",
+            temperature: 25.5,
+            humidity: 40.1,
+            pressure: 1009.2,
+            gas_resistance: 210.4
+        });
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.device_id, "sensair_shuttle_01");
+        let aliasSensorRows = await waitForDbRows(
+            dbPath,
+            "SELECT device_id FROM sensor_records WHERE device_id=? ORDER BY id DESC LIMIT 1",
+            ["sensair_shuttle_01"]
+        );
+        assert.equal(aliasSensorRows[0].device_id, "sensair_shuttle_01");
+
+        result = await request(baseUrl, "GET", "/api/device/v1/status?device_id=C51");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.status.device_id, "sensair_shuttle_01");
+        result = await request(baseUrl, "GET", "/api/device/v1/modules/status?device_id=C51");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.modules[0].device_id, "sensair_shuttle_01");
+        result = await request(baseUrl, "GET", "/api/device/v1/sensors/latest?device_id=C51");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.sensor.device_id, "sensair_shuttle_01");
+        result = await request(baseUrl, "GET", "/api/dashboard/v1/sensors/latest?device_id=C51");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.data.device_id, "sensair_shuttle_01");
+        result = await request(baseUrl, "GET", "/api/dashboard/v1/device/status?device_id=C51");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.data.device_id, "sensair_shuttle_01");
+        result = await request(baseUrl, "GET", "/api/dashboard/v1/modules/status?device_id=C51");
+        assert.equal(result.response.status, 200);
+        assert.ok(result.body.data.modules.every(module => module.device_id === "sensair_shuttle_01"));
+
+        result = await request(baseUrl, "GET", "/api/commands/whitelist");
         assert.equal(result.response.status, 200);
         assert.equal(result.body.ok, true);
         assert.ok(result.body.commands.some(command => command.name === "display.show_text"));

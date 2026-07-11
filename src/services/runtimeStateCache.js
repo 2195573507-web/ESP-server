@@ -1,6 +1,9 @@
 const {
     trimText
 } = require("./deviceMetadata");
+const {
+    resolveDeviceId
+} = require("./deviceIdResolver");
 
 const MIN_PLAUSIBLE_UNIX_MS = Date.UTC(2000, 0, 1);
 
@@ -77,7 +80,7 @@ function makeGatewayState(gateway, serverRecvMs = Date.now()) {
     const source = isPlainObject(gateway) ? gateway : defaultGateway(serverRecvMs);
     const lastSeen = integerOrNull(source.last_seen_ms ?? source.lastSeen ?? source.timestamp) ?? serverRecvMs;
     return {
-        gateway_id: trimText(source.gateway_id || "sensair_s3_gateway_01", 128),
+        gateway_id: resolveDeviceId(source.gateway_id || "sensair_s3_gateway_01"),
         online: booleanValue(source.online, false),
         last_seen: lastSeen,
         last_seen_ms: lastSeen,
@@ -114,7 +117,7 @@ function normalizeCsiRecord(record, serverRecvMs = Date.now()) {
     const stateText = trimText(record.state || record.fused_state || "IDLE", 16).toUpperCase() || "IDLE";
     const confidence = numberOrNull(record.confidence);
     return {
-        device_id: trimText(record.device_id, 128),
+        device_id: resolveDeviceId(record.device_id),
         link_id: trimText(record.link_id || "fused", 64),
         link_state: stateText,
         state: stateText,
@@ -135,7 +138,7 @@ function upsertDevice(device) {
         return null;
     }
 
-    const deviceId = trimText(device.device_id, 128);
+    const deviceId = resolveDeviceId(device.device_id);
     if (!deviceId) {
         return null;
     }
@@ -158,13 +161,42 @@ function upsertDevice(device) {
     return cloneJson(merged);
 }
 
+function canonicalizeSnapshotForCache(snapshot) {
+    const normalized = cloneJson(snapshot);
+    const canonicalizeRecord = record => {
+        if (!isPlainObject(record)) {
+            return record;
+        }
+
+        if (record.device_id) {
+            record.device_id = resolveDeviceId(record.device_id);
+        }
+        if (isPlainObject(record.csi) && record.csi.device_id) {
+            record.csi.device_id = resolveDeviceId(record.csi.device_id);
+        }
+        return record;
+    };
+
+    if (isPlainObject(normalized.gateway)) {
+        normalized.gateway.gateway_id = resolveDeviceId(normalized.gateway.gateway_id || "sensair_s3_gateway_01");
+    }
+    normalized.devices = (Array.isArray(normalized.devices) ? normalized.devices : []).map(canonicalizeRecord);
+    normalized.history = (Array.isArray(normalized.history) ? normalized.history : []).map(canonicalizeRecord);
+    normalized.recent_voice_events = (Array.isArray(normalized.recent_voice_events) ? normalized.recent_voice_events : []).map(canonicalizeRecord);
+    normalized.recent_commands = (Array.isArray(normalized.recent_commands) ? normalized.recent_commands : []).map(canonicalizeRecord);
+    if (isPlainObject(normalized.csi) && normalized.csi.device_id) {
+        normalized.csi.device_id = resolveDeviceId(normalized.csi.device_id);
+    }
+    return normalized;
+}
+
 function updateDashboardSnapshot(snapshot, options = {}) {
     if (!isPlainObject(snapshot)) {
         return null;
     }
 
     const serverRecvMs = integerOrNull(options.serverRecvMs ?? snapshot.received_at_ms) ?? Date.now();
-    const normalized = cloneJson(snapshot);
+    const normalized = canonicalizeSnapshotForCache(snapshot);
     state.latest_snapshot = normalized;
     state.gateway = cloneJson(normalized.gateway || defaultGateway(serverRecvMs));
     state.gateway_state = makeGatewayState(state.gateway, serverRecvMs);
@@ -196,7 +228,7 @@ function updateDashboardSnapshot(snapshot, options = {}) {
 
 function updateBmeSensor(prepared, options = {}) {
     const metadata = prepared?.metadata || {};
-    const deviceId = trimText(metadata.device_id, 128);
+    const deviceId = resolveDeviceId(metadata.device_id);
     if (!deviceId) {
         return null;
     }

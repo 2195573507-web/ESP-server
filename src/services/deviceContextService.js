@@ -6,6 +6,9 @@ const {
 const {
     trimText
 } = require("./deviceMetadata");
+const {
+    resolveDeviceId
+} = require("./deviceIdResolver");
 
 const ENVIRONMENT_FRESH_MS = 30000;
 
@@ -108,11 +111,12 @@ function moduleMapFromRows(rows) {
 }
 
 async function readLatestBmeRow(dbAll, deviceId) {
+    const resolvedDeviceId = resolveDeviceId(deviceId);
     const params = [];
     let where = "WHERE deleted_at IS NULL AND (payload_type='sensor.bme690' OR payload_type IS NULL OR payload_type='')";
-    if (deviceId) {
+    if (resolvedDeviceId) {
         where += " AND device_id=?";
-        params.push(deviceId);
+        params.push(resolvedDeviceId);
     }
 
     const rows = await dbAll(
@@ -127,7 +131,7 @@ async function readLatestBmeRow(dbAll, deviceId) {
 
 async function getDeviceContext(dbAll, deviceId = "", options = {}) {
     const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
-    const safeDeviceId = trimText(deviceId, 128);
+    const safeDeviceId = resolveDeviceId(deviceId);
     const device = await readDeviceStatus(dbAll, safeDeviceId, nowMs);
     const inferredDeviceId = safeDeviceId || device?.device_id || "";
     const moduleRows = await readModuleStatuses(dbAll, inferredDeviceId, nowMs);

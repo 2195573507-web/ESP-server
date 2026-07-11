@@ -11,6 +11,9 @@ const {
 const {
     recordEvent
 } = require("./eventLogService");
+const {
+    resolveDeviceId
+} = require("./deviceIdResolver");
 
 const DEFAULT_DEVICE_OFFLINE_TIMEOUT_MS = 30000;
 const MODULE_ONLINE_THRESHOLD_MS = 30000;
@@ -125,17 +128,19 @@ function computeDelayStats(row, delayMs) {
 }
 
 async function getDeviceStatusRow(dbAll, deviceId) {
+    const resolvedDeviceId = resolveDeviceId(deviceId);
     const rows = await dbAll(
         "SELECT * FROM device_status WHERE device_id=? AND deleted_at IS NULL LIMIT 1",
-        [deviceId]
+        [resolvedDeviceId]
     );
     return rowFirst(rows);
 }
 
 async function getModuleStatusRow(dbAll, deviceId, moduleType) {
+    const resolvedDeviceId = resolveDeviceId(deviceId);
     const rows = await dbAll(
         "SELECT * FROM device_module_status WHERE device_id=? AND module_type=? AND deleted_at IS NULL LIMIT 1",
-        [deviceId, moduleType]
+        [resolvedDeviceId, moduleType]
     );
     return rowFirst(rows);
 }
@@ -204,7 +209,7 @@ function computeOnlineState(row, nowMs = Date.now()) {
 }
 
 async function updateDeviceStatus(dbRun, dbAll, metadata, options = {}) {
-    const deviceId = trimText(metadata?.device_id, 128);
+    const deviceId = resolveDeviceId(metadata?.device_id);
     if (!deviceId || typeof dbRun !== "function" || typeof dbAll !== "function") {
         return {
             ok: false,
@@ -377,7 +382,7 @@ async function updateDeviceStatus(dbRun, dbAll, metadata, options = {}) {
 }
 
 async function updateChildStatusFromGatewaySnapshot(dbRun, dbAll, child, options = {}) {
-    const deviceId = trimText(child?.device_id, 128);
+    const deviceId = resolveDeviceId(child?.device_id);
     if (!deviceId || typeof dbRun !== "function" || typeof dbAll !== "function") {
         return {
             ok: false,
@@ -516,7 +521,7 @@ async function updateChildStatusFromGatewaySnapshot(dbRun, dbAll, child, options
 }
 
 async function updateDeviceModuleStatus(dbRun, dbAll, metadata, moduleType) {
-    const deviceId = trimText(metadata?.device_id, 128);
+    const deviceId = resolveDeviceId(metadata?.device_id);
     const safeModuleType = trimText(moduleType || metadata?.payload_type || "", 80);
     if (!deviceId || !safeModuleType || typeof dbRun !== "function" || typeof dbAll !== "function") {
         return {
@@ -617,7 +622,7 @@ function mapDeviceStatus(row, nowMs = Date.now()) {
     const childLastSeenMs = integerOrNull(row.child_last_seen_ms);
     const serverReceivedMs = integerOrNull(row.server_received_ms) ?? integerOrNull(row.last_server_recv_ms);
     return {
-        device_id: row.device_id,
+        device_id: resolveDeviceId(row.device_id),
         device_type: row.device_type || "unknown",
         room_id: row.room_id || "",
         room_name: row.room_name || "",
@@ -654,7 +659,7 @@ function mapStableDeviceStatus(row, nowMs = Date.now(), fallbackDeviceId = "") {
     const mapped = mapDeviceStatus(row, nowMs);
     if (!mapped) {
         return {
-            device_id: fallbackDeviceId,
+            device_id: resolveDeviceId(fallbackDeviceId),
             device_type: "unknown",
             room_id: "",
             room_name: "",
@@ -695,7 +700,7 @@ function mapModuleStatus(row, nowMs = Date.now()) {
     const lastSeenMs = integerOrNull(row.last_seen_ms);
     const ageMs = lastSeenMs === null ? null : Math.max(0, nowMs - lastSeenMs);
     return {
-        device_id: row.device_id,
+        device_id: resolveDeviceId(row.device_id),
         module_type: row.module_type,
         room_id: row.room_id || "",
         room_name: row.room_name || "",
@@ -770,17 +775,18 @@ async function markTimedOutDevices(dbRun, dbAll, nowMs = Date.now()) {
 }
 
 async function readDeviceStatus(dbAll, deviceId, nowMs = Date.now()) {
+    const resolvedDeviceId = resolveDeviceId(deviceId);
     const rows = await dbAll(
-        deviceId
+        resolvedDeviceId
             ? "SELECT * FROM device_status WHERE device_id=? AND deleted_at IS NULL LIMIT 1"
             : "SELECT * FROM device_status WHERE deleted_at IS NULL ORDER BY last_seen_ms DESC LIMIT 1",
-        deviceId ? [deviceId] : []
+        resolvedDeviceId ? [resolvedDeviceId] : []
     );
     return mapDeviceStatus(rowFirst(rows), nowMs);
 }
 
 async function readDeviceStatuses(dbAll, filters = {}, nowMs = Date.now()) {
-    const deviceId = trimText(filters.device_id, 128);
+    const deviceId = resolveDeviceId(filters.device_id);
     const rows = await dbAll(
         deviceId
             ? "SELECT * FROM device_status WHERE device_id=? AND deleted_at IS NULL LIMIT 1"
@@ -795,11 +801,12 @@ async function readDeviceStatuses(dbAll, filters = {}, nowMs = Date.now()) {
 }
 
 async function readModuleStatuses(dbAll, deviceId, nowMs = Date.now()) {
+    const resolvedDeviceId = resolveDeviceId(deviceId);
     const params = [];
     let where = "";
-    if (deviceId) {
+    if (resolvedDeviceId) {
         where = "WHERE device_id=? AND deleted_at IS NULL";
-        params.push(deviceId);
+        params.push(resolvedDeviceId);
     } else {
         where = "WHERE deleted_at IS NULL";
     }

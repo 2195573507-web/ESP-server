@@ -14,8 +14,10 @@ const {
 const {
     recordEvent
 } = require("../services/eventLogService");
+const {
+    resolveDeviceId
+} = require("../services/deviceIdResolver");
 
-const SENSOR_DEVICE_ID_MAX_LENGTH = 128;
 const LEGACY_SENSOR_FALLBACK_DEVICE_ID = "unknown_device";
 
 function toFiniteSensorNumber(value) {
@@ -41,9 +43,7 @@ function normalizeSensorBody(body = {}) {
         payload_type: typeof body.payload_type === "string" && body.payload_type.trim()
             ? body.payload_type.trim().slice(0, 80)
             : "sensor.bme690",
-        device_id: inferredDeviceId === undefined || inferredDeviceId === null
-            ? ""
-            : String(inferredDeviceId).trim().slice(0, SENSOR_DEVICE_ID_MAX_LENGTH)
+        device_id: resolveDeviceId(inferredDeviceId)
     };
 }
 
@@ -123,7 +123,7 @@ function createSensorRouter(options) {
         } = normalizedBody;
         const serverRecvMs = Date.now();
         const timing = buildSensorTimingFields(normalizedBody, serverRecvMs);
-        let deviceId = timing.device_id || normalizedBody.device_id;
+        let deviceId = resolveDeviceId(timing.device_id || normalizedBody.device_id);
         const usedFallbackDeviceId = !deviceId;
         if (!deviceId) {
             deviceId = LEGACY_SENSOR_FALLBACK_DEVICE_ID;
@@ -227,9 +227,15 @@ function createSensorRouter(options) {
                     return;
                 }
 
+                const deviceId = resolveDeviceId(row.device_id);
+                const canonicalRow = {
+                    ...row,
+                    device_id: deviceId
+                };
+
                 db.get(
                     "SELECT * FROM device_status WHERE device_id=? AND deleted_at IS NULL LIMIT 1",
-                    [row.device_id],
+                    [deviceId],
                     (statusErr, deviceStatusRow) => {
                         if (statusErr) {
                             return sendSensorDbError(res, statusErr);
@@ -237,13 +243,13 @@ function createSensorRouter(options) {
 
                         db.get(
                             "SELECT * FROM device_module_status WHERE device_id=? AND module_type='sensor.bme690' AND deleted_at IS NULL LIMIT 1",
-                            [row.device_id],
+                            [deviceId],
                             (moduleErr, moduleStatusRow) => {
                                 if (moduleErr) {
                                     return sendSensorDbError(res, moduleErr);
                                 }
 
-                                res.json(enrichLatestSensorRow(row, deviceStatusRow, moduleStatusRow));
+                                res.json(enrichLatestSensorRow(canonicalRow, deviceStatusRow, moduleStatusRow));
                             }
                         );
                     }

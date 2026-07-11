@@ -34,6 +34,9 @@ const {
     apiError
 } = require("../utils/apiEnvelope");
 const {
+    resolveDeviceId
+} = require("../services/deviceIdResolver");
+const {
     PRIORITY_HIGH,
     PRIORITY_LOW,
     PRIORITY_MEDIUM,
@@ -65,7 +68,7 @@ function mapLatestSensor(row) {
         humidity: row.humidity,
         pressure: row.pressure,
         gas_resistance: row.gas_resistance,
-        device_id: row.device_id,
+        device_id: resolveDeviceId(row.device_id),
         esp_time_ms: row.esp_time_ms,
         esp_uptime_ms: row.esp_uptime_ms,
         server_recv_ms: row.server_recv_ms,
@@ -90,11 +93,12 @@ function mapLatestSensor(row) {
 }
 
 async function readLatestSensor(dbAll, deviceId) {
+    const resolvedDeviceId = resolveDeviceId(deviceId);
     const params = [];
     let where = "WHERE deleted_at IS NULL AND (payload_type='sensor.bme690' OR payload_type IS NULL OR payload_type='')";
-    if (deviceId) {
+    if (resolvedDeviceId) {
         where += " AND device_id=?";
-        params.push(deviceId);
+        params.push(resolvedDeviceId);
     }
 
     const rows = await dbAll(
@@ -342,7 +346,7 @@ function createDeviceRouter(options) {
     async function sendDeviceStatus(req, res, forcedDeviceId = "") {
         const nowMs = Date.now();
         await markTimedOutDevices(dbRun, dbAll, nowMs);
-        const deviceId = trimText(forcedDeviceId || req.query.device_id, 128);
+        const deviceId = resolveDeviceId(forcedDeviceId || req.query.device_id);
         const devices = await readDeviceStatuses(dbAll, {
             device_id: deviceId
         }, nowMs);
@@ -379,7 +383,7 @@ function createDeviceRouter(options) {
     });
 
     router.get("/api/device/v1/modules/status", async (req, res) => {
-        const deviceId = trimText(req.query.device_id, 128);
+        const deviceId = resolveDeviceId(req.query.device_id);
         const modules = await readModuleStatuses(dbAll, deviceId);
         return res.json({
             ok: true,
@@ -389,7 +393,7 @@ function createDeviceRouter(options) {
     });
 
     router.get("/api/device/v1/context", async (req, res) => {
-        const deviceId = trimText(req.query.device_id, 128);
+        const deviceId = resolveDeviceId(req.query.device_id);
         const context = await getDeviceContext(dbAll, deviceId);
         return res.json({
             ok: true,
@@ -399,7 +403,7 @@ function createDeviceRouter(options) {
     });
 
     router.get("/api/device/v1/sensors/latest", async (req, res) => {
-        const deviceId = trimText(req.query.device_id, 128);
+        const deviceId = resolveDeviceId(req.query.device_id);
         const row = await readLatestSensor(dbAll, deviceId);
         return res.json({
             ok: true,

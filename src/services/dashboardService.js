@@ -14,6 +14,9 @@ const {
     trimText
 } = require("./deviceMetadata");
 const {
+    resolveDeviceId
+} = require("./deviceIdResolver");
+const {
     makeSnapshotId
 } = require("../db/dashboardSnapshots");
 const {
@@ -41,18 +44,6 @@ const DASHBOARD_SNAPSHOT_PAYLOAD_TYPE = "gateway.dashboard_snapshot";
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
 const CSI_STATES = new Set(["IDLE", "MOTION", "HOLD"]);
 const MIN_PLAUSIBLE_UNIX_MS = Date.UTC(2000, 0, 1);
-const DASHBOARD_DEVICE_ID_ALIASES = Object.freeze({
-    S3: "sensair_s3_gateway_01",
-    s3: "sensair_s3_gateway_01",
-    C51: "sensair_shuttle_01",
-    c51: "sensair_shuttle_01",
-    C52: "sensair_shuttle_02",
-    c52: "sensair_shuttle_02",
-    sensair_s3_gateway_01: "sensair_s3_gateway_01",
-    sensair_shuttle_01: "sensair_shuttle_01",
-    sensair_shuttle_02: "sensair_shuttle_02"
-});
-
 let latestDashboardSnapshot = null;
 const latestCsiMotionByDevice = new Map();
 
@@ -70,12 +61,7 @@ function parseJsonObject(value, fallback = null) {
 }
 
 function normalizeDashboardDeviceId(value) {
-    const deviceId = trimText(value, 128);
-    if (!deviceId) {
-        return "";
-    }
-
-    return DASHBOARD_DEVICE_ID_ALIASES[deviceId] || deviceId;
+    return resolveDeviceId(value);
 }
 
 function readDashboardLimit(value) {
@@ -346,7 +332,7 @@ function normalizeAppliances(input) {
 function normalizeSnapshotGateway(gateway, serverRecvMs) {
     const source = isPlainObject(gateway) ? gateway : {};
     return {
-        gateway_id: trimText(source.gateway_id || "sensair_s3_gateway_01", 128),
+        gateway_id: resolveDeviceId(source.gateway_id || "sensair_s3_gateway_01"),
         online: booleanValue(source.online, true),
         softap_ready: booleanValue(source.softap_ready, false),
         softap_enabled: booleanValue(source.softap_enabled ?? source.softap_ready, false),
@@ -380,7 +366,7 @@ function projectChildLastSeenMs(childLastSeenMs, gatewayTimestampMs, serverRecvM
 }
 
 function applyTrustedGatewayId(snapshot, trustedGatewayId) {
-    const gatewayId = trimText(trustedGatewayId, 128);
+    const gatewayId = resolveDeviceId(trustedGatewayId);
     if (!gatewayId || !snapshot?.gateway) {
         return snapshot;
     }
@@ -427,7 +413,7 @@ function normalizeSnapshotCsi(csi, serverRecvMs, options = {}) {
 
     if (!available) {
         return {
-            device_id: trimText(source.device_id, 128),
+            device_id: resolveDeviceId(source.device_id),
             link_id: trimText(source.link_id || "fused", 64),
             state: "IDLE",
             available: false,
@@ -440,7 +426,7 @@ function normalizeSnapshotCsi(csi, serverRecvMs, options = {}) {
     }
 
     return {
-        device_id: trimText(source.device_id, 128),
+        device_id: resolveDeviceId(source.device_id),
         link_id: trimText(source.link_id || "fused", 64),
         state,
         available: true,
@@ -457,7 +443,7 @@ function normalizeSnapshotDevice(device, serverRecvMs, gatewayTimestampMs) {
         return null;
     }
 
-    const deviceId = trimText(device.device_id, 128);
+    const deviceId = resolveDeviceId(device.device_id);
     if (!deviceId) {
         return null;
     }
@@ -503,7 +489,7 @@ function normalizeSnapshotHistoryItem(item, serverRecvMs) {
         return null;
     }
 
-    const deviceId = trimText(item.device_id, 128);
+    const deviceId = resolveDeviceId(item.device_id);
     if (!deviceId) {
         return null;
     }
@@ -525,7 +511,7 @@ function normalizeVoiceEvent(item, serverRecvMs) {
     if (!isPlainObject(item)) {
         return null;
     }
-    const deviceId = trimText(item.device_id, 128);
+    const deviceId = resolveDeviceId(item.device_id);
     if (!deviceId) {
         return null;
     }
@@ -544,7 +530,7 @@ function normalizeCommandEvent(item, serverRecvMs) {
         return null;
     }
     const commandId = trimText(item.command_id, 128);
-    const deviceId = trimText(item.device_id, 128);
+    const deviceId = resolveDeviceId(item.device_id);
     if (!commandId || !deviceId) {
         return null;
     }
@@ -690,6 +676,39 @@ function cloneJson(value) {
     return JSON.parse(JSON.stringify(value));
 }
 
+function canonicalizeSnapshotDeviceIds(snapshot) {
+    if (!isPlainObject(snapshot)) {
+        return null;
+    }
+
+    const normalized = cloneJson(snapshot);
+    const canonicalizeRecord = record => {
+        if (!isPlainObject(record)) {
+            return record;
+        }
+
+        if (record.device_id) {
+            record.device_id = resolveDeviceId(record.device_id);
+        }
+        if (isPlainObject(record.csi) && record.csi.device_id) {
+            record.csi.device_id = resolveDeviceId(record.csi.device_id);
+        }
+        return record;
+    };
+
+    if (isPlainObject(normalized.gateway)) {
+        normalized.gateway.gateway_id = resolveDeviceId(normalized.gateway.gateway_id || "sensair_s3_gateway_01");
+    }
+    normalized.devices = (Array.isArray(normalized.devices) ? normalized.devices : []).map(canonicalizeRecord);
+    normalized.history = (Array.isArray(normalized.history) ? normalized.history : []).map(canonicalizeRecord);
+    normalized.recent_voice_events = (Array.isArray(normalized.recent_voice_events) ? normalized.recent_voice_events : []).map(canonicalizeRecord);
+    normalized.recent_commands = (Array.isArray(normalized.recent_commands) ? normalized.recent_commands : []).map(canonicalizeRecord);
+    if (isPlainObject(normalized.csi) && normalized.csi.device_id) {
+        normalized.csi.device_id = resolveDeviceId(normalized.csi.device_id);
+    }
+    return normalized;
+}
+
 function stripMockAppliancesForStorage(snapshot) {
     const stored = cloneJson(snapshot);
     for (const device of stored.devices || []) {
@@ -770,7 +789,7 @@ async function restoreLatestDashboardSnapshot(dbAll) {
         ORDER BY server_recv_ms DESC, id DESC
         LIMIT 1`
     );
-    const payload = snapshotRowToPayload(rows[0]);
+    const payload = canonicalizeSnapshotDeviceIds(snapshotRowToPayload(rows[0]));
     if (payload) {
         latestDashboardSnapshot = payload;
     }
@@ -802,10 +821,10 @@ async function readDashboardSnapshotHistory(dbAll, query = {}) {
 
     return rows.map(row => ({
         snapshot_id: row.snapshot_id,
-        gateway_id: row.gateway_id,
+        gateway_id: resolveDeviceId(row.gateway_id),
         server_recv_ms: integerOrNull(row.server_recv_ms),
         schema_version: integerOrNull(row.schema_version),
-        payload: snapshotRowToPayload(row),
+        payload: canonicalizeSnapshotDeviceIds(snapshotRowToPayload(row)),
         created_at: row.created_at || ""
     }));
 }
@@ -848,7 +867,9 @@ function prepareDashboardSnapshot(body, options = {}) {
         };
     }
 
-    latestDashboardSnapshot = applyTrustedGatewayId(validation.snapshot, options.trustedGatewayId);
+    latestDashboardSnapshot = canonicalizeSnapshotDeviceIds(
+        applyTrustedGatewayId(validation.snapshot, options.trustedGatewayId)
+    );
     const gatewayId = latestDashboardSnapshot.gateway.gateway_id;
     const snapshotId = makeSnapshotId(gatewayId, serverRecvMs);
 
@@ -1017,7 +1038,7 @@ function readAirQuality(row) {
 
 function mapDashboardDeviceStatus(status, fallbackDeviceId = "") {
     return {
-        device_id: status?.device_id || fallbackDeviceId || null,
+        device_id: resolveDeviceId(status?.device_id || fallbackDeviceId),
         online: Boolean(status?.online),
         device_online: Boolean(status?.device_online),
         status: textOrNull(status?.status),
@@ -1039,7 +1060,7 @@ function mapDashboardDeviceStatus(status, fallbackDeviceId = "") {
 
 function mapDashboardModuleStatus(moduleStatus) {
     return {
-        device_id: moduleStatus?.device_id || null,
+        device_id: resolveDeviceId(moduleStatus?.device_id),
         module_type: moduleStatus?.module_type || null,
         online: Boolean(moduleStatus?.online),
         module_online: Boolean(moduleStatus?.module_online),
@@ -1125,7 +1146,7 @@ function adaptGatewayForOverview(snapshot, statuses) {
     const lastSeen = gatewayStatus?.last_seen_ms ?? integerOrNull(gateway.timestamp) ?? snapshot.received_at_ms ?? null;
     return {
         ...gateway,
-        gateway_id: gateway.gateway_id || "sensair_s3_gateway_01",
+        gateway_id: resolveDeviceId(gateway.gateway_id || "sensair_s3_gateway_01"),
         online: Boolean(gatewayStatus?.online ?? gateway.online),
         status_source: "server",
         lastSeen,
@@ -1149,7 +1170,7 @@ function adaptDeviceForOverview(device, statuses, modules) {
 
     return {
         ...device,
-        device_id: device.device_id,
+        device_id: resolveDeviceId(device.device_id),
         device_type: serverStatus?.device_type || device.device_type || "C5",
         room_id: serverStatus?.room_id || device.room_id || "",
         room_name: serverStatus?.room_name || device.room_name || "",
@@ -1287,7 +1308,7 @@ function mapDashboardSensor(row, deviceStatus = null, moduleStatus = null, optio
         humidity: numberOrNull(row.humidity),
         pressure: numberOrNull(row.pressure),
         gas_resistance: numberOrNull(row.gas_resistance),
-        device_id: textOrNull(row.device_id),
+        device_id: resolveDeviceId(row.device_id),
         sensor_id: textOrNull(row.sensor_id),
         payload_type: textOrNull(row.payload_type || "sensor.bme690"),
         esp_time_ms: integerOrNull(row.esp_time_ms),
@@ -1430,7 +1451,7 @@ async function readDashboardCsiHistory(dbAll, query = {}) {
     return {
         events: rows.map(row => ({
             id: row.id,
-            device_id: row.device_id,
+            device_id: resolveDeviceId(row.device_id),
             link_id: row.link_id,
             state: row.state,
             frame_energy: numberOrNull(row.frame_energy),
@@ -1573,7 +1594,7 @@ async function readDashboardOverview(dbAll, query = {}, options = {}) {
         devices,
         home_summary: computeHomeSummary(devices),
         history: Array.isArray(history) ? history.map(row => ({
-            device_id: row.device_id,
+            device_id: resolveDeviceId(row.device_id),
             sensor_type: "bme690",
             timestamp: row.timestamp,
             temperature: row.temperature,

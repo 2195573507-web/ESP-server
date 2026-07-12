@@ -3,7 +3,8 @@ const {
 } = require("../utils/env");
 
 const DEFAULT_VOLC_GATEWAY_WS_AUDIO_CHUNK_BYTES = 32000;
-const DEFAULT_VOICE_TURN_TIMEOUT_MS = 45000;
+const VOICE_REQUEST_TIMEOUT_MS = 60000;
+const DEFAULT_VOICE_TURN_TIMEOUT_MS = VOICE_REQUEST_TIMEOUT_MS;
 const DEFAULT_VOICE_TURN_MAX_CONCURRENT = 1;
 const DEFAULT_VOICE_TURN_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_LLM_TIMEOUT_MS = 30000;
@@ -29,6 +30,7 @@ function readVoiceLlmTimeoutMs() {
 }
 
 module.exports = {
+    VOICE_REQUEST_TIMEOUT_MS,
     readVoiceLlmTimeoutMs,
     readVoiceTurnConfig,
     readVoiceTurnMaxBytes

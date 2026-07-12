@@ -72,6 +72,14 @@ function readBooleanOrNull(value) {
     return null;
 }
 
+function copyOpaqueObject(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return undefined;
+    }
+
+    return JSON.parse(JSON.stringify(value));
+}
+
 function logAirQualityDecision(logger, source, reason = "") {
     const target = logger || console;
     if (source === "fallback") {
@@ -88,8 +96,8 @@ function logAirQualityDecision(logger, source, reason = "") {
 }
 
 function normalizeV3AirQuality(payload) {
-    const input = payload.air_quality;
-    if (!input || typeof input !== "object" || Array.isArray(input)) {
+    const input = copyOpaqueObject(payload.air_quality);
+    if (!input) {
         return {
             ok: false,
             reason: "v3_air_quality_missing"
@@ -124,31 +132,25 @@ function normalizeV3AirQuality(payload) {
         };
     }
 
+    // C5 owns this object. Keep every supplied field, including future v3 fields.
     return {
         ok: true,
-        airQuality: {
-            // Keep additive C5 v3 fields in air_quality_json for downstream cache/snapshot consumers.
-            ...input,
-            air_quality_score: score,
-            air_quality_level: normalizedLevel,
-            air_quality_confidence: normalizedConfidence,
-            air_quality_algo_version: algorithm,
-            air_quality_source: "v3",
-            gas_baseline_ohm: toFiniteNumber(payload.gas_baseline_ohm),
-            gas_ratio: gasRatio,
-            gas_score: roundOrNull(toFiniteNumber(payload.gas_score)),
-            humidity_score: roundOrNull(toFiniteNumber(payload.humidity_score)),
-            baseline_ready: baselineReady,
-            warmup_done: readBooleanOrNull(payload.warmup_done) === true,
-            sample_count: Number.isFinite(Number(payload.sample_count)) ? Math.trunc(Number(payload.sample_count)) : null,
-            algorithm,
-            score,
-            level: normalizedLevel,
-            confidence: normalizedConfidence,
-            source: "v3",
-            stability_score: stabilityScore,
-            sensor_state: sensorState
-        }
+        airQuality: input
+    };
+}
+
+function readAirQualityCompatibility(airQuality) {
+    const source = airQuality && typeof airQuality === "object" ? airQuality : {};
+    return {
+        air_quality_score: toFiniteNumber(source.air_quality_score ?? source.score),
+        air_quality_level: trimText(source.air_quality_level ?? source.level, 40) || null,
+        air_quality_confidence: trimText(source.air_quality_confidence ?? source.confidence, 40) || null,
+        air_quality_algo_version: trimText(source.air_quality_algo_version ?? source.algorithm, 80) || null,
+        air_quality_source: trimText(source.air_quality_source ?? source.source, 40) || null,
+        gas_baseline_ohm: toFiniteNumber(source.gas_baseline_ohm),
+        gas_ratio: toFiniteNumber(source.gas_ratio),
+        gas_score: roundOrNull(toFiniteNumber(source.gas_score)),
+        humidity_score: roundOrNull(toFiniteNumber(source.humidity_score))
     };
 }
 
@@ -211,46 +213,18 @@ function normalizeLegacyAirQuality(payload) {
 }
 
 function buildFallbackAirQuality(payload, readings) {
-    const gasBaseline = toFiniteNumber(payload.gas_baseline_ohm);
-
-    const fallbackBaseline = gasBaseline && gasBaseline > 0
-        ? gasBaseline
-        : (readings.gas_resistance_ohm > 0 ? readings.gas_resistance_ohm : null);
-    if (!fallbackBaseline) {
-        return {
-            air_quality_score: null,
-            air_quality_level: "unknown",
-            air_quality_confidence: "none",
-            air_quality_algo_version: AIR_QUALITY_ALGO_VERSION,
-            air_quality_source: "server_fallback",
-            gas_baseline_ohm: null,
-            gas_ratio: null,
-            gas_score: null,
-            humidity_score: null,
-            baseline_ready: false,
-            warmup_done: false,
-            sample_count: null
-        };
-    }
-
-    const fallbackGasRatio = clamp(readings.gas_resistance_ohm / fallbackBaseline, 0, 1.5);
-    const fallbackGasScore = Math.round(clamp(fallbackGasRatio * 100, 0, 100));
-    const humidityDeviation = Math.abs(readings.humidity_percent - 50);
-    const fallbackHumidityScore = Math.round(clamp(100 - humidityDeviation * 2.5, 0, 100));
-    const fallbackScore = Math.round(clamp(fallbackGasScore * 0.75 + fallbackHumidityScore * 0.25, 0, 100));
-
     return {
-        air_quality_score: fallbackScore,
-        air_quality_level: levelForScore(fallbackScore),
-        air_quality_confidence: "low",
-        air_quality_algo_version: AIR_QUALITY_ALGO_VERSION,
-        air_quality_source: "server_fallback",
-        gas_baseline_ohm: fallbackBaseline,
-        gas_ratio: fallbackGasRatio,
-        gas_score: fallbackGasScore,
-        humidity_score: fallbackHumidityScore,
-        baseline_ready: false,
-        warmup_done: false,
+        air_quality_score: toFiniteNumber(payload.air_quality_score),
+        air_quality_level: trimText(payload.air_quality_level, 40) || "unknown",
+        air_quality_confidence: trimText(payload.air_quality_confidence, 40) || "none",
+        air_quality_algo_version: trimText(payload.air_quality_algo_version, 80) || null,
+        air_quality_source: "unavailable",
+        gas_baseline_ohm: toFiniteNumber(payload.gas_baseline_ohm),
+        gas_ratio: toFiniteNumber(payload.gas_ratio),
+        gas_score: roundOrNull(toFiniteNumber(payload.gas_score)),
+        humidity_score: roundOrNull(toFiniteNumber(payload.humidity_score)),
+        baseline_ready: readBooleanOrNull(payload.baseline_ready),
+        warmup_done: readBooleanOrNull(payload.warmup_done),
         sample_count: Number.isFinite(Number(payload.sample_count)) ? Math.trunc(Number(payload.sample_count)) : null
     };
 }
@@ -361,6 +335,10 @@ function prepareBme690Ingest(body, options = {}) {
     const airQuality = normalizeAirQuality(payload, validation.readings, {
         logger: options.logger
     });
+    const airQualityCompatibility = readAirQualityCompatibility(airQuality);
+    // These C5-owned objects remain opaque throughout the server pipeline.
+    const bmeDiag = copyOpaqueObject(payload.bme_diag);
+    const baselineState = copyOpaqueObject(payload.baseline_state);
     const rawJson = JSON.stringify(body);
     const metadataJson = JSON.stringify(metadataForStorage(metadata));
     const airQualityJson = JSON.stringify(airQuality);
@@ -373,6 +351,9 @@ function prepareBme690Ingest(body, options = {}) {
         readings: validation.readings,
         sensorId,
         airQuality,
+        airQualityCompatibility,
+        bmeDiag,
+        baselineState,
         rawJson,
         metadataJson,
         airQualityJson,
@@ -385,7 +366,10 @@ function prepareBme690Ingest(body, options = {}) {
             server_recv_ms: metadata.server_recv_ms,
             server_time_iso: metadata.server_time_iso,
             upload_delay_ms: metadata.upload_delay_ms,
-            air_quality: airQuality
+            air_quality: airQuality,
+            air_quality_score: airQualityCompatibility.air_quality_score,
+            air_quality_level: airQualityCompatibility.air_quality_level,
+            air_quality_confidence: airQualityCompatibility.air_quality_confidence
         }
     };
 }
@@ -422,15 +406,15 @@ async function persistBme690Ingest(dbRun, dbAll, prepared) {
             prepared.metadataJson,
             prepared.rawJson,
             prepared.airQualityJson,
-            prepared.airQuality.air_quality_score,
-            prepared.airQuality.air_quality_level,
-            prepared.airQuality.air_quality_confidence,
-            prepared.airQuality.air_quality_algo_version,
-            prepared.airQuality.air_quality_source,
-            prepared.airQuality.gas_baseline_ohm,
-            prepared.airQuality.gas_ratio,
-            prepared.airQuality.gas_score,
-            prepared.airQuality.humidity_score
+            prepared.airQualityCompatibility.air_quality_score,
+            prepared.airQualityCompatibility.air_quality_level,
+            prepared.airQualityCompatibility.air_quality_confidence,
+            prepared.airQualityCompatibility.air_quality_algo_version,
+            prepared.airQualityCompatibility.air_quality_source,
+            prepared.airQualityCompatibility.gas_baseline_ohm,
+            prepared.airQualityCompatibility.gas_ratio,
+            prepared.airQualityCompatibility.gas_score,
+            prepared.airQualityCompatibility.humidity_score
         ]
     );
 

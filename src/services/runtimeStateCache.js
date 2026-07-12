@@ -97,16 +97,25 @@ function makeGatewayState(gateway, serverRecvMs = Date.now()) {
 function sensorFromBmePrepared(prepared) {
     const readings = prepared?.readings || {};
     const airQuality = prepared?.airQuality || {};
+    const airQualityCompatibility = prepared?.airQualityCompatibility || airQuality;
+    const bmeDiag = prepared?.bmeDiag;
+    const baselineState = prepared?.baselineState;
     return {
         temperature: readings.temperature_c,
         humidity: readings.humidity_percent,
         pressure: readings.pressure_hpa,
         gas_resistance: readings.gas_resistance_ohm,
-        air_quality_score: airQuality.air_quality_score,
-        air_quality_level: airQuality.air_quality_level,
-        air_quality_confidence: airQuality.air_quality_confidence,
-        air_quality_source: airQuality.air_quality_source,
-        air_quality: cloneJson(airQuality)
+        air_quality_score: airQualityCompatibility.air_quality_score,
+        air_quality_level: airQualityCompatibility.air_quality_level,
+        air_quality_confidence: airQualityCompatibility.air_quality_confidence,
+        air_quality_source: airQualityCompatibility.air_quality_source,
+        air_quality: cloneJson(airQuality),
+        ...(isPlainObject(bmeDiag) ? {
+            bme_diag: cloneJson(bmeDiag)
+        } : {}),
+        ...(isPlainObject(baselineState) ? {
+            baseline_state: cloneJson(baselineState)
+        } : {})
     };
 }
 

@@ -383,6 +383,12 @@ function normalizeSnapshotSensors(sensors) {
     const suppliedAirQuality = isPlainObject(sensors.air_quality)
         ? cloneJson(sensors.air_quality)
         : null;
+    const bmeDiag = isPlainObject(sensors.bme_diag)
+        ? cloneJson(sensors.bme_diag)
+        : null;
+    const baselineState = isPlainObject(sensors.baseline_state)
+        ? cloneJson(sensors.baseline_state)
+        : null;
     const score = integerOrNull(sensors.air_quality_score ?? suppliedAirQuality?.air_quality_score ?? suppliedAirQuality?.score);
     const level = trimText(sensors.air_quality_level ?? suppliedAirQuality?.air_quality_level ?? suppliedAirQuality?.level, 40) || "unknown";
     const confidence = trimText(sensors.air_quality_confidence ?? suppliedAirQuality?.air_quality_confidence ?? suppliedAirQuality?.confidence, 40);
@@ -399,6 +405,12 @@ function normalizeSnapshotSensors(sensors) {
         air_quality_source: source,
         ...(suppliedAirQuality ? {
             air_quality: suppliedAirQuality
+        } : {}),
+        ...(bmeDiag ? {
+            bme_diag: bmeDiag
+        } : {}),
+        ...(baselineState ? {
+            baseline_state: baselineState
         } : {})
     };
 }
@@ -1030,6 +1042,13 @@ async function ingestDashboardSnapshot(body, options = {}) {
 function readAirQuality(row) {
     const parsed = parseJsonObject(row?.air_quality_json, null);
     const airQuality = isPlainObject(parsed) ? cloneJson(parsed) : null;
+    const rawPayload = parseJsonObject(row?.raw_json, null)?.payload;
+    const bmeDiag = isPlainObject(rawPayload?.bme_diag)
+        ? cloneJson(rawPayload.bme_diag)
+        : null;
+    const baselineState = isPlainObject(rawPayload?.baseline_state)
+        ? cloneJson(rawPayload.baseline_state)
+        : null;
     const score = row?.air_quality_score ?? airQuality?.air_quality_score ?? airQuality?.score ?? null;
     const level = row?.air_quality_level || airQuality?.air_quality_level || airQuality?.level || null;
     const confidence = row?.air_quality_confidence || airQuality?.air_quality_confidence || airQuality?.confidence || null;
@@ -1044,6 +1063,8 @@ function readAirQuality(row) {
 
     return {
         air_quality: airQuality,
+        bme_diag: bmeDiag,
+        baseline_state: baselineState,
         air_quality_score: score,
         air_quality_level: level,
         air_quality_confidence: confidence,
@@ -1213,6 +1234,8 @@ function adaptDeviceForOverview(device, statuses, modules) {
         air_quality_level: sensors.air_quality_level || "unknown",
         air_quality_confidence: sensors.air_quality_confidence || null,
         air_quality: isPlainObject(sensors.air_quality) ? cloneJson(sensors.air_quality) : null,
+        bme_diag: isPlainObject(sensors.bme_diag) ? cloneJson(sensors.bme_diag) : null,
+        baseline_state: isPlainObject(sensors.baseline_state) ? cloneJson(sensors.baseline_state) : null,
         temperature_c: numberValueOrNull(sensors.temperature ?? sensors.temperature_c),
         humidity_percent: numberValueOrNull(sensors.humidity ?? sensors.humidity_percent),
         pressure_hpa: numberValueOrNull(sensors.pressure ?? sensors.pressure_hpa),
@@ -1596,7 +1619,13 @@ async function readDashboardOverview(dbAll, query = {}, options = {}) {
             air_quality_level: sensorLatest.air_quality_level,
             air_quality_confidence: sensorLatest.air_quality_confidence,
             air_quality_source: sensorLatest.air_quality_source,
-            air_quality: sensorLatest.air_quality
+            air_quality: sensorLatest.air_quality,
+            ...(sensorLatest.bme_diag ? {
+                bme_diag: sensorLatest.bme_diag
+            } : {}),
+            ...(sensorLatest.baseline_state ? {
+                baseline_state: sensorLatest.baseline_state
+            } : {})
         } : null,
         csi: normalizeSnapshotCsi(null, Date.now(), {
             availableDefault: false

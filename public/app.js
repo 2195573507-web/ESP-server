@@ -1310,7 +1310,7 @@ function buildMetrics(sensor, deviceStatus = dashboardState.deviceStatus) {
     const airLevel = sensor.airQualityScore === null ? "unknown" : "normal";
     const airDisplay = sensor.airQualityScore === null
         ? DISCONNECTED_TEXT
-        : `${formatNumber(sensor.airQualityScore, 0)} 分${sensor.airQualityLevel ? ` · ${sensor.airQualityLevel}` : ""}`;
+        : `${formatNumber(sensor.airQualityScore, 0)} 分`;
 
     return {
         temperature: {
@@ -1555,7 +1555,6 @@ function renderMetricCards() {
     });
 
     const metrics = dashboardState.metrics;
-    const airQualityState = getAirQualityState(metrics.air.value);
     setText("#temperatureValue", metrics.temperature.display || NO_DATA_TEXT);
     setText("#humidityValue", metrics.humidity.display || NO_DATA_TEXT);
     setText("#airQualityValue", metrics.air.display || NO_DATA_TEXT);
@@ -1572,7 +1571,7 @@ function renderMetricCards() {
 
     setMetricChange('[data-field="temperatureChange"]', sourceLabel(metrics.temperature.source), metrics.temperature.level);
     setMetricChange('[data-field="humidityChange"]', sourceLabel(metrics.humidity.source), metrics.humidity.level);
-    setMetricChange('[data-field="airChange"]', `${sourceLabel(metrics.air.source)} · ${airQualityState.label}`, metrics.air.level);
+    setMetricChange('[data-field="airChange"]', sourceLabel(metrics.air.source), metrics.air.level);
     setMetricChange('[data-field="espStatusNote"]', metrics.esp.note, metrics.esp.level);
     const sensorTooltip = () => [
         `来源：ESP32 ${deviceId}`
@@ -2318,7 +2317,7 @@ function buildSensorSnapshotText(rawSensor, sensor, deviceStatus = dashboardStat
         parts.push(`湿度 ${formatNumber(humidity)}%`);
     }
     if (airQualityScore !== null) {
-        parts.push(`空气质量 ${formatNumber(airQualityScore, 0)} 分${airQualityLevel ? ` · ${airQualityLevel}` : ""}`);
+        parts.push(`空气质量 ${formatNumber(airQualityScore, 0)} 分`);
     }
     if (sensor && sensor.hasTimestamp) {
         parts.push(`时间 ${formatTime(sensor.timestamp)}`);

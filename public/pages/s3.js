@@ -651,9 +651,7 @@
         const rawScore = device?.sensors?.air_quality_score;
         const score = rawScore === null || rawScore === undefined || rawScore === "" ? NaN : Number(rawScore);
         if (!Number.isFinite(score)) return SENSOR_EMPTY_TEXT;
-        const airState = getDeviceAirQualityState(device);
-        const label = airState.label ? ` · ${airState.label}` : "";
-        return `${formatNumber(score, 0)} 分${label}`;
+        return `${formatNumber(score, 0)} 分`;
     }
 
     function getApplianceStatus(appliances, slot, online) {

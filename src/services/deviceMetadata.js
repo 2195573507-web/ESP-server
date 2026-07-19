@@ -4,6 +4,9 @@ const PAYLOAD_TYPE_MAX_LENGTH = 80;
 const MAX_VALID_UPLOAD_DELAY_MS = 60000;
 const DEFAULT_CLOCK_MAX_FUTURE_SKEW_MS = 10000;
 const DEFAULT_CLOCK_MAX_PAST_SKEW_MS = 24 * 60 * 60 * 1000;
+const {
+    resolveDeviceId
+} = require("./deviceIdResolver");
 
 function readHeader(headers = {}, name) {
     return headers[String(name || "").toLowerCase()];
@@ -159,7 +162,7 @@ function readDeviceMetadata(input = {}) {
     const espTimeMs = toIntegerOrNull(firstValue(body.esp_time_ms, readHeader(headers, "x-esp-time-ms")));
     const metadata = {
         schema_version: toIntegerOrNull(firstValue(body.schema_version, readHeader(headers, "x-schema-version"))),
-        device_id: trimText(
+        device_id: resolveDeviceId(
             firstValue(
                 body.device_id,
                 body.id,
@@ -171,8 +174,7 @@ function readDeviceMetadata(input = {}) {
                 readHeader(headers, "x-client-id"),
                 query.device_id,
                 input.deviceId
-            ),
-            DEVICE_ID_MAX_LENGTH
+            )
         ),
         device_type: trimText(firstValue(body.device_type, readHeader(headers, "x-device-type"))),
         room_id: trimText(firstValue(body.room_id, query.room_id, readHeader(headers, "x-room-id"))),

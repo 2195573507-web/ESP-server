@@ -14,6 +14,9 @@ const {
     trimText
 } = require("./deviceMetadata");
 const {
+    resolveDeviceId
+} = require("./deviceIdResolver");
+const {
     makeSnapshotId
 } = require("../db/dashboardSnapshots");
 const {
@@ -41,18 +44,6 @@ const DASHBOARD_SNAPSHOT_PAYLOAD_TYPE = "gateway.dashboard_snapshot";
 const CSI_MOTION_PAYLOAD_TYPE = "csi.motion";
 const CSI_STATES = new Set(["IDLE", "MOTION", "HOLD"]);
 const MIN_PLAUSIBLE_UNIX_MS = Date.UTC(2000, 0, 1);
-const DASHBOARD_DEVICE_ID_ALIASES = Object.freeze({
-    S3: "sensair_s3_gateway_01",
-    s3: "sensair_s3_gateway_01",
-    C51: "sensair_shuttle_01",
-    c51: "sensair_shuttle_01",
-    C52: "sensair_shuttle_02",
-    c52: "sensair_shuttle_02",
-    sensair_s3_gateway_01: "sensair_s3_gateway_01",
-    sensair_shuttle_01: "sensair_shuttle_01",
-    sensair_shuttle_02: "sensair_shuttle_02"
-});
-
 let latestDashboardSnapshot = null;
 const latestCsiMotionByDevice = new Map();
 
@@ -70,12 +61,7 @@ function parseJsonObject(value, fallback = null) {
 }
 
 function normalizeDashboardDeviceId(value) {
-    const deviceId = trimText(value, 128);
-    if (!deviceId) {
-        return "";
-    }
-
-    return DASHBOARD_DEVICE_ID_ALIASES[deviceId] || deviceId;
+    return resolveDeviceId(value);
 }
 
 function readDashboardLimit(value) {
@@ -346,7 +332,7 @@ function normalizeAppliances(input) {
 function normalizeSnapshotGateway(gateway, serverRecvMs) {
     const source = isPlainObject(gateway) ? gateway : {};
     return {
-        gateway_id: trimText(source.gateway_id || "sensair_s3_gateway_01", 128),
+        gateway_id: resolveDeviceId(source.gateway_id || "sensair_s3_gateway_01"),
         online: booleanValue(source.online, true),
         softap_ready: booleanValue(source.softap_ready, false),
         softap_enabled: booleanValue(source.softap_enabled ?? source.softap_ready, false),
@@ -380,7 +366,7 @@ function projectChildLastSeenMs(childLastSeenMs, gatewayTimestampMs, serverRecvM
 }
 
 function applyTrustedGatewayId(snapshot, trustedGatewayId) {
-    const gatewayId = trimText(trustedGatewayId, 128);
+    const gatewayId = resolveDeviceId(trustedGatewayId);
     if (!gatewayId || !snapshot?.gateway) {
         return snapshot;
     }
@@ -394,14 +380,38 @@ function normalizeSnapshotSensors(sensors) {
         return null;
     }
 
+    const suppliedAirQuality = isPlainObject(sensors.air_quality)
+        ? cloneJson(sensors.air_quality)
+        : null;
+    const bmeDiag = isPlainObject(sensors.bme_diag)
+        ? cloneJson(sensors.bme_diag)
+        : null;
+    const baselineState = isPlainObject(sensors.baseline_state)
+        ? cloneJson(sensors.baseline_state)
+        : null;
+    const score = integerOrNull(sensors.air_quality_score ?? suppliedAirQuality?.air_quality_score ?? suppliedAirQuality?.score);
+    const level = trimText(sensors.air_quality_level ?? suppliedAirQuality?.air_quality_level ?? suppliedAirQuality?.level, 40) || "unknown";
+    const confidence = trimText(sensors.air_quality_confidence ?? suppliedAirQuality?.air_quality_confidence ?? suppliedAirQuality?.confidence, 40);
+    const source = trimText(sensors.air_quality_source ?? suppliedAirQuality?.air_quality_source ?? suppliedAirQuality?.source, 40) || "s3_mapped";
+
     return {
         temperature: numberValueOrNull(sensors.temperature ?? sensors.temperature_c),
         humidity: numberValueOrNull(sensors.humidity ?? sensors.humidity_percent),
         pressure: numberValueOrNull(sensors.pressure ?? sensors.pressure_hpa),
         gas_resistance: numberValueOrNull(sensors.gas_resistance ?? sensors.gas_resistance_ohm),
-        air_quality_score: integerOrNull(sensors.air_quality_score),
-        air_quality_level: trimText(sensors.air_quality_level, 40) || "unknown",
-        air_quality_source: trimText(sensors.air_quality_source, 40) || "s3_mapped"
+        air_quality_score: score,
+        air_quality_level: level,
+        air_quality_confidence: confidence,
+        air_quality_source: source,
+        ...(suppliedAirQuality ? {
+            air_quality: suppliedAirQuality
+        } : {}),
+        ...(bmeDiag ? {
+            bme_diag: bmeDiag
+        } : {}),
+        ...(baselineState ? {
+            baseline_state: baselineState
+        } : {})
     };
 }
 
@@ -427,7 +437,7 @@ function normalizeSnapshotCsi(csi, serverRecvMs, options = {}) {
 
     if (!available) {
         return {
-            device_id: trimText(source.device_id, 128),
+            device_id: resolveDeviceId(source.device_id),
             link_id: trimText(source.link_id || "fused", 64),
             state: "IDLE",
             available: false,
@@ -440,7 +450,7 @@ function normalizeSnapshotCsi(csi, serverRecvMs, options = {}) {
     }
 
     return {
-        device_id: trimText(source.device_id, 128),
+        device_id: resolveDeviceId(source.device_id),
         link_id: trimText(source.link_id || "fused", 64),
         state,
         available: true,
@@ -457,7 +467,7 @@ function normalizeSnapshotDevice(device, serverRecvMs, gatewayTimestampMs) {
         return null;
     }
 
-    const deviceId = trimText(device.device_id, 128);
+    const deviceId = resolveDeviceId(device.device_id);
     if (!deviceId) {
         return null;
     }
@@ -465,7 +475,10 @@ function normalizeSnapshotDevice(device, serverRecvMs, gatewayTimestampMs) {
         return null;
     }
 
-    const online = booleanValue(device.online, false);
+    const voiceBusy = booleanValue(device.voice_busy, false);
+    // voice_busy is an active S3 child-registry state. It must not be exposed
+    // as offline merely because the separate online bit is momentarily stale.
+    const online = booleanValue(device.online, false) || voiceBusy;
     const childLastSeenMs = integerOrNull(device.child_last_seen_ms ?? device.last_seen_ms);
     const lastSeenMs = projectChildLastSeenMs(childLastSeenMs, gatewayTimestampMs, serverRecvMs);
 
@@ -482,7 +495,7 @@ function normalizeSnapshotDevice(device, serverRecvMs, gatewayTimestampMs) {
         status: trimText(device.status, 40) || (online ? "online" : "offline"),
         offline_reason: trimText(device.offline_reason, 128) || null,
         link_lost: booleanValue(device.link_lost, false),
-        voice_busy: booleanValue(device.voice_busy, false),
+        voice_busy: voiceBusy,
         child_last_seen_ms: childLastSeenMs,
         server_received_ms: serverRecvMs,
         // Public status timestamps stay in Server epoch time. child_last_seen_ms
@@ -503,7 +516,7 @@ function normalizeSnapshotHistoryItem(item, serverRecvMs) {
         return null;
     }
 
-    const deviceId = trimText(item.device_id, 128);
+    const deviceId = resolveDeviceId(item.device_id);
     if (!deviceId) {
         return null;
     }
@@ -525,7 +538,7 @@ function normalizeVoiceEvent(item, serverRecvMs) {
     if (!isPlainObject(item)) {
         return null;
     }
-    const deviceId = trimText(item.device_id, 128);
+    const deviceId = resolveDeviceId(item.device_id);
     if (!deviceId) {
         return null;
     }
@@ -544,7 +557,7 @@ function normalizeCommandEvent(item, serverRecvMs) {
         return null;
     }
     const commandId = trimText(item.command_id, 128);
-    const deviceId = trimText(item.device_id, 128);
+    const deviceId = resolveDeviceId(item.device_id);
     if (!commandId || !deviceId) {
         return null;
     }
@@ -563,6 +576,7 @@ function computeHomeSummary(devices) {
     const summary = {
         online_device_count: 0,
         offline_device_count: 0,
+        unknown_device_count: 0,
         avg_temperature: null,
         avg_humidity: null,
         avg_air_quality: null
@@ -573,10 +587,12 @@ function computeHomeSummary(devices) {
     let count = 0;
 
     for (const device of devices) {
-        if (device.online) {
+        if (device.online === true) {
             summary.online_device_count += 1;
-        } else {
+        } else if (device.online === false) {
             summary.offline_device_count += 1;
+        } else {
+            summary.unknown_device_count += 1;
         }
         if (device.online && device.sensors) {
             if (Number.isFinite(device.sensors.temperature)) {
@@ -690,6 +706,39 @@ function cloneJson(value) {
     return JSON.parse(JSON.stringify(value));
 }
 
+function canonicalizeSnapshotDeviceIds(snapshot) {
+    if (!isPlainObject(snapshot)) {
+        return null;
+    }
+
+    const normalized = cloneJson(snapshot);
+    const canonicalizeRecord = record => {
+        if (!isPlainObject(record)) {
+            return record;
+        }
+
+        if (record.device_id) {
+            record.device_id = resolveDeviceId(record.device_id);
+        }
+        if (isPlainObject(record.csi) && record.csi.device_id) {
+            record.csi.device_id = resolveDeviceId(record.csi.device_id);
+        }
+        return record;
+    };
+
+    if (isPlainObject(normalized.gateway)) {
+        normalized.gateway.gateway_id = resolveDeviceId(normalized.gateway.gateway_id || "sensair_s3_gateway_01");
+    }
+    normalized.devices = (Array.isArray(normalized.devices) ? normalized.devices : []).map(canonicalizeRecord);
+    normalized.history = (Array.isArray(normalized.history) ? normalized.history : []).map(canonicalizeRecord);
+    normalized.recent_voice_events = (Array.isArray(normalized.recent_voice_events) ? normalized.recent_voice_events : []).map(canonicalizeRecord);
+    normalized.recent_commands = (Array.isArray(normalized.recent_commands) ? normalized.recent_commands : []).map(canonicalizeRecord);
+    if (isPlainObject(normalized.csi) && normalized.csi.device_id) {
+        normalized.csi.device_id = resolveDeviceId(normalized.csi.device_id);
+    }
+    return normalized;
+}
+
 function stripMockAppliancesForStorage(snapshot) {
     const stored = cloneJson(snapshot);
     for (const device of stored.devices || []) {
@@ -770,7 +819,7 @@ async function restoreLatestDashboardSnapshot(dbAll) {
         ORDER BY server_recv_ms DESC, id DESC
         LIMIT 1`
     );
-    const payload = snapshotRowToPayload(rows[0]);
+    const payload = canonicalizeSnapshotDeviceIds(snapshotRowToPayload(rows[0]));
     if (payload) {
         latestDashboardSnapshot = payload;
     }
@@ -802,10 +851,10 @@ async function readDashboardSnapshotHistory(dbAll, query = {}) {
 
     return rows.map(row => ({
         snapshot_id: row.snapshot_id,
-        gateway_id: row.gateway_id,
+        gateway_id: resolveDeviceId(row.gateway_id),
         server_recv_ms: integerOrNull(row.server_recv_ms),
         schema_version: integerOrNull(row.schema_version),
-        payload: snapshotRowToPayload(row),
+        payload: canonicalizeSnapshotDeviceIds(snapshotRowToPayload(row)),
         created_at: row.created_at || ""
     }));
 }
@@ -848,7 +897,9 @@ function prepareDashboardSnapshot(body, options = {}) {
         };
     }
 
-    latestDashboardSnapshot = applyTrustedGatewayId(validation.snapshot, options.trustedGatewayId);
+    latestDashboardSnapshot = canonicalizeSnapshotDeviceIds(
+        applyTrustedGatewayId(validation.snapshot, options.trustedGatewayId)
+    );
     const gatewayId = latestDashboardSnapshot.gateway.gateway_id;
     const snapshotId = makeSnapshotId(gatewayId, serverRecvMs);
 
@@ -995,36 +1046,59 @@ async function ingestDashboardSnapshot(body, options = {}) {
 }
 
 function readAirQuality(row) {
-    const parsed = parseJsonObject(row?.air_quality_json, {});
-    const score = row?.air_quality_score ?? parsed.air_quality_score ?? null;
-    const level = row?.air_quality_level || parsed.air_quality_level || null;
-    const confidence = row?.air_quality_confidence || parsed.air_quality_confidence || null;
-    const source = row?.air_quality_source || parsed.air_quality_source || null;
+    const parsed = parseJsonObject(row?.air_quality_json, null);
+    const airQuality = isPlainObject(parsed) ? cloneJson(parsed) : null;
+    const rawPayload = parseJsonObject(row?.raw_json, null)?.payload;
+    const bmeDiag = isPlainObject(rawPayload?.bme_diag)
+        ? cloneJson(rawPayload.bme_diag)
+        : null;
+    const baselineState = isPlainObject(rawPayload?.baseline_state)
+        ? cloneJson(rawPayload.baseline_state)
+        : null;
+    const score = row?.air_quality_score ?? airQuality?.air_quality_score ?? airQuality?.score ?? null;
+    const level = row?.air_quality_level || airQuality?.air_quality_level || airQuality?.level || null;
+    const confidence = row?.air_quality_confidence || airQuality?.air_quality_confidence || airQuality?.confidence || null;
+    const source = row?.air_quality_source || airQuality?.air_quality_source || airQuality?.source || null;
+    const algorithm = textOrNull(airQuality?.algorithm || row?.air_quality_algo_version);
+    const gasRatio = numberValueOrNull(row?.gas_ratio ?? airQuality?.gas_ratio);
+    const stabilityScore = numberValueOrNull(airQuality?.stability_score);
+    const sensorState = textOrNull(airQuality?.sensor_state);
+    const baselineReady = airQuality?.baseline_ready === undefined
+        ? null
+        : booleanValue(airQuality.baseline_ready, null);
 
     return {
-        air_quality: {
-            air_quality_score: score,
-            air_quality_level: level,
-            air_quality_confidence: confidence,
-            air_quality_source: source
-        },
+        air_quality: airQuality,
+        bme_diag: bmeDiag,
+        baseline_state: baselineState,
         air_quality_score: score,
         air_quality_level: level,
         air_quality_confidence: confidence,
-        air_quality_source: source
+        air_quality_source: source,
+        score,
+        level,
+        confidence,
+        source,
+        algorithm,
+        gas_ratio: gasRatio,
+        stability_score: stabilityScore,
+        sensor_state: sensorState,
+        baseline_ready: baselineReady
     };
 }
 
 function mapDashboardDeviceStatus(status, fallbackDeviceId = "") {
+    const observed = Boolean(status);
     return {
-        device_id: status?.device_id || fallbackDeviceId || null,
-        online: Boolean(status?.online),
-        device_online: Boolean(status?.device_online),
-        status: textOrNull(status?.status),
-        status_source: textOrNull(status?.status_source),
+        device_id: resolveDeviceId(status?.device_id || fallbackDeviceId),
+        online: observed ? Boolean(status.online) : null,
+        device_online: observed ? Boolean(status.device_online) : null,
+        status: textOrNull(status?.status) || "unknown",
+        status_source: textOrNull(status?.status_source) || "not_observed",
+        observed,
         offline_reason: textOrNull(status?.offline_reason),
-        link_lost: Boolean(status?.link_lost),
-        voice_busy: Boolean(status?.voice_busy),
+        link_lost: observed ? Boolean(status.link_lost) : null,
+        voice_busy: observed ? Boolean(status.voice_busy) : null,
         child_last_seen_ms: status?.child_last_seen_ms ?? null,
         server_received_ms: status?.server_received_ms ?? null,
         last_seen_ms: status?.last_seen_ms ?? null,
@@ -1039,7 +1113,7 @@ function mapDashboardDeviceStatus(status, fallbackDeviceId = "") {
 
 function mapDashboardModuleStatus(moduleStatus) {
     return {
-        device_id: moduleStatus?.device_id || null,
+        device_id: resolveDeviceId(moduleStatus?.device_id),
         module_type: moduleStatus?.module_type || null,
         online: Boolean(moduleStatus?.online),
         module_online: Boolean(moduleStatus?.module_online),
@@ -1125,7 +1199,7 @@ function adaptGatewayForOverview(snapshot, statuses) {
     const lastSeen = gatewayStatus?.last_seen_ms ?? integerOrNull(gateway.timestamp) ?? snapshot.received_at_ms ?? null;
     return {
         ...gateway,
-        gateway_id: gateway.gateway_id || "sensair_s3_gateway_01",
+        gateway_id: resolveDeviceId(gateway.gateway_id || "sensair_s3_gateway_01"),
         online: Boolean(gatewayStatus?.online ?? gateway.online),
         status_source: "server",
         lastSeen,
@@ -1149,7 +1223,7 @@ function adaptDeviceForOverview(device, statuses, modules) {
 
     return {
         ...device,
-        device_id: device.device_id,
+        device_id: resolveDeviceId(device.device_id),
         device_type: serverStatus?.device_type || device.device_type || "C5",
         room_id: serverStatus?.room_id || device.room_id || "",
         room_name: serverStatus?.room_name || device.room_name || "",
@@ -1166,6 +1240,10 @@ function adaptDeviceForOverview(device, statuses, modules) {
         last_seen_ms: lastSeenMs,
         air_quality_score: integerOrNull(sensors.air_quality_score),
         air_quality_level: sensors.air_quality_level || "unknown",
+        air_quality_confidence: sensors.air_quality_confidence || null,
+        air_quality: isPlainObject(sensors.air_quality) ? cloneJson(sensors.air_quality) : null,
+        bme_diag: isPlainObject(sensors.bme_diag) ? cloneJson(sensors.bme_diag) : null,
+        baseline_state: isPlainObject(sensors.baseline_state) ? cloneJson(sensors.baseline_state) : null,
         temperature_c: numberValueOrNull(sensors.temperature ?? sensors.temperature_c),
         humidity_percent: numberValueOrNull(sensors.humidity ?? sensors.humidity_percent),
         pressure_hpa: numberValueOrNull(sensors.pressure ?? sensors.pressure_hpa),
@@ -1277,8 +1355,12 @@ function mapDashboardSensor(row, deviceStatus = null, moduleStatus = null, optio
 
     const airQuality = readAirQuality(row);
     const delay = pickSensorDelay(row, deviceStatus, moduleStatus);
-    const deviceOnline = Boolean(deviceStatus?.online);
-    const sensorOnline = Boolean(moduleStatus?.online);
+    const deviceObserved = Boolean(deviceStatus);
+    const deviceOnline = deviceObserved ? Boolean(deviceStatus.online) : null;
+    const sensorOnline = moduleStatus ? Boolean(moduleStatus.online) : null;
+    const online = deviceOnline === null
+        ? null
+        : (sensorOnline === null ? deviceOnline : (deviceOnline && sensorOnline));
 
     return {
         id: row.id,
@@ -1287,7 +1369,7 @@ function mapDashboardSensor(row, deviceStatus = null, moduleStatus = null, optio
         humidity: numberOrNull(row.humidity),
         pressure: numberOrNull(row.pressure),
         gas_resistance: numberOrNull(row.gas_resistance),
-        device_id: textOrNull(row.device_id),
+        device_id: resolveDeviceId(row.device_id),
         sensor_id: textOrNull(row.sensor_id),
         payload_type: textOrNull(row.payload_type || "sensor.bme690"),
         esp_time_ms: integerOrNull(row.esp_time_ms),
@@ -1295,9 +1377,12 @@ function mapDashboardSensor(row, deviceStatus = null, moduleStatus = null, optio
         server_recv_ms: integerOrNull(row.server_recv_ms),
         server_time_iso: textOrNull(row.server_time_iso),
         upload_delay_ms: integerOrNull(row.upload_delay_ms),
-        online: deviceOnline && sensorOnline,
+        online,
         device_online: deviceOnline,
         sensor_online: sensorOnline,
+        status: deviceStatus?.status || "unknown",
+        status_source: deviceStatus?.status_source || "not_observed",
+        offline_reason: deviceStatus?.offline_reason ?? null,
         ...delay,
         ...airQuality,
         time_sync: options.includeTimeSync ? getTimeSyncStatus() : undefined
@@ -1430,7 +1515,7 @@ async function readDashboardCsiHistory(dbAll, query = {}) {
     return {
         events: rows.map(row => ({
             id: row.id,
-            device_id: row.device_id,
+            device_id: resolveDeviceId(row.device_id),
             link_id: row.link_id,
             state: row.state,
             frame_energy: numberOrNull(row.frame_energy),
@@ -1537,7 +1622,7 @@ async function readDashboardOverview(dbAll, query = {}, options = {}) {
         local_id: null,
         name: "",
         room_name: "unassigned",
-        online: Boolean(sensorLatest?.online ?? deviceStatus?.online),
+        online: sensorLatest?.online ?? deviceStatus?.online ?? null,
         wifi_rssi: null,
         timestamp: sensorLatest?.timestamp ?? deviceStatus?.last_seen_ms ?? Date.now(),
         sensors: sensorLatest ? {
@@ -1547,7 +1632,15 @@ async function readDashboardOverview(dbAll, query = {}, options = {}) {
             gas_resistance: sensorLatest.gas_resistance,
             air_quality_score: sensorLatest.air_quality_score,
             air_quality_level: sensorLatest.air_quality_level,
-            air_quality_source: sensorLatest.air_quality_source
+            air_quality_confidence: sensorLatest.air_quality_confidence,
+            air_quality_source: sensorLatest.air_quality_source,
+            air_quality: sensorLatest.air_quality,
+            ...(sensorLatest.bme_diag ? {
+                bme_diag: sensorLatest.bme_diag
+            } : {}),
+            ...(sensorLatest.baseline_state ? {
+                baseline_state: sensorLatest.baseline_state
+            } : {})
         } : null,
         csi: normalizeSnapshotCsi(null, Date.now(), {
             availableDefault: false
@@ -1573,7 +1666,7 @@ async function readDashboardOverview(dbAll, query = {}, options = {}) {
         devices,
         home_summary: computeHomeSummary(devices),
         history: Array.isArray(history) ? history.map(row => ({
-            device_id: row.device_id,
+            device_id: resolveDeviceId(row.device_id),
             sensor_type: "bme690",
             timestamp: row.timestamp,
             temperature: row.temperature,

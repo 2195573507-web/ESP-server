@@ -5,18 +5,16 @@ const {
 } = require("../../server-time-sync/timeSync");
 const {
     mapDeviceStatus,
-    mapModuleStatus,
-    refreshDeviceActivity
+    mapModuleStatus
 } = require("../services/deviceStatusService");
-const {
-    readDeviceMetadata
-} = require("../services/deviceMetadata");
 const {
     recordEvent
 } = require("../services/eventLogService");
+const {
+    resolveDeviceId
+} = require("../services/deviceIdResolver");
 
-const SENSOR_DEVICE_ID_MAX_LENGTH = 128;
-const LEGACY_SENSOR_FALLBACK_DEVICE_ID = "unknown_device";
+const LEGACY_SENSOR_FALLBACK_DEVICE_ID = "legacy_unassigned";
 
 function toFiniteSensorNumber(value) {
     if (value === undefined || value === null || value === "") {
@@ -41,9 +39,7 @@ function normalizeSensorBody(body = {}) {
         payload_type: typeof body.payload_type === "string" && body.payload_type.trim()
             ? body.payload_type.trim().slice(0, 80)
             : "sensor.bme690",
-        device_id: inferredDeviceId === undefined || inferredDeviceId === null
-            ? ""
-            : String(inferredDeviceId).trim().slice(0, SENSOR_DEVICE_ID_MAX_LENGTH)
+        device_id: resolveDeviceId(inferredDeviceId)
     };
 }
 
@@ -90,8 +86,11 @@ function enrichLatestSensorRow(row, deviceStatusRow, moduleStatusRow) {
 
     return {
         ...enriched,
-        online: Boolean(deviceStatus?.online),
-        device_online: Boolean(deviceStatus?.online),
+        online: deviceStatus ? Boolean(deviceStatus.online) : null,
+        device_online: deviceStatus ? Boolean(deviceStatus.online) : null,
+        status: deviceStatus?.status || "unknown",
+        status_source: deviceStatus?.status_source || "not_observed",
+        offline_reason: deviceStatus?.offline_reason ?? null,
         sensor_online: Boolean(moduleStatus?.online),
         latest_upload_delay_ms: deviceStatus?.latest_upload_delay_ms ?? row.upload_delay_ms ?? null,
         avg_upload_delay_ms: deviceStatus?.avg_upload_delay_ms ?? null,
@@ -123,7 +122,7 @@ function createSensorRouter(options) {
         } = normalizedBody;
         const serverRecvMs = Date.now();
         const timing = buildSensorTimingFields(normalizedBody, serverRecvMs);
-        let deviceId = timing.device_id || normalizedBody.device_id;
+        let deviceId = resolveDeviceId(timing.device_id || normalizedBody.device_id);
         const usedFallbackDeviceId = !deviceId;
         if (!deviceId) {
             deviceId = LEGACY_SENSOR_FALLBACK_DEVICE_ID;
@@ -164,35 +163,27 @@ function createSensorRouter(options) {
                     return sendSensorDbError(res, err, true);
                 }
 
-                if (typeof dbRun === "function" && typeof dbAll === "function") {
+                // Legacy telemetry is retained for compatibility, but it never
+                // authors C5 device_status. S3 child_registry remains the only
+                // source of formal C5 online/offline state.
+                if (usedFallbackDeviceId && typeof dbRun === "function") {
                     try {
-                        await refreshDeviceActivity(dbRun, dbAll, readDeviceMetadata({
-                            body: {
-                                ...normalizedBody,
-                                device_id: deviceId,
-                                payload_type: payloadType
+                        await recordEvent(dbRun, {
+                            event_type: "system",
+                            event_name: "system_log_created",
+                            device_id: deviceId,
+                            severity: "warning",
+                            message: "legacy /sensor upload missing device_id; stored as legacy_unassigned",
+                            payload: {
+                                payload_type: payloadType,
+                                route: "/sensor",
+                                identity_scope: "legacy_unassigned"
                             },
-                            headers: req.headers,
-                            payloadType,
-                            serverRecvMs
-                        }), payloadType);
-                        if (usedFallbackDeviceId) {
-                            await recordEvent(dbRun, {
-                                event_type: "system",
-                                event_name: "system_log_created",
-                                device_id: deviceId,
-                                severity: "warning",
-                                message: "legacy /sensor upload missing device_id; using unknown_device",
-                                payload: {
-                                    payload_type: payloadType,
-                                    route: "/sensor"
-                                },
-                                source: "legacy_sensor",
-                                server_recv_ms: serverRecvMs
-                            });
-                        }
+                            source: "legacy_sensor",
+                            server_recv_ms: serverRecvMs
+                        });
                     } catch (error) {
-                        logger.warn(`[sensor] legacy status refresh failed device_id=${deviceId || "-"} message=${JSON.stringify(error?.message || "-")}`);
+                        logger.warn(`[sensor] legacy identity event failed device_id=${deviceId || "-"} message=${JSON.stringify(error?.message || "-")}`);
                     }
                 }
 
@@ -227,9 +218,15 @@ function createSensorRouter(options) {
                     return;
                 }
 
+                const deviceId = resolveDeviceId(row.device_id);
+                const canonicalRow = {
+                    ...row,
+                    device_id: deviceId
+                };
+
                 db.get(
                     "SELECT * FROM device_status WHERE device_id=? AND deleted_at IS NULL LIMIT 1",
-                    [row.device_id],
+                    [deviceId],
                     (statusErr, deviceStatusRow) => {
                         if (statusErr) {
                             return sendSensorDbError(res, statusErr);
@@ -237,13 +234,13 @@ function createSensorRouter(options) {
 
                         db.get(
                             "SELECT * FROM device_module_status WHERE device_id=? AND module_type='sensor.bme690' AND deleted_at IS NULL LIMIT 1",
-                            [row.device_id],
+                            [deviceId],
                             (moduleErr, moduleStatusRow) => {
                                 if (moduleErr) {
                                     return sendSensorDbError(res, moduleErr);
                                 }
 
-                                res.json(enrichLatestSensorRow(row, deviceStatusRow, moduleStatusRow));
+                                res.json(enrichLatestSensorRow(canonicalRow, deviceStatusRow, moduleStatusRow));
                             }
                         );
                     }

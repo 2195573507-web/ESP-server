@@ -2,17 +2,19 @@ const crypto = require("crypto");
 const {
     trimText
 } = require("./deviceMetadata");
+const {
+    resolveDeviceId
+} = require("./deviceIdResolver");
 
 const GATEWAY_ID_MAX_LENGTH = 128;
 const GATEWAY_TOKEN_MAX_LENGTH = 256;
-const DEVICE_ID_MAX_LENGTH = 128;
 
 function normalizeGatewayId(value) {
     return trimText(value, GATEWAY_ID_MAX_LENGTH);
 }
 
 function normalizeDeviceId(value) {
-    return trimText(value, DEVICE_ID_MAX_LENGTH);
+    return resolveDeviceId(value);
 }
 
 function normalizeGatewayToken(value) {

@@ -184,6 +184,20 @@ function isMachineApiPath(pathname) {
         pathname.startsWith("/llm/");
 }
 
+function getDashboardHashPage(pathname) {
+    let decodedPathname;
+    try {
+        decodedPathname = decodeURIComponent(pathname);
+    } catch (_) {
+        return null;
+    }
+
+    const page = decodedPathname.replace(/^\/#?/, "");
+    return ["s3", "c51", "c52", "settings", "habit-rules"].includes(page)
+        ? page
+        : null;
+}
+
 app.use((req, res, next) => {
     if (!isMachineApiPath(req.path)) {
         return next();
@@ -193,6 +207,21 @@ app.use((req, res, next) => {
         ok: false,
         error: "Not found"
     });
+});
+
+// The dashboard is hash-routed. Normalize direct or proxy-encoded hash paths to
+// the canonical fragment URL, then serve the shell for other SPA paths.
+app.use((req, res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        return next();
+    }
+
+    const page = getDashboardHashPage(req.path);
+    if (page) {
+        return res.redirect(`/#${page}`);
+    }
+
+    return res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
 app.use((err, req, res, next) => {

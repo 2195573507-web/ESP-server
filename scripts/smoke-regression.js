@@ -331,14 +331,15 @@ async function request(baseUrl, method, pathname, body, headers = {}) {
     };
 }
 
-async function requestRaw(baseUrl, method, pathname, body, headers = {}) {
+async function requestRaw(baseUrl, method, pathname, body, headers = {}, redirect = "follow") {
     const response = await fetch(`${baseUrl}${pathname}`, {
         method,
         headers: {
             ...SMOKE_GATEWAY_HEADERS,
             ...headers
         },
-        body
+        body,
+        redirect
     });
     const contentType = response.headers.get("content-type") || "";
     if (contentType.includes("application/json")) {
@@ -3215,6 +3216,29 @@ async function run() {
         assert.match(result.response.headers.get("content-type") || "", /text\/html/);
         assert.ok(Buffer.isBuffer(result.body));
         assert.ok(result.body.length > 0);
+
+        result = await request(baseUrl, "GET", "/");
+        assert.equal(result.response.status, 200);
+        assert.match(result.response.headers.get("content-type") || "", /text\/html/);
+        assert.match(result.body.toString("utf8"), /href="#settings"/);
+
+        result = await requestRaw(baseUrl, "GET", "/%23settings", undefined, {}, "manual");
+        assert.equal(result.response.status, 302);
+        assert.equal(result.response.headers.get("location"), "/#settings");
+
+        result = await request(baseUrl, "GET", "/%23settings");
+        assert.equal(result.response.status, 200);
+        assert.match(result.response.headers.get("content-type") || "", /text\/html/);
+        assert.match(result.body.toString("utf8"), /href="#settings"/);
+
+        result = await requestRaw(baseUrl, "GET", "/settings", undefined, {}, "manual");
+        assert.equal(result.response.status, 302);
+        assert.equal(result.response.headers.get("location"), "/#settings");
+
+        result = await request(baseUrl, "GET", "/settings");
+        assert.equal(result.response.status, 200);
+        assert.match(result.response.headers.get("content-type") || "", /text\/html/);
+        assert.match(result.body.toString("utf8"), /href="#settings"/);
 
         result = await request(baseUrl, "GET", "/api/smart-home/v1/status");
         assert.equal(result.response.status, 200);

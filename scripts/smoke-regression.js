@@ -851,7 +851,7 @@ async function assertHomeLocationCrud() {
     }
 }
 
-async function assertWeatherQuery() {
+async function assertWeatherQueryFailsClosedWithoutFreshContext() {
     const calls = [];
     const fetcher = async url => {
         calls.push(url);
@@ -861,20 +861,13 @@ async function assertWeatherQuery() {
         return new Response(JSON.stringify({ name: "Shanghai", coord: { lat: 31.2, lon: 121.4 }, main: { temp: 21, humidity: 51 }, weather: [{ description: "cloudy" }], wind: { speed: 2.5 } }), { status: 200 });
     };
     const result = await weatherQuery({}, {
-        dbAll: async () => [{ country: "CN", city: "Shanghai", latitude: 31.2, longitude: 121.4, timezone: "Asia/Shanghai" }],
+        dbAll: async () => [],
         weatherConfig: { apiKey: "test-key", baseUrl: "https://weather.test", timeoutMs: 1000 },
         fetcher
     });
-    assert.equal(result.success, true);
-    assert.equal(result.location, "Shanghai");
-    assert.equal(result.forecast.length, 1);
-    assert.equal(calls.length, 2);
-    const missingKey = await weatherQuery({}, {
-        dbAll: async () => [],
-        weatherConfig: { apiKey: "", baseUrl: "https://weather.test", timeoutMs: 1000 },
-        fetcher
-    });
-    assert.equal(missingKey.success, false);
+    assert.equal(result.success, false);
+    assert.equal(result.error, "WEATHER_CONTEXT_UNAVAILABLE");
+    assert.equal(calls.length, 0);
 }
 
 async function run() {
@@ -882,7 +875,7 @@ async function run() {
     assertLlmMetadataBounds();
     assertPromptAndToolRegistry();
     await assertHomeLocationCrud();
-    await assertWeatherQuery();
+    await assertWeatherQueryFailsClosedWithoutFreshContext();
     await assertUpsertRetryAfterInsertConflict();
     await assertPendingDispatchSkipsLostClaim();
     await assertDuplicateKeyUpserts();

@@ -16,7 +16,7 @@ function createDefaultToolRegistry() {
     return createToolRegistry([
         {
             name: "weather_query",
-            description: "Get current weather and forecast from OpenWeather. Use for any real-time weather question.",
+            description: "Use only for an explicit refresh request, a non-home location, or a complex weather question not answerable from fresh weather_context.",
             parameters: {
                 type: "object",
                 properties: {

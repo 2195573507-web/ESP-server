@@ -7,6 +7,7 @@ const DEFAULT_VOICE_TURN_TIMEOUT_MS = 45000;
 const DEFAULT_VOICE_TURN_MAX_CONCURRENT = 1;
 const DEFAULT_VOICE_TURN_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_LLM_TIMEOUT_MS = 30000;
+const DEFAULT_VOICE_TOOL_TIMEOUT_MS = 8000;
 
 function readVoiceTurnConfig() {
     return {
@@ -28,8 +29,13 @@ function readVoiceLlmTimeoutMs() {
     return readPositiveInteger(process.env.LLM_TIMEOUT_MS, DEFAULT_LLM_TIMEOUT_MS);
 }
 
+function readVoiceToolTimeoutMs() {
+    return readPositiveInteger(process.env.VOICE_TOOL_TIMEOUT_MS, DEFAULT_VOICE_TOOL_TIMEOUT_MS);
+}
+
 module.exports = {
     readVoiceLlmTimeoutMs,
+    readVoiceToolTimeoutMs,
     readVoiceTurnConfig,
     readVoiceTurnMaxBytes
 };

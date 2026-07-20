@@ -1,25 +1,12 @@
+const { buildLocationLabel, readHomeLocation } = require("../services/homeLocationService");
+const { readWeatherContext } = require("../services/weatherContextService");
 const {
-    buildLocationLabel,
-    readHomeLocation
-} = require("../services/homeLocationService");
-const {
-    readPositiveInteger,
-    readTrimmedEnv
-} = require("../utils/env");
-
-const DEFAULT_WEATHER_TIMEOUT_MS = 8000;
-const DEFAULT_OPENWEATHER_BASE_URL = "https://api.openweathermap.org";
-
-function readWeatherConfig(logger = console) {
-    const apiKey = readTrimmedEnv("OPENWEATHER_API_KEY");
-    const baseUrl = readTrimmedEnv("OPENWEATHER_BASE_URL", DEFAULT_OPENWEATHER_BASE_URL).replace(/\/+$/, "");
-    const timeoutMs = readPositiveInteger(process.env.OPENWEATHER_TIMEOUT_MS, DEFAULT_WEATHER_TIMEOUT_MS);
-    if (!apiKey) {
-        logger.warn("[weather] OPENWEATHER_API_KEY is not configured; weather_query will fail closed");
-    }
-
-    return { apiKey, baseUrl, timeoutMs };
-}
+    DEFAULT_WEATHER_TIMEOUT_MS,
+    buildOpenWeatherUrl,
+    fetchOpenWeather,
+    mapForecast,
+    readWeatherConfig
+} = require("../services/weatherProvider");
 
 function parseWeatherLocation(location) {
     if (typeof location !== "string") {
@@ -32,50 +19,25 @@ function weatherError(error) {
     return { success: false, error };
 }
 
-async function fetchOpenWeather(url, config, fetcher = fetch) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), config.timeoutMs);
-    try {
-        const response = await fetcher(url, { signal: controller.signal });
-        const body = await response.json().catch(() => null);
-        if (!response.ok) {
-            return {
-                ok: false,
-                error: body?.message || `OpenWeather request failed (${response.status})`
-            };
-        }
-        return { ok: true, body };
-    } catch (error) {
-        return {
-            ok: false,
-            error: error?.name === "AbortError" ? "OpenWeather request timed out" : "OpenWeather network request failed"
-        };
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
-function buildOpenWeatherUrl(baseUrl, pathname, query) {
-    const url = new URL(pathname, `${baseUrl}/`);
-    for (const [key, value] of Object.entries(query)) {
-        if (value !== null && value !== undefined && value !== "") {
-            url.searchParams.set(key, String(value));
-        }
-    }
-    return url.toString();
-}
-
-function mapForecast(list) {
-    return Array.isArray(list) ? list.slice(0, 8).map(item => ({
-        time: item?.dt_txt || "",
-        temperature: Number.isFinite(Number(item?.main?.temp)) ? Number(item.main.temp) : null,
-        humidity: Number.isFinite(Number(item?.main?.humidity)) ? Number(item.main.humidity) : null,
-        weather: item?.weather?.[0]?.description || "",
-        wind_speed: Number.isFinite(Number(item?.wind?.speed)) ? Number(item.wind.speed) : null
-    })) : [];
-}
-
 async function weatherQuery(args, context = {}) {
+    if (!args?.location) {
+        const cached = await readWeatherContext(context.dbAll);
+        if (cached.status !== "fresh") {
+            return weatherError("WEATHER_CONTEXT_UNAVAILABLE");
+        }
+        return {
+            success: true,
+            source: "weather_context",
+            observed_at_ms: cached.observed_at_ms,
+            expires_at_ms: cached.expires_at_ms,
+            temperature: cached.temperature_c,
+            feels_like: cached.feels_like_c,
+            humidity: cached.humidity_percent,
+            weather: cached.condition_key,
+            wind_speed: cached.wind_speed_mps,
+            forecast: cached.forecast
+        };
+    }
     const config = context.weatherConfig || readWeatherConfig(context.logger || console);
     if (!config.apiKey) {
         return weatherError("OpenWeather is not configured");
@@ -140,6 +102,9 @@ async function weatherQuery(args, context = {}) {
 
 module.exports = {
     DEFAULT_WEATHER_TIMEOUT_MS,
+    buildOpenWeatherUrl,
+    fetchOpenWeather,
+    mapForecast,
     readWeatherConfig,
     weatherQuery
 };

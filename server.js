@@ -52,6 +52,9 @@ const {
     ensureHomeLocationTables
 } = require("./src/db/homeLocation");
 const {
+    ensureWeatherContextTables
+} = require("./src/db/weatherContext");
+const {
     ensureHabitRulesTables
 } = require("./src/db/habitRules");
 const {
@@ -102,6 +105,9 @@ const {
 const {
     createHabitEventsRouter
 } = require("./src/routes/habitEventsRoutes");
+const {
+    createWeatherContextRouter
+} = require("./src/routes/weatherContextRoutes");
 const {
     ensureDefaultHabitRules
 } = require("./src/services/habitRulesService");
@@ -160,6 +166,7 @@ app.use(createUserDataRouter({ dbRun, dbAll }));
 app.use(createSettingsRouter({ dbRun, dbAll }));
 app.use(createHabitRulesRouter({ dbRun, dbAll }));
 app.use(createHabitEventsRouter({ dbRun, dbAll }));
+app.use(createWeatherContextRouter({ dbRun, dbAll }));
 app.use(createRecordRouter({ db }));
 app.use(createSensorRouter({ db, dbRun, dbAll }));
 
@@ -264,6 +271,7 @@ async function startServer() {
     await ensureAgentStateTables(dbRun, dbAll);
     await ensureUserDataDeletionTables(dbRun, dbAll);
     await ensureHomeLocationTables(dbRun, dbAll);
+    await ensureWeatherContextTables(dbRun);
     await ensureHabitRulesTables(dbRun);
     await ensureHabitEventsTables(dbRun);
     await ensureDefaultHabitRules(dbRun, dbAll);
@@ -289,6 +297,7 @@ async function startServer() {
                 "agent_state",
                 "user_data_deletion",
                 "home_location",
+                "weather_context",
                 "habit_rules",
                 "habit_events"
             ]

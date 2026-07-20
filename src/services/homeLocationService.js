@@ -112,6 +112,18 @@ async function saveHomeLocation(dbRun, dbAll, input) {
             location.timezone
         ]
     );
+    // A location change cannot reuse a weather observation for the old coordinates.
+    // Standalone home-location callers may intentionally run before weather migration.
+    try {
+        await dbRun(
+            "UPDATE weather_context SET expires_at_ms=0,available=0,updated_at_ms=? WHERE scope_key='home'",
+            [Date.now()]
+        );
+    } catch (error) {
+        if (error?.code !== "SQLITE_ERROR" || !/no such table: weather_context/i.test(error?.message || "")) {
+            throw error;
+        }
+    }
 
     return {
         ok: true,

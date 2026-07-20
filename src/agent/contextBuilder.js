@@ -1,6 +1,9 @@
 const {
     readHomeLocation
 } = require("../services/homeLocationService");
+const {
+    readWeatherContext
+} = require("../services/weatherContextService");
 
 function parseCapabilities(value) {
     try {
@@ -11,14 +14,27 @@ function parseCapabilities(value) {
     }
 }
 
+function agentHomeLocation(location) {
+    return {
+        configured: Boolean(location?.configured),
+        country: location?.country || "",
+        province: location?.province || "",
+        city: location?.city || "",
+        district: location?.district || "",
+        timezone: location?.timezone || ""
+    };
+}
+
 async function buildAgentContext(dbAll, toolRegistry) {
-    const [homeLocation, capabilityRows] = await Promise.all([
+    const [homeLocation, capabilityRows, weatherContext] = await Promise.all([
         readHomeLocation(dbAll),
-        dbAll("SELECT device_id,protocol_version,capabilities_json,last_seen_at FROM device_capabilities ORDER BY device_id ASC")
+        dbAll("SELECT device_id,protocol_version,capabilities_json,last_seen_at FROM device_capabilities ORDER BY device_id ASC"),
+        readWeatherContext(dbAll)
     ]);
 
     return {
-        home_location: homeLocation,
+        home_location: agentHomeLocation(homeLocation),
+        weather_context: weatherContext,
         device_capabilities: capabilityRows.map(row => ({
             device_id: row.device_id,
             protocol_version: row.protocol_version || "",
@@ -33,5 +49,6 @@ async function buildAgentContext(dbAll, toolRegistry) {
 }
 
 module.exports = {
+    agentHomeLocation,
     buildAgentContext
 };

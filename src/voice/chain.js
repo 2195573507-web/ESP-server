@@ -5,6 +5,9 @@ const {
     buildLlmPrompt
 } = require("../services/llmPromptContextService");
 const {
+    runVoiceAgentConversation
+} = require("./agentConversation");
+const {
     maskLogValue,
     maskUrlForLog,
     normalizeLogPreview
@@ -341,9 +344,10 @@ async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConf
     );
 
     stageStartedAt = Date.now();
-    const llmResult = await requestVoiceTurnLlm(asrResult.text, gatewayConfig, signal, {
+    const llmResult = await runVoiceAgentConversation(asrResult.text, gatewayConfig, signal, {
         dbAll: options.dbAll,
-        deviceId
+        deviceId,
+        logger
     });
     metrics.llmMs = Date.now() - stageStartedAt;
     metrics.llmReplyLength = llmResult.text.length;
@@ -375,6 +379,7 @@ async function runVoiceTurnChain(audioBuffer, deviceId, voiceConfig, gatewayConf
 
 module.exports = {
     requestVoiceAsr,
+    requestVoiceTurnLlm,
     requestVoiceTts,
     runVoiceTurnChain
 };

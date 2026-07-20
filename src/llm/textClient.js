@@ -197,7 +197,7 @@ function getLlmResponseStatus(error) {
     return 500;
 }
 
-async function requestLlmChat(messages, tools, config, externalSignal) {
+async function requestLlmChat(messages, tools, config, externalSignal, options = {}) {
     if (!config.apiKey) {
         throw createLlmError("LLM_API_KEY_MISSING");
     }
@@ -227,6 +227,7 @@ async function requestLlmChat(messages, tools, config, externalSignal) {
                 model: config.model,
                 messages,
                 ...(Array.isArray(tools) && tools.length > 0 ? { tools } : {}),
+                ...(options.toolChoice ? { tool_choice: options.toolChoice } : {}),
                 stream: false
             }),
             signal: controller.signal

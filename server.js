@@ -49,6 +49,15 @@ const {
     ensureVoiceTurnsTable
 } = require("./src/db/voiceTurns");
 const {
+    ensureHomeLocationTables
+} = require("./src/db/homeLocation");
+const {
+    ensureHabitRulesTables
+} = require("./src/db/habitRules");
+const {
+    ensureHabitEventsTables
+} = require("./src/db/habitEvents");
+const {
     createCommandRouter
 } = require("./src/routes/commandRoutes");
 const {
@@ -84,6 +93,21 @@ const {
 const {
     createUserDataRouter
 } = require("./src/routes/userDataRoutes");
+const {
+    createSettingsRouter
+} = require("./src/routes/settingsRoutes");
+const {
+    createHabitRulesRouter
+} = require("./src/routes/habitRulesRoutes");
+const {
+    createHabitEventsRouter
+} = require("./src/routes/habitEventsRoutes");
+const {
+    ensureDefaultHabitRules
+} = require("./src/services/habitRulesService");
+const {
+    readWeatherConfig
+} = require("./src/agent/weatherQuery");
 const {
     createVoiceBodyParserErrorHandler,
     createVoiceRouter
@@ -133,6 +157,9 @@ app.use(createEventRouter({ dbRun, dbAll }));
 app.use(createMemoryRouter({ dbRun, dbAll }));
 app.use(createAgentStateRouter({ dbRun, dbAll }));
 app.use(createUserDataRouter({ dbRun, dbAll }));
+app.use(createSettingsRouter({ dbRun, dbAll }));
+app.use(createHabitRulesRouter({ dbRun, dbAll }));
+app.use(createHabitEventsRouter({ dbRun, dbAll }));
 app.use(createRecordRouter({ db }));
 app.use(createSensorRouter({ db, dbRun, dbAll }));
 
@@ -236,6 +263,11 @@ async function startServer() {
     await ensureMemoryTables(dbRun, dbAll);
     await ensureAgentStateTables(dbRun, dbAll);
     await ensureUserDataDeletionTables(dbRun, dbAll);
+    await ensureHomeLocationTables(dbRun, dbAll);
+    await ensureHabitRulesTables(dbRun);
+    await ensureHabitEventsTables(dbRun);
+    await ensureDefaultHabitRules(dbRun, dbAll);
+    readWeatherConfig(console);
     await recordEvent(dbRun, {
         event_type: "system",
         event_name: "system_log_created",
@@ -255,7 +287,10 @@ async function startServer() {
                 "smart_home",
                 "memory",
                 "agent_state",
-                "user_data_deletion"
+                "user_data_deletion",
+                "home_location",
+                "habit_rules",
+                "habit_events"
             ]
         },
         source: "server_startup",

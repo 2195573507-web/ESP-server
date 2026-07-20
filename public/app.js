@@ -2689,7 +2689,7 @@ function bindMobileSidebar() {
 }
 
 function normalizeDashboardPage(value) {
-    return ["s3", "c51", "c52"].includes(value) ? value : "c51";
+    return ["s3", "c51", "c52", "settings", "habit-rules"].includes(value) ? value : "c51";
 }
 
 function getDashboardPageFromHash() {
@@ -2735,12 +2735,20 @@ function updateRouteChrome(page) {
 
     const s3Page = document.querySelector('[data-page="s3"]');
     const cDevicePage = document.querySelector("[data-c-device-page]");
+    const settingsPage = document.querySelector('[data-page="settings"]');
+    const habitRulesPage = document.querySelector('[data-page="habit-rules"]');
     if (s3Page) {
         s3Page.hidden = page !== "s3";
     }
     if (cDevicePage) {
-        cDevicePage.hidden = page === "s3";
+        cDevicePage.hidden = page === "s3" || page === "settings" || page === "habit-rules";
         cDevicePage.dataset.activeDevice = page === "c52" ? "c52" : "c51";
+    }
+    if (settingsPage) {
+        settingsPage.hidden = page !== "settings";
+    }
+    if (habitRulesPage) {
+        habitRulesPage.hidden = page !== "habit-rules";
     }
 
 }
@@ -2757,6 +2765,18 @@ function setDashboardPage(page, options = {}) {
         return;
     }
 
+    if (nextPage === "settings") {
+        cleanupDashboardTimers();
+        loadHomeLocation();
+        return;
+    }
+
+    if (nextPage === "habit-rules") {
+        cleanupDashboardTimers();
+        window.HabitRulesDashboard?.load();
+        return;
+    }
+
     stopS3DashboardTimer();
     if (options.refresh !== false) {
         updateDashboard();
@@ -2766,6 +2786,64 @@ function setDashboardPage(page, options = {}) {
 
 function handleDashboardRoute() {
     setDashboardPage(getDashboardPageFromHash());
+}
+
+function homeLocationFormData(form) {
+    const values = Object.fromEntries(new FormData(form));
+    for (const field of ["latitude", "longitude"]) {
+        values[field] = values[field] === "" ? null : Number(values[field]);
+    }
+    return values;
+}
+
+function setHomeLocationStatus(message, state = "") {
+    const status = document.querySelector("[data-home-location-status]");
+    if (!status) return;
+    status.textContent = message;
+    status.dataset.state = state;
+}
+
+function populateHomeLocation(location) {
+    const form = document.querySelector("[data-home-location-form]");
+    if (!form) return;
+    for (const field of ["country", "province", "city", "district", "latitude", "longitude", "timezone"]) {
+        form.elements[field].value = location?.[field] ?? "";
+    }
+}
+
+async function loadHomeLocation() {
+    try {
+        setHomeLocationStatus("正在读取位置配置...");
+        const payload = await fetchJson("/api/settings/home-location");
+        populateHomeLocation(payload?.data?.home_location);
+        setHomeLocationStatus(payload?.data?.home_location?.configured ? "当前位置已保存" : "尚未设置家庭位置", "ready");
+    } catch (_) {
+        setHomeLocationStatus("位置配置读取失败", "error");
+    }
+}
+
+function initHomeLocationForm() {
+    const form = document.querySelector("[data-home-location-form]");
+    if (!form) return;
+    form.addEventListener("submit", async event => {
+        event.preventDefault();
+        const submit = form.querySelector('button[type="submit"]');
+        submit.disabled = true;
+        setHomeLocationStatus("正在保存位置配置...");
+        try {
+            const payload = await fetchJson("/api/settings/home-location", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(homeLocationFormData(form))
+            });
+            populateHomeLocation(payload?.data?.home_location);
+            setHomeLocationStatus("家庭位置已保存", "ready");
+        } catch (_) {
+            setHomeLocationStatus("位置配置保存失败，请检查输入。", "error");
+        } finally {
+            submit.disabled = false;
+        }
+    });
 }
 
 window.addEventListener("resize", () => {
@@ -2821,6 +2899,8 @@ document.addEventListener("DOMContentLoaded", () => {
     bindCommandButtons();
     initCommandControls();
     initSmartHomeControls();
+    initHomeLocationForm();
+    window.HabitRulesDashboard?.init();
     bindMobileSidebar();
     window.addEventListener("hashchange", handleDashboardRoute);
     handleDashboardRoute();

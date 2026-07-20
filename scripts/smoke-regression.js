@@ -13,6 +13,22 @@ const {
     readLlmTextRequest
 } = require("../src/llm/textClient");
 const {
+    loadSystemPrompt
+} = require("../src/agent/agentRunner");
+const {
+    createDefaultToolRegistry
+} = require("../src/agent/defaultToolRegistry");
+const {
+    weatherQuery
+} = require("../src/agent/weatherQuery");
+const {
+    ensureHomeLocationTables
+} = require("../src/db/homeLocation");
+const {
+    readHomeLocation,
+    saveHomeLocation
+} = require("../src/services/homeLocationService");
+const {
     listPendingCommands,
     upsertDeviceCapabilities
 } = require("../src/commands/queue");
@@ -147,7 +163,33 @@ function startMockLlmServer() {
                     body
                 });
 
-                if (req.method !== "POST" || req.url.split("?")[0] !== "/v1/chat/completions") {
+                const pathname = req.url.split("?")[0];
+                if (req.method === "GET" && pathname === "/data/2.5/weather") {
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        name: "Shanghai",
+                        coord: { lat: 31.2304, lon: 121.4737 },
+                        main: { temp: 26.5, humidity: 61 },
+                        weather: [{ description: "clear sky" }],
+                        wind: { speed: 3.4 }
+                    }));
+                    return;
+                }
+
+                if (req.method === "GET" && pathname === "/data/2.5/forecast") {
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        list: [{
+                            dt_txt: "2026-07-19 12:00:00",
+                            main: { temp: 27, humidity: 60 },
+                            weather: [{ description: "few clouds" }],
+                            wind: { speed: 3.1 }
+                        }]
+                    }));
+                    return;
+                }
+
+                if (req.method !== "POST" || pathname !== "/v1/chat/completions") {
                     res.writeHead(404, {
                         "Content-Type": "application/json"
                     });
@@ -157,17 +199,35 @@ function startMockLlmServer() {
                     return;
                 }
 
-                res.writeHead(200, {
-                    "Content-Type": "application/json"
-                });
-                const contentText = (() => {
+                const requestPayload = (() => {
                     try {
-                        const payload = JSON.parse(body);
-                        return String(payload?.messages?.[0]?.content || "");
+                        return JSON.parse(body);
                     } catch (_) {
-                        return "";
+                        return {};
                     }
                 })();
+                const messages = Array.isArray(requestPayload.messages) ? requestPayload.messages : [];
+                const contentText = messages.map(message => String(message?.content || "")).join("\n");
+                const hasToolResponse = messages.some(message => message?.role === "tool");
+                if (Array.isArray(requestPayload.tools) && contentText.includes("天气工具调用烟雾")) {
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        model: "smoke-structured-model",
+                        choices: [{
+                            message: hasToolResponse
+                                ? { content: "上海当前天气晴朗，26.5 C。" }
+                                : {
+                                    content: null,
+                                    tool_calls: [{
+                                        id: "weather-call-1",
+                                        type: "function",
+                                        function: { name: "weather_query", arguments: "{}" }
+                                    }]
+                                }
+                        }]
+                    }));
+                    return;
+                }
                 const structuredContent = contentText.includes("生成非法结构化命令")
                     ? {
                         chat: {
@@ -202,6 +262,9 @@ function startMockLlmServer() {
                             }
                         ]
                     };
+                res.writeHead(200, {
+                    "Content-Type": "application/json"
+                });
                 res.end(JSON.stringify({
                     model: "smoke-structured-model",
                     choices: [
@@ -748,9 +811,78 @@ function assertLlmMetadataBounds() {
     assert.equal(parsed.sessionId, "s".repeat(LLM_METADATA_MAX_CHARS));
 }
 
+function assertPromptAndToolRegistry() {
+    const prompt = loadSystemPrompt();
+    assert.match(prompt, /家庭 AI Agent/);
+    assert.match(prompt, /weather_query/);
+    const registry = createDefaultToolRegistry();
+    assert.deepEqual(registry.list().map(tool => tool.name), [
+        "weather_query",
+        "home_state_query",
+        "sensor_query",
+        "device_status_query"
+    ]);
+    assert.equal(registry.openAiTools()[0].function.name, "weather_query");
+}
+
+async function assertHomeLocationCrud() {
+    const dir = makeTempDir();
+    const dbPath = path.join(dir, "home-location.sqlite");
+    const db = createDatabase(dir);
+    const { dbRun: run, dbAll: all } = createDbHelpers(db);
+    try {
+        await ensureHomeLocationTables(run, all);
+        assert.equal((await readHomeLocation(all)).configured, false);
+        const saved = await saveHomeLocation(run, all, {
+            country: "CN",
+            province: "Shanghai",
+            city: "Shanghai",
+            district: "Pudong",
+            latitude: 31.2304,
+            longitude: 121.4737,
+            timezone: "Asia/Shanghai"
+        });
+        assert.equal(saved.ok, true);
+        assert.equal(saved.location.city, "Shanghai");
+        assert.equal((await readHomeLocation(all)).latitude, 31.2304);
+    } finally {
+        await new Promise(resolve => db.close(resolve));
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+}
+
+async function assertWeatherQuery() {
+    const calls = [];
+    const fetcher = async url => {
+        calls.push(url);
+        if (url.includes("forecast")) {
+            return new Response(JSON.stringify({ list: [{ main: { temp: 20, humidity: 50 }, weather: [{ description: "cloudy" }], wind: { speed: 2 } }] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ name: "Shanghai", coord: { lat: 31.2, lon: 121.4 }, main: { temp: 21, humidity: 51 }, weather: [{ description: "cloudy" }], wind: { speed: 2.5 } }), { status: 200 });
+    };
+    const result = await weatherQuery({}, {
+        dbAll: async () => [{ country: "CN", city: "Shanghai", latitude: 31.2, longitude: 121.4, timezone: "Asia/Shanghai" }],
+        weatherConfig: { apiKey: "test-key", baseUrl: "https://weather.test", timeoutMs: 1000 },
+        fetcher
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.location, "Shanghai");
+    assert.equal(result.forecast.length, 1);
+    assert.equal(calls.length, 2);
+    const missingKey = await weatherQuery({}, {
+        dbAll: async () => [],
+        weatherConfig: { apiKey: "", baseUrl: "https://weather.test", timeoutMs: 1000 },
+        fetcher
+    });
+    assert.equal(missingKey.success, false);
+}
+
 async function run() {
     assertTtsJsonPcmNormalization();
     assertLlmMetadataBounds();
+    assertPromptAndToolRegistry();
+    await assertHomeLocationCrud();
+    await assertWeatherQuery();
     await assertUpsertRetryAfterInsertConflict();
     await assertPendingDispatchSkipsLostClaim();
     await assertDuplicateKeyUpserts();
@@ -777,6 +909,9 @@ async function run() {
             LLM_API_KEY: "smoke-llm-key",
             LLM_BASE_URL: mockLlm.baseUrl,
             LLM_CHAT_PATH: "/v1/chat/completions",
+            OPENWEATHER_API_KEY: "smoke-weather-key",
+            OPENWEATHER_BASE_URL: mockLlm.baseUrl,
+            OPENWEATHER_TIMEOUT_MS: "1000",
             USER_DATA_DELETE_TOKEN,
             GATEWAY_AUTH_TOKEN: "",
             GATEWAY_AUTH_TOKENS: "",
@@ -983,6 +1118,123 @@ async function run() {
         assert.equal(result.response.status, 400);
         assert.equal(result.body.ok, false);
         assert.equal(result.body.error, "text is required");
+
+        result = await request(baseUrl, "GET", "/api/settings/home-location");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.home_location.configured, false);
+
+        result = await request(baseUrl, "POST", "/api/settings/home-location", {
+            country: "CN",
+            province: "Shanghai",
+            city: "Shanghai",
+            district: "Pudong",
+            latitude: 31.2304,
+            longitude: 121.4737,
+            timezone: "Asia/Shanghai"
+        });
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.home_location.configured, true);
+        assert.equal(result.body.data.home_location.city, "Shanghai");
+
+        result = await request(baseUrl, "GET", "/api/habit-rules");
+        assert.equal(result.response.status, 200);
+        assertDashboardEnvelope(result.body);
+        assert.equal(result.body.data.rules.length, 6);
+        assert.ok(result.body.data.rules.some(rule => rule.type === "LONG_OCCUPANCY"));
+
+        const habitBundleFirst = await request(baseUrl, "GET", "/api/habit-rules/bundle");
+        const habitBundleSecond = await request(baseUrl, "GET", "/api/habit-rules/bundle");
+        assert.equal(habitBundleFirst.response.status, 200);
+        assert.equal(habitBundleFirst.body.data.bundle.schema_version, "habit-rule-bundle-v1");
+        assert.equal(habitBundleFirst.body.data.bundle.checksum, habitBundleSecond.body.data.bundle.checksum);
+
+        const habitRulesVersionBefore = await request(baseUrl, "GET", "/api/habit-rules/version");
+        assert.equal(habitRulesVersionBefore.response.status, 200);
+        assertDashboardEnvelope(habitRulesVersionBefore.body);
+        assert.match(habitRulesVersionBefore.body.data.version, /^habit-rules-v1-/);
+        assert.match(habitRulesVersionBefore.body.data.checksum, /^[a-f0-9]{64}$/);
+        assert.ok(habitRulesVersionBefore.body.data.updated_at);
+
+        result = await request(baseUrl, "POST", "/api/habit-rules", {
+            id: "smoke-habit-rule",
+            name: "烟雾测试离开规则",
+            type: "PERSON_LEAVE_ROOM",
+            enabled: true,
+            config: { enabled: true, room: "office", duration_minutes: 0 }
+        });
+        assert.equal(result.response.status, 201);
+        assert.equal(result.body.data.rule.id, "smoke-habit-rule");
+
+        result = await request(baseUrl, "GET", "/api/habit-rules/smoke-habit-rule");
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.data.rule.config.room, "office");
+
+        result = await request(baseUrl, "PUT", "/api/habit-rules/smoke-habit-rule", {
+            name: "烟雾测试离开规则（已关闭）",
+            type: "PERSON_LEAVE_ROOM",
+            enabled: false,
+            config: { enabled: false, room: "office", duration_minutes: 10 }
+        });
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.data.rule.enabled, false);
+        assert.equal(result.body.data.rule.config.duration_minutes, 10);
+
+        const habitRulesVersionAfter = await request(baseUrl, "GET", "/api/habit-rules/version");
+        assert.notEqual(habitRulesVersionAfter.body.data.checksum, habitRulesVersionBefore.body.data.checksum);
+
+        result = await request(baseUrl, "POST", "/api/habit-rules", {
+            id: "invalid-habit-rule",
+            name: "非法规则",
+            type: "PERSON_LEAVE_ROOM",
+            enabled: true,
+            config: { enabled: true, room: "office", duration_minutes: -1 }
+        });
+        assert.equal(result.response.status, 400);
+        assert.equal(result.body.ok, false);
+        assert.equal(result.body.error.code, "HABIT_RULE_INVALID");
+
+        const habitEvent = {
+            event_id: "smoke-habit-event-1",
+            rule_id: "person_enter_room",
+            rule_type: "PERSON_ENTER_ROOM",
+            room: "bedroom",
+            source: "C52",
+            timestamp: "2026-07-20T10:00:00",
+            sequence: 1,
+            payload: { person_count: 1, reason: "occupied_false_to_true" }
+        };
+        result = await request(baseUrl, "POST", "/api/habit-events", habitEvent);
+        assert.equal(result.response.status, 201);
+        assert.equal(result.body.data.accepted, true);
+        result = await request(baseUrl, "POST", "/api/habit-events", habitEvent);
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.data.duplicate, true);
+        const habitEventRows = await dbAll(dbPath,
+            "SELECT event_id, rule_type, room FROM habit_events WHERE event_id=?", [habitEvent.event_id]);
+        assert.equal(habitEventRows.length, 1);
+        assert.equal(habitEventRows[0].rule_type, "PERSON_ENTER_ROOM");
+
+        result = await request(baseUrl, "DELETE", "/api/habit-rules/smoke-habit-rule");
+        assert.equal(result.response.status, 200);
+        result = await request(baseUrl, "GET", "/api/habit-rules/smoke-habit-rule");
+        assert.equal(result.response.status, 404);
+        assert.equal(result.body.error.code, "HABIT_RULE_NOT_FOUND");
+
+        result = await request(baseUrl, "POST", "/api/llm/text", {
+            text: "天气工具调用烟雾：现在天气如何？"
+        });
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.ok, true);
+        assert.equal(result.body.text, "上海当前天气晴朗，26.5 C。");
+        const weatherToolRequests = mockLlm.requests.slice(-4);
+        const firstToolPayload = JSON.parse(weatherToolRequests[0].body);
+        const secondToolPayload = JSON.parse(weatherToolRequests[3].body);
+        assert.equal(firstToolPayload.messages[0].role, "system");
+        assert.equal(firstToolPayload.messages[1].role, "system");
+        assert.equal(firstToolPayload.tools.length, 4);
+        assert.ok(secondToolPayload.messages.some(message => message.role === "tool"));
 
         result = await request(baseUrl, "POST", "/api/commands", {
             name: "unknown.command",
@@ -2605,10 +2857,10 @@ async function run() {
         });
         assert.equal(result.response.status, 200);
         assert.equal(result.body.ok, true);
-        assert.match(mockLlm.requests[mockLlm.requests.length - 1].body, /设备上下文/);
-        assert.match(mockLlm.requests[mockLlm.requests.length - 1].body, /BME690/);
-        assert.match(mockLlm.requests[mockLlm.requests.length - 1].body, /不是国标 AQI/);
-        assert.match(mockLlm.requests[mockLlm.requests.length - 1].body, /已过期|历史参考|not recent|offline/);
+        const contextSeparatedPayload = JSON.parse(mockLlm.requests[mockLlm.requests.length - 1].body);
+        assert.match(contextSeparatedPayload.messages[0].content, /家庭 AI Agent/);
+        assert.match(contextSeparatedPayload.messages[1].content, /available_tools/);
+        assert.doesNotMatch(contextSeparatedPayload.messages[1].content, /72\/100|29\.57/);
 
         result = await request(baseUrl, "POST", "/sensor", {
             temperature: 25.5,
@@ -3504,7 +3756,7 @@ async function run() {
         });
         assert.equal(result.response.status, 200);
         const postDeletePromptBody = mockLlm.requests[mockLlm.requests.length - 1].body;
-        assert.match(postDeletePromptBody, /当前没有可用的实时 BME690|当前没有可靠的 ESP 本地空气状态估算/);
+        assert.match(postDeletePromptBody, /家庭 AI Agent/);
         assert.doesNotMatch(postDeletePromptBody, /moderate|72\/100|29\.57/);
 
         result = await request(baseUrl, "POST", "/api/user-data/delete", {

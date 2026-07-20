@@ -127,14 +127,16 @@ function normalizeLlmContent(content) {
 
 function extractLlmReply(payload) {
     const choice = payload && Array.isArray(payload.choices) ? payload.choices[0] : null;
+    const message = choice?.message || null;
     const replyText = normalizeLlmContent(
-        choice?.message?.content ??
+        message?.content ??
         choice?.delta?.content ??
         choice?.text
     );
 
     return {
         text: replyText,
+        toolCalls: Array.isArray(message?.tool_calls) ? message.tool_calls : [],
         model: typeof payload?.model === "string" && payload.model.trim() ? payload.model.trim() : ""
     };
 }
@@ -195,7 +197,7 @@ function getLlmResponseStatus(error) {
     return 500;
 }
 
-async function requestLlmText(text, config, externalSignal) {
+async function requestLlmChat(messages, tools, config, externalSignal) {
     if (!config.apiKey) {
         throw createLlmError("LLM_API_KEY_MISSING");
     }
@@ -223,12 +225,8 @@ async function requestLlmText(text, config, externalSignal) {
             },
             body: JSON.stringify({
                 model: config.model,
-                messages: [
-                    {
-                        role: "user",
-                        content: text
-                    }
-                ],
+                messages,
+                ...(Array.isArray(tools) && tools.length > 0 ? { tools } : {}),
                 stream: false
             }),
             signal: controller.signal
@@ -257,7 +255,7 @@ async function requestLlmText(text, config, externalSignal) {
         }
 
         const reply = extractLlmReply(payload);
-        if (!reply.text) {
+        if (!reply.text && reply.toolCalls.length === 0) {
             const error = createLlmError("LLM_REPLY_EMPTY");
             error.endpoint = endpoint;
             error.model = config.model;
@@ -266,6 +264,7 @@ async function requestLlmText(text, config, externalSignal) {
 
         return {
             text: reply.text,
+            toolCalls: reply.toolCalls,
             model: reply.model || config.model
         };
     } catch (error) {
@@ -286,11 +285,21 @@ async function requestLlmText(text, config, externalSignal) {
     }
 }
 
+async function requestLlmText(text, config, externalSignal) {
+    return requestLlmChat([
+        {
+            role: "user",
+            content: text
+        }
+    ], [], config, externalSignal);
+}
+
 module.exports = {
     describeLlmError,
     getLlmResponseStatus,
     LLM_METADATA_MAX_CHARS,
     readLlmConfig,
     readLlmTextRequest,
+    requestLlmChat,
     requestLlmText
 };

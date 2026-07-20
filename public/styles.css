@@ -680,6 +680,219 @@ svg {
     padding: 22px 0 20px;
 }
 
+.settings-page {
+    width: min(900px, 100%);
+    margin: 32px auto 48px;
+}
+
+.habit-rules-page {
+    width: min(980px, 100%);
+    margin: 32px auto 48px;
+}
+
+.habit-rules-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+
+.habit-rule-card {
+    min-width: 0;
+    padding: 18px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--panel-bg);
+    box-shadow: var(--shadow);
+}
+
+.habit-rule-card-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 18px;
+}
+
+.habit-rule-card-header h2 {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 17px;
+    letter-spacing: 0;
+}
+
+.habit-rule-card-header span {
+    display: block;
+    margin-top: 6px;
+    color: var(--text-muted);
+    font-family: "SFMono-Regular", Consolas, monospace;
+    font-size: 11px;
+    overflow-wrap: anywhere;
+}
+
+.habit-rule-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.habit-rule-toggle input {
+    width: 18px;
+    height: 18px;
+    accent-color: #16803b;
+}
+
+.habit-rule-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.habit-rule-field {
+    display: grid;
+    gap: 7px;
+    min-width: 0;
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.habit-rule-field input {
+    width: 100%;
+    min-width: 0;
+    min-height: 40px;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    color: var(--text-primary);
+    background: var(--control-bg);
+}
+
+.habit-rule-field input:focus {
+    outline: 2px solid #2874ff;
+    outline-offset: 1px;
+}
+
+.habit-rules-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 20px;
+}
+
+[data-habit-rules-status] {
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+[data-habit-rules-status][data-state="ready"] {
+    color: #16803b;
+}
+
+[data-habit-rules-status][data-state="error"] {
+    color: #c72c41;
+}
+
+.habit-rules-empty {
+    grid-column: 1 / -1;
+    margin: 0;
+    padding: 24px;
+    border: 1px dashed var(--line);
+    color: var(--text-muted);
+}
+
+.settings-heading {
+    margin-bottom: 20px;
+}
+
+.settings-heading p {
+    margin: 0 0 6px;
+    color: var(--text-muted);
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.settings-heading h1 {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 28px;
+    letter-spacing: 0;
+}
+
+.settings-heading span {
+    display: block;
+    margin-top: 8px;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+.home-location-form {
+    padding: 24px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--panel-bg);
+    box-shadow: var(--shadow);
+}
+
+.home-location-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+}
+
+.home-location-grid label {
+    display: grid;
+    gap: 8px;
+    color: var(--text-secondary);
+    font-size: 14px;
+    font-weight: 700;
+}
+
+.home-location-grid input {
+    width: 100%;
+    min-height: 42px;
+    padding: 0 12px;
+    color: var(--text-primary);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--control-bg);
+    font: inherit;
+}
+
+.home-location-grid input:focus {
+    outline: 2px solid #2874ff;
+    outline-offset: 1px;
+}
+
+.timezone-field {
+    grid-column: 1 / -1;
+}
+
+.home-location-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 24px;
+}
+
+[data-home-location-status] {
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+[data-home-location-status][data-state="ready"] {
+    color: #16803b;
+}
+
+[data-home-location-status][data-state="error"] {
+    color: #c72c41;
+}
+
 .s3-dashboard {
     display: grid;
     gap: 18px;
@@ -3530,6 +3743,54 @@ body[data-theme="light"] .command-modal {
 
     .log-modal-header h2 {
         font-size: 18px;
+    }
+
+    .settings-page {
+        margin: 20px auto 32px;
+    }
+
+    .habit-rules-page {
+        margin: 20px auto 32px;
+    }
+
+    .habit-rules-list,
+    .habit-rule-fields {
+        grid-template-columns: 1fr;
+    }
+
+    .habit-rule-card {
+        padding: 16px;
+    }
+
+    .habit-rules-actions {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .habit-rules-actions .primary-action {
+        width: 100%;
+    }
+
+    .home-location-form {
+        padding: 16px;
+    }
+
+    .home-location-grid {
+        grid-template-columns: 1fr;
+        gap: 14px;
+    }
+
+    .timezone-field {
+        grid-column: auto;
+    }
+
+    .home-location-actions {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .home-location-actions .primary-action {
+        width: 100%;
     }
 
     .modal-alert-log,
